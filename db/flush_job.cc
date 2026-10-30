@@ -1155,7 +1155,6 @@ Status FlushJob::WriteLevel0Table() {
       TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", &meta_);
       edit_->AddFile(0 /* level */, meta_);
     }
-
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
     for (auto& garbage : blob_file_garbages) {
       edit_->AddBlobFileGarbage(std::move(garbage));

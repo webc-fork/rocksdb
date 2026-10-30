@@ -96,14 +96,15 @@ std::ostream& operator<<(std::ostream& os,
 class BlobFileMetaData {
  public:
   using LinkedSsts = std::unordered_set<uint64_t>;
+  using FullLinkedSsts = std::unordered_set<uint64_t>;
 
   static std::shared_ptr<BlobFileMetaData> Create(
       std::shared_ptr<SharedBlobFileMetaData> shared_meta,
-      LinkedSsts linked_ssts, uint64_t garbage_blob_count,
-      uint64_t garbage_blob_bytes) {
-    return std::shared_ptr<BlobFileMetaData>(
-        new BlobFileMetaData(std::move(shared_meta), std::move(linked_ssts),
-                             garbage_blob_count, garbage_blob_bytes));
+      LinkedSsts linked_ssts, FullLinkedSsts full_linked_ssts,
+      uint64_t garbage_blob_count, uint64_t garbage_blob_bytes) {
+    return std::shared_ptr<BlobFileMetaData>(new BlobFileMetaData(
+        std::move(shared_meta), std::move(linked_ssts),
+        std::move(full_linked_ssts), garbage_blob_count, garbage_blob_bytes));
   }
 
   BlobFileMetaData(const BlobFileMetaData&) = delete;
@@ -146,6 +147,8 @@ class BlobFileMetaData {
 
   const LinkedSsts& GetLinkedSsts() const { return linked_ssts_; }
 
+  const FullLinkedSsts& GetFullLinkedSsts() const { return full_linked_ssts_; }
+
   uint64_t GetGarbageBlobCount() const { return garbage_blob_count_; }
   uint64_t GetGarbageBlobBytes() const { return garbage_blob_bytes_; }
 
@@ -153,10 +156,11 @@ class BlobFileMetaData {
 
  private:
   BlobFileMetaData(std::shared_ptr<SharedBlobFileMetaData> shared_meta,
-                   LinkedSsts linked_ssts, uint64_t garbage_blob_count,
-                   uint64_t garbage_blob_bytes)
+                   LinkedSsts linked_ssts, FullLinkedSsts full_linked_ssts,
+                   uint64_t garbage_blob_count, uint64_t garbage_blob_bytes)
       : shared_meta_(std::move(shared_meta)),
         linked_ssts_(std::move(linked_ssts)),
+        full_linked_ssts_(std::move(full_linked_ssts)),
         garbage_blob_count_(garbage_blob_count),
         garbage_blob_bytes_(garbage_blob_bytes) {
     assert(shared_meta_);
@@ -165,7 +169,8 @@ class BlobFileMetaData {
   }
 
   std::shared_ptr<SharedBlobFileMetaData> shared_meta_;
-  LinkedSsts linked_ssts_;
+  LinkedSsts linked_ssts_;           // based on oldest_blob_file_number
+  FullLinkedSsts full_linked_ssts_;  // based on complete blob_file_list
   uint64_t garbage_blob_count_;
   uint64_t garbage_blob_bytes_;
 };

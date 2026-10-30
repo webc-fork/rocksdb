@@ -24,6 +24,7 @@
 #include "cache/cache_entry_stats.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
+#include "db/version_edit.h"
 #include "db/write_stall_stats.h"
 #include "port/port.h"
 #include "rocksdb/system_clock.h"
@@ -1816,7 +1817,9 @@ void InternalStats::DumpCFMapStats(
   const VersionStorageInfo* vstorage = cfd_->current()->storage_info();
   CompactionStats compaction_stats_sum;
   std::map<int, std::map<LevelStatType, double>> levels_stats;
-  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum);
+  bool found_untracked_sst_blob_refs = false;
+  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum,
+                 &found_untracked_sst_blob_refs);
   for (auto const& level_ent : levels_stats) {
     auto level_str =
         level_ent.first == -1 ? "Sum" : "L" + std::to_string(level_ent.first);
@@ -1835,8 +1838,14 @@ void InternalStats::DumpCFMapStats(
 void InternalStats::DumpCFMapStats(
     const VersionStorageInfo* vstorage,
     std::map<int, std::map<LevelStatType, double>>* levels_stats,
-    CompactionStats* compaction_stats_sum) {
+    CompactionStats* compaction_stats_sum,
+    bool* found_untracked_sst_blob_refs) {
   assert(vstorage);
+  assert(found_untracked_sst_blob_refs);
+
+  bool found_untracked_sst_blob = false;
+  const bool enable_blob_list_gc =
+      cfd_->GetLatestMutableCFOptions().enable_blob_list_garbage_collection;
 
   int num_levels_to_check =
       (cfd_->ioptions().compaction_style == kCompactionStyleLevel)
@@ -1857,8 +1866,14 @@ void InternalStats::DumpCFMapStats(
       if (f->being_compacted) {
         ++files_being_compacted[level];
       }
+      if (!found_untracked_sst_blob && enable_blob_list_gc &&
+          f->oldest_blob_file_number != kInvalidBlobFileNumber &&
+          f->blob_file_set.empty()) {
+        found_untracked_sst_blob = true;
+      }
     }
   }
+  *found_untracked_sst_blob_refs = found_untracked_sst_blob;
 
   int total_files = 0;
   int total_files_being_compacted = 0;
@@ -2022,7 +2037,9 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
   const VersionStorageInfo* vstorage = cfd_->current()->storage_info();
   std::map<int, std::map<LevelStatType, double>> levels_stats;
   CompactionStats compaction_stats_sum;
-  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum);
+  bool found_untracked_sst_blob_refs = false;
+  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum,
+                 &found_untracked_sst_blob_refs);
   for (int l = 0; l < number_levels_; ++l) {
     if (levels_stats.find(l) != levels_stats.end()) {
       PrintLevelStats(buf, sizeof(buf), "L" + std::to_string(l),
@@ -2069,6 +2086,13 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
           priorities_stats[static_cast<int>(priority)]);
       value->append(buf);
     }
+  }
+
+  if (found_untracked_sst_blob_refs) {
+    snprintf(buf, sizeof(buf),
+             "\nWARNING: blob list GC enabled, but some blob file set records "
+             "are missing\n");
+    value->append(buf);
   }
 
   const auto blob_st = vstorage->GetBlobStats();

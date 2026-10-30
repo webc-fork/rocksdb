@@ -2555,6 +2555,36 @@ TEST_F(DBPropertiesTest, TableMetaIndexKeys) {
   } while (ChangeOptions());
 }
 
+TEST_F(DBPropertiesTest, BlobListGCUntrackedBlobRefsWarning) {
+  constexpr char kWarningFragment[] = "blob file set records";
+
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.disable_auto_compactions = true;
+  options.enable_blob_file_set_record = false;
+  options.enable_blob_list_garbage_collection = false;
+  DestroyAndReopen(options);
+
+  const std::string large_value(1000, 'a');
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), large_value));
+  }
+  ASSERT_OK(Flush());
+
+  {
+    std::string prop;
+    ASSERT_TRUE(dbfull()->GetProperty(DB::Properties::kCFStats, &prop));
+    ASSERT_EQ(std::string::npos, prop.find(kWarningFragment));
+  }
+
+  ASSERT_OK(db_->SetOptions({{"enable_blob_list_garbage_collection", "true"}}));
+  {
+    std::string prop;
+    ASSERT_TRUE(dbfull()->GetProperty(DB::Properties::kCFStats, &prop));
+    ASSERT_NE(std::string::npos, prop.find(kWarningFragment));
+  }
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

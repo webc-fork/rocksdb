@@ -121,6 +121,8 @@ Status BuildTable(
     input = blob_counting_iter.get();
   }
 
+  const bool record_blob_file_set =
+      mutable_cf_options.enable_blob_file_set_record;
   input->SeekToFirst();
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg(
       new CompactionRangeDelAggregator(&tboptions.internal_comparator,
@@ -313,7 +315,8 @@ Status BuildTable(
       }
 
       s = meta->UpdateBoundaries(key_after_flush, value_after_flush,
-                                 ikey.sequence, ikey.type);
+                                 ikey.sequence, ikey.type,
+                                 record_blob_file_set);
       if (!s.ok()) {
         break;
       }

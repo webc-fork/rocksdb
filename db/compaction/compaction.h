@@ -429,6 +429,10 @@ class Compaction {
     return enable_blob_garbage_collection_;
   }
 
+  bool enable_blob_list_garbage_collection() const {
+    return enable_blob_list_garbage_collection_;
+  }
+
   double blob_garbage_collection_age_cutoff() const {
     return blob_garbage_collection_age_cutoff_;
   }
@@ -649,6 +653,9 @@ class Compaction {
 
   // Enable/disable GC collection for blobs during compaction.
   bool enable_blob_garbage_collection_;
+
+  // Enable/disable blob list GC during compaction.
+  bool enable_blob_list_garbage_collection_;
 
   // Blob garbage collection age cutoff.
   double blob_garbage_collection_age_cutoff_;

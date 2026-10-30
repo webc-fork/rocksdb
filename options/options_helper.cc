@@ -316,6 +316,29 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.blob_garbage_collection_age_cutoff;
   cf_opts->blob_garbage_collection_force_threshold =
       moptions.blob_garbage_collection_force_threshold;
+  cf_opts->enable_blob_file_set_record = moptions.enable_blob_file_set_record;
+  cf_opts->enable_blob_list_garbage_collection =
+      moptions.enable_blob_list_garbage_collection;
+  cf_opts->blob_list_garbage_overall_garbage_ratio_low =
+      moptions.blob_list_garbage_overall_garbage_ratio_low;
+  cf_opts->blob_list_garbage_overall_garbage_ratio_middle =
+      moptions.blob_list_garbage_overall_garbage_ratio_middle;
+  cf_opts->blob_list_garbage_overall_gc_garbage_ratio_high =
+      moptions.blob_list_garbage_overall_gc_garbage_ratio_high;
+  cf_opts->blob_list_garbage_gc_garbage_ratio =
+      moptions.blob_list_garbage_gc_garbage_ratio;
+  cf_opts->blob_list_garbage_hard_gc_garbage_ratio =
+      moptions.blob_list_garbage_hard_gc_garbage_ratio;
+  cf_opts->blob_list_garbage_max_blob_candidate_per_round =
+      moptions.blob_list_garbage_max_blob_candidate_per_round;
+  cf_opts->blob_list_garbage_max_blob_per_compaction =
+      moptions.blob_list_garbage_max_blob_per_compaction;
+  cf_opts->blob_list_garbage_max_sst_candidate_per_round =
+      moptions.blob_list_garbage_max_sst_candidate_per_round;
+  cf_opts->blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold =
+      moptions.blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold;
+  cf_opts->blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold =
+      moptions.blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold;
   cf_opts->blob_compaction_readahead_size =
       moptions.blob_compaction_readahead_size;
   cf_opts->blob_file_starting_level = moptions.blob_file_starting_level;

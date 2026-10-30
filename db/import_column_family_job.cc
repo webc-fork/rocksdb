@@ -216,7 +216,8 @@ Status ImportColumnFamilyJob::Run() {
           kUnknownFileChecksum, kUnknownFileChecksumFuncName, f.unique_id, 0,
           tail_size,
           static_cast<bool>(
-              f.table_properties.user_defined_timestamps_persisted));
+              f.table_properties.user_defined_timestamps_persisted),
+          {});
       s = dummy_version_builder.Apply(&dummy_version_edit);
     }
     if (s.ok()) {

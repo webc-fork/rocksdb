@@ -2242,9 +2242,10 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->largest.user_key().ToString(),
           file->stats.num_reads_sampled.load(std::memory_order_relaxed),
           file->being_compacted, file->temperature,
-          file->oldest_blob_file_number, file->TryGetOldestAncestorTime(),
-          file->TryGetFileCreationTime(), file->epoch_number,
-          file->file_checksum, file->file_checksum_func_name);
+          file->oldest_blob_file_number, file->blob_file_set.size(),
+          file->TryGetOldestAncestorTime(), file->TryGetFileCreationTime(),
+          file->epoch_number, file->file_checksum,
+          file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
       files.back().smallest = file->smallest.Encode().ToString();
@@ -2262,7 +2263,8 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
         ioptions.cf_paths.front().path, meta->GetBlobFileSize(),
         meta->GetTotalBlobCount(), meta->GetTotalBlobBytes(),
         meta->GetGarbageBlobCount(), meta->GetGarbageBlobBytes(),
-        meta->GetChecksumMethod(), meta->GetChecksumValue());
+        meta->GetChecksumMethod(), meta->GetChecksumValue(),
+        meta->GetLinkedSsts().size(), meta->GetFullLinkedSsts().size());
     ++cf_meta->blob_file_count;
     cf_meta->blob_file_size += meta->GetBlobFileSize();
   }
@@ -2325,7 +2327,8 @@ void Version::GetColumnFamilyMetaData(
           file->largest.user_key().ToString(),
           file->stats.num_reads_sampled.load(std::memory_order_relaxed),
           file->being_compacted, file->temperature,
-          file->oldest_blob_file_number, file->TryGetOldestAncestorTime(),
+          file->oldest_blob_file_number, file->blob_file_set.size(),
+          file->TryGetOldestAncestorTime(),
           file->TryGetFileCreationTime(), file->epoch_number,
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
@@ -3879,10 +3882,14 @@ void VersionStorageInfo::ComputeCompactionScore(
   ComputeFilesMarkedForPeriodicCompaction(
       immutable_options, mutable_cf_options.periodic_compaction_seconds,
       max_output_level);
-  ComputeFilesMarkedForForcedBlobGC(
-      mutable_cf_options.blob_garbage_collection_age_cutoff,
-      mutable_cf_options.blob_garbage_collection_force_threshold,
-      mutable_cf_options.enable_blob_garbage_collection);
+  if (mutable_cf_options.enable_blob_list_garbage_collection) {
+    ComputeFilesMarkedForForceBlobListGC(mutable_cf_options);
+  } else {
+    ComputeFilesMarkedForForcedBlobGC(
+        mutable_cf_options.blob_garbage_collection_age_cutoff,
+        mutable_cf_options.blob_garbage_collection_force_threshold,
+        mutable_cf_options.enable_blob_garbage_collection);
+  }
   ComputeFilesMarkedForReadTriggeredCompaction(
       mutable_cf_options.read_triggered_compaction_threshold,
       immutable_options.compaction_style);
@@ -4175,6 +4182,197 @@ void VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction(
               return reads_per_byte_snapshot.at(a.second) >
                      reads_per_byte_snapshot.at(b.second);
             });
+}
+
+namespace {
+
+double GetBlobGarbageRatio(const BlobFileMetaData& meta) {
+  const uint64_t total_blob_bytes = meta.GetTotalBlobBytes();
+  if (total_blob_bytes == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(meta.GetGarbageBlobBytes()) /
+         static_cast<double>(total_blob_bytes);
+}
+
+uint64_t ComputeSstRewriteGarbageBytes(const FileMetaData& sst_meta,
+                                       double per_blob_garbage_ratio_threshold,
+                                       const VersionStorageInfo& vstorage) {
+  uint64_t rewrite_garbage_bytes = 0;
+
+  for (uint64_t blob_file_number : sst_meta.blob_file_set) {
+    const std::shared_ptr<BlobFileMetaData> blob_meta =
+        vstorage.GetBlobFileMetaData(blob_file_number);
+    if (!blob_meta) {
+      continue;
+    }
+
+    if (GetBlobGarbageRatio(*blob_meta) < per_blob_garbage_ratio_threshold) {
+      continue;
+    }
+
+    rewrite_garbage_bytes += blob_meta->GetGarbageBlobBytes();
+  }
+
+  return rewrite_garbage_bytes;
+}
+
+}  // anonymous namespace
+
+void VersionStorageInfo::ComputeOverallBlobGarbageRatio() {
+  if (overall_blob_garbage_ratio_.has_value()) {
+    return;
+  }
+
+  if (blob_files_.empty()) {
+    overall_blob_garbage_ratio_ = 0.0;
+    return;
+  }
+
+  uint64_t total_blob_bytes = 0;
+  uint64_t total_garbage_size = 0;
+  for (const auto& meta : blob_files_) {
+    assert(meta);
+    total_blob_bytes += meta->GetTotalBlobBytes();
+    total_garbage_size += meta->GetGarbageBlobBytes();
+  }
+  if (total_blob_bytes == 0) {
+    overall_blob_garbage_ratio_ = 0.0;
+    return;
+  }
+
+  overall_blob_garbage_ratio_ = static_cast<double>(total_garbage_size) /
+                                static_cast<double>(total_blob_bytes);
+}
+
+void VersionStorageInfo::ComputeFilesMarkedForForceBlobListGC(
+    const MutableCFOptions& mutable_cf_options) {
+  files_marked_for_forced_blob_gc_.clear();
+
+  if (mutable_cf_options.blob_list_garbage_max_blob_candidate_per_round == 0 ||
+      mutable_cf_options.blob_list_garbage_max_sst_candidate_per_round == 0) {
+    return;
+  }
+
+  if (blob_files_.empty()) {
+    return;
+  }
+
+  if (!overall_blob_garbage_ratio_.has_value()) {
+    ComputeOverallBlobGarbageRatio();
+  }
+
+  const double overall_garbage_ratio = *overall_blob_garbage_ratio_;
+
+  double per_blob_garbage_ratio_threshold = 0.0;
+  std::optional<double> sst_rewrite_garbage_bytes_ratio_threshold;
+
+  if (overall_garbage_ratio >=
+      mutable_cf_options.blob_list_garbage_overall_gc_garbage_ratio_high) {
+    per_blob_garbage_ratio_threshold =
+        mutable_cf_options.blob_list_garbage_hard_gc_garbage_ratio;
+  } else if (overall_garbage_ratio >=
+             mutable_cf_options
+                 .blob_list_garbage_overall_garbage_ratio_middle) {
+    per_blob_garbage_ratio_threshold =
+        mutable_cf_options.blob_list_garbage_hard_gc_garbage_ratio;
+    sst_rewrite_garbage_bytes_ratio_threshold =
+        mutable_cf_options
+            .blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold;
+  } else if (overall_garbage_ratio >=
+             mutable_cf_options.blob_list_garbage_overall_garbage_ratio_low) {
+    per_blob_garbage_ratio_threshold =
+        mutable_cf_options.blob_list_garbage_gc_garbage_ratio;
+    sst_rewrite_garbage_bytes_ratio_threshold =
+        mutable_cf_options
+            .blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold;
+  } else {
+    return;
+  }
+
+  const size_t max_blob_candidates =
+      mutable_cf_options.blob_list_garbage_max_blob_candidate_per_round;
+  const size_t max_sst_candidates =
+      mutable_cf_options.blob_list_garbage_max_sst_candidate_per_round;
+
+  std::vector<std::shared_ptr<BlobFileMetaData>> gc_blob_candidates;
+  gc_blob_candidates.reserve(max_blob_candidates);
+
+  for (const auto& blob_meta : blob_files_) {
+    assert(blob_meta);
+    if (blob_meta->GetFullLinkedSsts().empty()) {
+      continue;
+    }
+    if (GetBlobGarbageRatio(*blob_meta) < per_blob_garbage_ratio_threshold) {
+      continue;
+    }
+    gc_blob_candidates.emplace_back(blob_meta);
+    if (gc_blob_candidates.size() >= max_blob_candidates) {
+      break;
+    }
+  }
+
+  if (gc_blob_candidates.empty()) {
+    return;
+  }
+
+  std::sort(gc_blob_candidates.begin(), gc_blob_candidates.end(),
+            [](const std::shared_ptr<BlobFileMetaData>& lhs,
+               const std::shared_ptr<BlobFileMetaData>& rhs) {
+              assert(lhs);
+              assert(rhs);
+              return lhs->GetGarbageBlobBytes() > rhs->GetGarbageBlobBytes();
+            });
+
+  std::unordered_set<uint64_t> candidate_sst_file_numbers;
+  candidate_sst_file_numbers.reserve(max_sst_candidates);
+
+  for (const auto& blob_meta : gc_blob_candidates) {
+    assert(blob_meta);
+
+    for (uint64_t sst_file_number : blob_meta->GetFullLinkedSsts()) {
+      if (!candidate_sst_file_numbers.insert(sst_file_number).second) {
+        continue;
+      }
+
+      const FileLocation location = GetFileLocation(sst_file_number);
+      if (!location.IsValid()) {
+        continue;
+      }
+
+      const int level = location.GetLevel();
+      assert(level >= 0);
+
+      FileMetaData* const sst_meta = files_[level][location.GetPosition()];
+      assert(sst_meta);
+
+      if (sst_meta->being_compacted) {
+        continue;
+      }
+
+      if (sst_rewrite_garbage_bytes_ratio_threshold.has_value() &&
+          *sst_rewrite_garbage_bytes_ratio_threshold > 0.0) {
+        const uint64_t sst_file_size = sst_meta->fd.GetFileSize();
+        if (sst_file_size == 0) {
+          continue;
+        }
+
+        const uint64_t rewrite_garbage_bytes = ComputeSstRewriteGarbageBytes(
+            *sst_meta, per_blob_garbage_ratio_threshold, *this);
+        const double rewrite_efficiency =
+            static_cast<double>(rewrite_garbage_bytes) /
+            static_cast<double>(sst_file_size);
+        if (rewrite_efficiency < *sst_rewrite_garbage_bytes_ratio_threshold) {
+          continue;
+        }
+      }
+
+      files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
+      if (files_marked_for_forced_blob_gc_.size() >= max_sst_candidates) {
+        return;
+      }
+    }
+  }
 }
 
 namespace {
@@ -8009,7 +8207,8 @@ Status VersionSet::WriteCurrentStateToManifest(
                        f->file_checksum_func_name, f->unique_id,
                        f->compensated_range_deletion_size, f->tail_size,
                        f->user_defined_timestamps_persisted, f->min_timestamp,
-                       f->max_timestamp, f->file_open_metadata);
+                       f->max_timestamp, f->file_open_metadata,
+                       f->blob_file_set);
         }
       }
 
@@ -8583,6 +8782,7 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.num_entries = file->num_entries;
         filemetadata.num_deletions = file->num_deletions;
         filemetadata.oldest_blob_file_number = file->oldest_blob_file_number;
+        filemetadata.blob_file_set_count = file->blob_file_set.size();
         filemetadata.file_checksum = file->file_checksum;
         filemetadata.file_checksum_func_name = file->file_checksum_func_name;
         filemetadata.temperature = file->temperature;

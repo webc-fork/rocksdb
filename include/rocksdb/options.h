@@ -2961,6 +2961,8 @@ enum class BlobGarbageCollectionPolicy {
   kDisable,
   // Inherit blob file garbage collection policy from ColumnFamilyOptions.
   kUseDefault,
+  // Force blob list garbage collection.
+  kForceBlobList,
 };
 
 // CompactRangeOptions is used by CompactRange() call.
@@ -3007,9 +3009,12 @@ struct CompactRangeOptions {
   // set to true
 
   // If set to kForce, RocksDB will override enable_blob_file_garbage_collection
-  // to true; if set to kDisable, RocksDB will override it to false, and
-  // kUseDefault leaves the setting in effect. This enables customers to both
-  // force-enable and force-disable GC when calling CompactRange.
+  // to true and disable blob list GC for this compaction; if set to
+  // kForceBlobList, RocksDB will override enable_blob_list_garbage_collection
+  // to true and disable traditional blob GC for this compaction; if set to
+  // kDisable, RocksDB will override both to false; and kUseDefault leaves the
+  // ColumnFamilyOptions settings in effect. This enables customers to
+  // explicitly choose the blob GC mode when calling CompactRange.
   BlobGarbageCollectionPolicy blob_garbage_collection_policy =
       BlobGarbageCollectionPolicy::kUseDefault;
 

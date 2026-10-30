@@ -2265,7 +2265,7 @@ TEST_F(DBWALTest, RaceInstallFlushResultsWithWalObsoletion) {
 
   {
     dbfull()->TEST_LockMutex();
-    ASSERT_LE(2, dbfull()->GetBGJobLimits().max_flushes);
+    ASSERT_LE(2, dbfull()->GetBGJobLimits(false).max_flushes);
     dbfull()->TEST_UnlockMutex();
   }
 

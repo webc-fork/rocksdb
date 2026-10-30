@@ -53,6 +53,12 @@ std::ostream& operator<<(std::ostream& os, const BlobFileMetaData& meta) {
   }
   os << " }";
 
+  os << " full_linked_ssts: {";
+  for (uint64_t file_number : meta.GetFullLinkedSsts()) {
+    os << ' ' << file_number;
+  }
+  os << " }";
+
   os << " garbage_blob_count: " << meta.GetGarbageBlobCount()
      << " garbage_blob_bytes: " << meta.GetGarbageBlobBytes();
 

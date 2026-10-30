@@ -335,9 +335,22 @@ Compaction::Compaction(
           _blob_garbage_collection_policy == BlobGarbageCollectionPolicy::kForce
               ? true
               : (_blob_garbage_collection_policy ==
-                         BlobGarbageCollectionPolicy::kDisable
+                             BlobGarbageCollectionPolicy::kDisable ||
+                         _blob_garbage_collection_policy ==
+                             BlobGarbageCollectionPolicy::kForceBlobList
                      ? false
                      : mutable_cf_options().enable_blob_garbage_collection)),
+      enable_blob_list_garbage_collection_(
+          _blob_garbage_collection_policy ==
+                  BlobGarbageCollectionPolicy::kForceBlobList
+              ? true
+              : (_blob_garbage_collection_policy ==
+                             BlobGarbageCollectionPolicy::kDisable ||
+                         _blob_garbage_collection_policy ==
+                             BlobGarbageCollectionPolicy::kForce
+                     ? false
+                     : mutable_cf_options()
+                           .enable_blob_list_garbage_collection)),
       blob_garbage_collection_age_cutoff_(
           _blob_garbage_collection_age_cutoff < 0 ||
                   _blob_garbage_collection_age_cutoff > 1
@@ -356,6 +369,10 @@ Compaction::Compaction(
   MarkFilesBeingCompacted(true);
   if (max_subcompactions_ == 0) {
     max_subcompactions_ = _mutable_db_options.max_subcompactions;
+  }
+
+  if (enable_blob_list_garbage_collection_) {
+    vstorage->ComputeOverallBlobGarbageRatio();
   }
 
   // for the non-bottommost levels, it tries to build files match the target

@@ -889,6 +889,603 @@ TEST_F(DBBlobCompactionTest, CompactionDoNotFillCache) {
   Close();
 }
 
+TEST_F(DBBlobCompactionTest, BlobListGCLowTierBelowGCRatio) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.05;
+  options.blob_list_garbage_overall_garbage_ratio_middle = 0.60;
+  options.blob_list_garbage_overall_gc_garbage_ratio_high = 0.80;
+  options.blob_list_garbage_gc_garbage_ratio = 0.70;
+  options.blob_list_garbage_hard_gc_garbage_ratio = 0.30;
+  Reopen(options);
+
+  constexpr int kTotal = 10;
+  constexpr int kOverwrite = 5;
+  const std::string kLargeVal(1000, 'a');
+  const std::string kNewVal(1000, 'b');
+
+  for (int i = 0; i < kTotal; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kLargeVal));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 0; i < kOverwrite; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kNewVal));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  uint64_t garbage_bytes_before = 0;
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+
+    uint64_t total_blob_bytes = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      garbage_bytes_before += blob.garbage_blob_bytes;
+      total_blob_bytes += blob.total_blob_bytes;
+    }
+    ASSERT_GT(garbage_bytes_before, 0u);
+
+    ASSERT_GT(total_blob_bytes, 0u);
+    const double overall_garbage_ratio =
+        static_cast<double>(garbage_bytes_before) /
+        static_cast<double>(total_blob_bytes);
+    ASSERT_GE(overall_garbage_ratio,
+              options.blob_list_garbage_overall_garbage_ratio_low);
+    ASSERT_LT(overall_garbage_ratio,
+              options.blob_list_garbage_overall_garbage_ratio_middle);
+  }
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        /*disallow_trivial_move=*/true));
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    uint64_t garbage_bytes_after = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      garbage_bytes_after += blob.garbage_blob_bytes;
+    }
+    ASSERT_EQ(garbage_bytes_after, garbage_bytes_before);
+    ASSERT_EQ(cf_meta.blob_files.size(), 2u);
+    uint64_t total_count = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      total_count += blob.total_blob_count;
+    }
+    ASSERT_EQ(total_count, static_cast<uint64_t>(kTotal + kOverwrite));
+  }
+
+  for (int i = 0; i < kOverwrite; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kNewVal);
+  }
+  for (int i = kOverwrite; i < kTotal; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kLargeVal);
+  }
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, CompactRangeForceBlobListGC) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_garbage_collection = false;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.05;
+  options.blob_list_garbage_overall_garbage_ratio_middle = 0.20;
+  options.blob_list_garbage_overall_gc_garbage_ratio_high = 0.80;
+  options.blob_list_garbage_gc_garbage_ratio = 0.70;
+  options.blob_list_garbage_hard_gc_garbage_ratio = 0.30;
+  options.blob_list_garbage_max_blob_candidate_per_round = 1000;
+  options.blob_list_garbage_max_sst_candidate_per_round = 1000;
+  options.blob_list_garbage_max_blob_per_compaction = 0;  // unlimited
+  Reopen(options);
+
+  const std::string kValA(1000, 'a');
+  const std::string kValB(1000, 'b');
+  const std::string kValC(1000, 'c');
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValA));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 5; i < 15; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValB));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValC));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(cf_meta.blob_files.size(), 3u);
+    uint64_t total_garbage = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      total_garbage += blob.garbage_blob_count;
+    }
+    ASSERT_GT(total_garbage, 0u);
+  }
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  cro.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForceBlobList;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    uint64_t total_garbage = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      total_garbage += blob.garbage_blob_count;
+    }
+    ASSERT_EQ(total_garbage, 0u);
+  }
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValA);
+  }
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValC);
+  }
+  for (int i = 10; i < 15; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValB);
+  }
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest,
+       DisableBlobFileSetRecordSkipsBlobListOnFlushAndCompaction) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.enable_blob_file_set_record = false;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  const std::string kLargeVal(1000, 'a');
+  ASSERT_OK(Put("key0", kLargeVal));
+  ASSERT_OK(Put("key1", kLargeVal));
+  ASSERT_OK(Flush());
+
+  std::vector<std::vector<FileMetaData>> files;
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+  ASSERT_EQ(files[0].size(), 1u);
+  ASSERT_TRUE(files[0][0].blob_file_set.empty());
+  ASSERT_NE(files[0][0].oldest_blob_file_number, kInvalidBlobFileNumber);
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  files.clear();
+  dbfull()->TEST_GetFilesMetaData(dbfull()->DefaultColumnFamily(), &files);
+  bool found_blob_output = false;
+  for (const auto& level_files : files) {
+    for (const auto& file : level_files) {
+      if (file.oldest_blob_file_number == kInvalidBlobFileNumber) {
+        continue;
+      }
+      found_blob_output = true;
+      ASSERT_TRUE(file.blob_file_set.empty());
+    }
+  }
+  ASSERT_TRUE(found_blob_output);
+
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCMiddleTierAboveHardGCRatio) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_garbage_collection = false;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.05;
+  options.blob_list_garbage_overall_garbage_ratio_middle = 0.20;
+  options.blob_list_garbage_overall_gc_garbage_ratio_high = 0.80;
+  options.blob_list_garbage_gc_garbage_ratio = 0.70;
+  options.blob_list_garbage_hard_gc_garbage_ratio = 0.30;
+  Reopen(options);
+
+  const std::string kValA(1000, 'a');
+  const std::string kValB(1000, 'b');
+  const std::string kValC(1000, 'c');
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValA));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 5; i < 15; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValB));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), kValC));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(cf_meta.blob_files.size(), 3u);
+    uint64_t total_garbage = 0;
+    for (const auto& blob : cf_meta.blob_files) {
+      total_garbage += blob.garbage_blob_count;
+    }
+    ASSERT_GT(total_garbage, 0u);
+  }
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        /*disallow_trivial_move=*/true));
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(cf_meta.blob_files.size(), 3u);
+    for (const auto& blob : cf_meta.blob_files) {
+      ASSERT_EQ(blob.total_blob_count, 5u);
+      ASSERT_EQ(blob.garbage_blob_count, 0u);
+      ASSERT_EQ(blob.garbage_blob_bytes, 0u);
+    }
+  }
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValA);
+  }
+  for (int i = 5; i < 10; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValC);
+  }
+  for (int i = 10; i < 15; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), kValB);
+  }
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCRewritesOnlySelectedBlobFiles) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.05;
+  options.blob_list_garbage_overall_garbage_ratio_middle = 0.20;
+  options.blob_list_garbage_overall_gc_garbage_ratio_high = 0.90;
+  options.blob_list_garbage_gc_garbage_ratio = 0.80;
+  options.blob_list_garbage_hard_gc_garbage_ratio = 0.30;
+  options.blob_list_garbage_max_blob_candidate_per_round = 1000;
+  options.blob_list_garbage_max_sst_candidate_per_round = 1000;
+  options.blob_list_garbage_max_blob_per_compaction = 0;
+  Reopen(options);
+
+  const std::string kSelectedVal(1000, 'a');
+  const std::string kSkippedVal(1000, 'b');
+  const std::string kNewVal(1000, 'n');
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("sel" + std::to_string(i), kSelectedVal));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("skip" + std::to_string(i), kSkippedVal));
+  }
+  ASSERT_OK(Flush());
+
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_OK(Put("sel" + std::to_string(i), kNewVal));
+  }
+  ASSERT_OK(Put("skip0", kNewVal));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  uint64_t selected_blob = 0;
+  uint64_t skipped_blob = 0;
+  uint64_t skipped_garbage_before = 0;
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    for (const auto& blob : cf_meta.blob_files) {
+      if (blob.garbage_blob_bytes == 0) {
+        continue;
+      }
+      ASSERT_GT(blob.total_blob_bytes, 0u);
+      const double ratio = static_cast<double>(blob.garbage_blob_bytes) /
+                           static_cast<double>(blob.total_blob_bytes);
+      if (ratio >= options.blob_list_garbage_hard_gc_garbage_ratio) {
+        ASSERT_EQ(selected_blob, 0u);
+        selected_blob = blob.blob_file_number;
+      } else {
+        ASSERT_EQ(skipped_blob, 0u);
+        skipped_blob = blob.blob_file_number;
+        skipped_garbage_before = blob.garbage_blob_bytes;
+      }
+    }
+  }
+  ASSERT_NE(selected_blob, 0u);
+  ASSERT_NE(skipped_blob, 0u);
+  ASSERT_GT(skipped_garbage_before, 0u);
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        /*disallow_trivial_move=*/true));
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+
+    bool saw_selected = false;
+    bool saw_skipped = false;
+    for (const auto& blob : cf_meta.blob_files) {
+      if (blob.blob_file_number == selected_blob) {
+        saw_selected = true;
+        ASSERT_EQ(blob.garbage_blob_bytes, 0u);
+      } else if (blob.blob_file_number == skipped_blob) {
+        saw_skipped = true;
+        ASSERT_EQ(blob.garbage_blob_bytes, skipped_garbage_before);
+      }
+    }
+    ASSERT_TRUE(saw_skipped);
+    (void)saw_selected;
+  }
+
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_EQ(Get("sel" + std::to_string(i)), kNewVal);
+  }
+  ASSERT_EQ(Get("sel9"), kSelectedVal);
+  ASSERT_EQ(Get("skip0"), kNewVal);
+  for (int i = 1; i < 10; ++i) {
+    ASSERT_EQ(Get("skip" + std::to_string(i)), kSkippedVal);
+  }
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCMaxBlobPerCompaction) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.05;
+  options.blob_list_garbage_overall_garbage_ratio_middle = 0.20;
+  options.blob_list_garbage_overall_gc_garbage_ratio_high = 0.90;
+  options.blob_list_garbage_gc_garbage_ratio = 0.80;
+  options.blob_list_garbage_hard_gc_garbage_ratio = 0.30;
+  options.blob_list_garbage_max_blob_candidate_per_round = 1000;
+  options.blob_list_garbage_max_sst_candidate_per_round = 1000;
+  options.blob_list_garbage_max_blob_per_compaction = 1;
+  Reopen(options);
+
+  const std::string kValA(1000, 'a');
+  const std::string kValB(1000, 'b');
+  const std::string kNewVal(1000, 'n');
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("a_key" + std::to_string(i), kValA));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("b_key" + std::to_string(i), kValB));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_OK(Put("a_key" + std::to_string(i), kNewVal));
+    ASSERT_OK(Put("b_key" + std::to_string(i), kNewVal));
+  }
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  size_t files_with_garbage_before = 0;
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    for (const auto& blob : cf_meta.blob_files) {
+      if (blob.garbage_blob_bytes > 0) {
+        ++files_with_garbage_before;
+      }
+    }
+  }
+  ASSERT_EQ(files_with_garbage_before, 2U);
+
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        /*disallow_trivial_move=*/true));
+
+  size_t files_with_garbage_after = 0;
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    for (const auto& blob : cf_meta.blob_files) {
+      if (blob.garbage_blob_bytes > 0) {
+        ++files_with_garbage_after;
+      }
+    }
+  }
+  ASSERT_EQ(files_with_garbage_after, 1U);
+
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_EQ(Get("a_key" + std::to_string(i)), kNewVal);
+    ASSERT_EQ(Get("b_key" + std::to_string(i)), kNewVal);
+  }
+  ASSERT_EQ(Get("a_key9"), kValA);
+  ASSERT_EQ(Get("b_key9"), kValB);
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCRebuildsMissingBlobFileSet) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.disable_auto_compactions = true;
+  options.enable_blob_file_set_record = false;
+  options.enable_blob_list_garbage_collection = false;
+  Reopen(options);
+
+  const std::string large_value(1000, 'a');
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), large_value));
+  }
+  ASSERT_OK(Flush());
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    size_t blob_referencing_ssts = 0;
+    for (const auto& level : cf_meta.levels) {
+      for (const auto& sst : level.files) {
+        if (sst.oldest_blob_file_number != kInvalidBlobFileNumber) {
+          ++blob_referencing_ssts;
+          ASSERT_EQ(sst.blob_file_set_count, 0U);
+        }
+      }
+    }
+    ASSERT_GT(blob_referencing_ssts, 0U);
+    for (const auto& blob : cf_meta.blob_files) {
+      ASSERT_GT(blob.linked_ssts_count, 0U);
+      ASSERT_EQ(blob.full_linked_ssts_count, 0U);
+    }
+  }
+
+  options.enable_blob_file_set_record = true;
+  Reopen(options);
+
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    size_t blob_referencing_ssts = 0;
+    for (const auto& level : cf_meta.levels) {
+      for (const auto& sst : level.files) {
+        if (sst.oldest_blob_file_number != kInvalidBlobFileNumber) {
+          ++blob_referencing_ssts;
+          ASSERT_GT(sst.blob_file_set_count, 0U);
+        }
+      }
+    }
+    ASSERT_GT(blob_referencing_ssts, 0U);
+    for (const auto& blob : cf_meta.blob_files) {
+      ASSERT_GT(blob.full_linked_ssts_count, 0U);
+    }
+  }
+
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_EQ(Get("key" + std::to_string(i)), large_value);
+  }
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCHighGarbageParallelizesCompactions) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  options.max_background_jobs = 8;
+  options.max_background_flushes = -1;
+  options.max_background_compactions = -1;
+  Reopen(options);
+
+  const std::string old_value(1000, 'a');
+  const std::string new_value(1000, 'b');
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), old_value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), new_value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  ASSERT_GT(dbfull()->TEST_BGCompactionsAllowed(), 1);
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCLowGarbageKeepsCompactionsThrottled) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = true;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.99;
+  options.max_background_jobs = 8;
+  options.max_background_flushes = -1;
+  options.max_background_compactions = -1;
+  Reopen(options);
+
+  const std::string old_value(1000, 'a');
+  const std::string new_value(1000, 'b');
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), old_value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), new_value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  ASSERT_EQ(dbfull()->TEST_BGCompactionsAllowed(), 1);
+  Close();
+}
+
+TEST_F(DBBlobCompactionTest, BlobListGCGarbageIgnoredWhenDisabled) {
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 500;
+  options.enable_blob_file_set_record = true;
+  options.enable_blob_list_garbage_collection = false;
+  options.disable_auto_compactions = true;
+  options.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  options.max_background_jobs = 8;
+  options.max_background_flushes = -1;
+  options.max_background_compactions = -1;
+  Reopen(options);
+
+  const std::string old_value(1000, 'a');
+  const std::string new_value(1000, 'b');
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), old_value));
+  }
+  ASSERT_OK(Flush());
+  for (int i = 0; i < 19; ++i) {
+    ASSERT_OK(Put("key" + std::to_string(i), new_value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  cro.blob_garbage_collection_policy =
+      BlobGarbageCollectionPolicy::kForceBlobList;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+
+  ASSERT_EQ(dbfull()->TEST_BGCompactionsAllowed(), 1);
+  Close();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

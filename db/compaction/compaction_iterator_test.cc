@@ -187,6 +187,8 @@ class FakeCompaction : public CompactionIterator::CompactionProxy {
 
   bool enable_blob_garbage_collection() const override { return false; }
 
+  bool enable_blob_list_garbage_collection() const override { return false; }
+
   double blob_garbage_collection_age_cutoff() const override { return 0.0; }
 
   uint64_t blob_compaction_readahead_size() const override { return 0; }
