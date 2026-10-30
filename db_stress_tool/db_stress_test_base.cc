@@ -5466,6 +5466,7 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
   cro.max_subcompactions = static_cast<uint32_t>(thread->rand.Next() % 4);
   std::vector<BlobGarbageCollectionPolicy> blob_gc_policies = {
       BlobGarbageCollectionPolicy::kForce,
+      BlobGarbageCollectionPolicy::kForceBlobList,
       BlobGarbageCollectionPolicy::kDisable,
       BlobGarbageCollectionPolicy::kUseDefault};
   cro.blob_garbage_collection_policy =

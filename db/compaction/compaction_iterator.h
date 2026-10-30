@@ -165,6 +165,8 @@ class CompactionIterator {
 
     virtual bool enable_blob_garbage_collection() const = 0;
 
+    virtual bool enable_blob_list_garbage_collection() const = 0;
+
     virtual double blob_garbage_collection_age_cutoff() const = 0;
 
     virtual uint64_t blob_compaction_readahead_size() const = 0;
@@ -214,6 +216,10 @@ class CompactionIterator {
 
     bool enable_blob_garbage_collection() const override {
       return compaction_->enable_blob_garbage_collection();
+    }
+
+    bool enable_blob_list_garbage_collection() const override {
+      return compaction_->enable_blob_list_garbage_collection();
     }
 
     double blob_garbage_collection_age_cutoff() const override {
@@ -483,6 +489,9 @@ class CompactionIterator {
     }
   }
 
+  static std::unordered_set<uint64_t>
+  ComputeBlobListGarbageCollectionBlobFileNumbers(
+      const CompactionProxy* compaction);
   static std::unique_ptr<BlobFetcher> CreateBlobFetcherIfNeeded(
       const CompactionProxy* compaction, const Version* input_version,
       Env::IOActivity blob_read_io_activity);
@@ -607,6 +616,8 @@ class CompactionIterator {
   PinnedIteratorsManager pinned_iters_mgr_;
 
   uint64_t blob_garbage_collection_cutoff_file_number_;
+
+  std::unordered_set<uint64_t> blob_list_gc_blob_file_numbers_;
 
   std::unique_ptr<BlobFetcher> blob_fetcher_;
   std::unique_ptr<PrefetchBufferCollection> prefetch_buffers_;

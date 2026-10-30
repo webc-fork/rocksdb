@@ -208,6 +208,8 @@ CompactionIterator::CompactionIterator(
               ? *blob_gc_cutoff_file_number
               : ComputeBlobGarbageCollectionCutoffFileNumber(
                     compaction_.get())),
+      blob_list_gc_blob_file_numbers_(
+          ComputeBlobListGarbageCollectionBlobFileNumbers(compaction_.get())),
       blob_fetcher_(CreateBlobFetcherIfNeeded(compaction_.get(), input_version,
                                               blob_read_io_activity)),
       prefetch_buffers_(
@@ -1463,7 +1465,13 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
   }
 
   // GC for integrated BlobDB
-  if (compaction_->enable_blob_garbage_collection()) {
+  if (compaction_->enable_blob_garbage_collection() ||
+      compaction_->enable_blob_list_garbage_collection()) {
+    if (compaction_->enable_blob_list_garbage_collection() &&
+        blob_list_gc_blob_file_numbers_.empty()) {
+      return;
+    }
+
     TEST_SYNC_POINT_CALLBACK(
         "CompactionIterator::GarbageCollectBlobIfNeeded::TamperWithBlobIndex",
         &value_);
@@ -1481,8 +1489,11 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
       }
     }
 
-    if (blob_index.file_number() >=
-        blob_garbage_collection_cutoff_file_number_) {
+    if (compaction_->enable_blob_list_garbage_collection()
+            ? !blob_list_gc_blob_file_numbers_.contains(
+                  blob_index.file_number())
+            : blob_index.file_number() >=
+                  blob_garbage_collection_cutoff_file_number_) {
       return;
     }
 
@@ -2057,7 +2068,8 @@ uint64_t CompactionIterator::ComputeBlobGarbageCollectionCutoffFileNumber(
     return 0;
   }
 
-  if (!compaction->enable_blob_garbage_collection()) {
+  if (!compaction->enable_blob_garbage_collection() ||
+      compaction->enable_blob_list_garbage_collection()) {
     return 0;
   }
 
@@ -2080,6 +2092,68 @@ uint64_t CompactionIterator::ComputeBlobGarbageCollectionCutoffFileNumber(
   assert(meta);
 
   return meta->GetBlobFileNumber();
+}
+
+std::unordered_set<uint64_t>
+CompactionIterator::ComputeBlobListGarbageCollectionBlobFileNumbers(
+    const CompactionProxy* compaction) {
+  if (!compaction || !compaction->enable_blob_list_garbage_collection()) {
+    return {};
+  }
+
+  const Compaction* const c = compaction->real_compaction();
+  if (!c) {
+    return {};
+  }
+
+  const Version* const version = compaction->input_version();
+  assert(version);
+
+  const VersionStorageInfo* const storage_info = version->storage_info();
+  assert(storage_info);
+
+  const MutableCFOptions& mutable_cf_options = c->mutable_cf_options();
+
+  const auto& overall_ratio = storage_info->OverallBlobGarbageRatio();
+  if (!overall_ratio.has_value()) {
+    return {};
+  }
+
+  const auto thresholds =
+      mutable_cf_options.GetBlobListGCThresholds(*overall_ratio);
+  if (!thresholds.active) {
+    return {};
+  }
+  const double per_blob_threshold = thresholds.per_blob_garbage_ratio;
+
+  std::unordered_set<uint64_t> blob_file_numbers;
+  std::unordered_set<uint64_t> seen_blob_file_numbers;
+  const uint32_t max_blob_per_compaction =
+      mutable_cf_options.blob_list_garbage_max_blob_per_compaction;
+  for (size_t lvl_idx = 0; lvl_idx < c->num_input_levels(); ++lvl_idx) {
+    for (size_t i = 0; i < c->num_input_files(lvl_idx); ++i) {
+      const FileMetaData* const sst_meta = c->input(lvl_idx, i);
+      assert(sst_meta);
+      for (uint64_t blob_file_number : sst_meta->blob_file_set) {
+        if (!seen_blob_file_numbers.insert(blob_file_number).second) {
+          continue;
+        }
+        const std::shared_ptr<BlobFileMetaData> blob_meta =
+            storage_info->GetBlobFileMetaData(blob_file_number);
+        if (!blob_meta || blob_meta->GetTotalBlobBytes() == 0) {
+          continue;
+        }
+        if (blob_meta->GetGarbageBlobRatio() >= per_blob_threshold) {
+          blob_file_numbers.insert(blob_file_number);
+          if (max_blob_per_compaction > 0 &&
+              blob_file_numbers.size() >= max_blob_per_compaction) {
+            return blob_file_numbers;
+          }
+        }
+      }
+    }
+  }
+  return blob_file_numbers;
 }
 
 std::unique_ptr<BlobFetcher> CompactionIterator::CreateBlobFetcherIfNeeded(

@@ -793,6 +793,18 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
     return nullptr;
   }
 
+  // for BOTTOM LEVEL compaction only, use max_file_num_to_ignore to filter out
+  // files that are created during the current compaction.
+  uint64_t file_num_to_ignore = std::numeric_limits<uint64_t>::max();
+  if (compact_range_options.bottommost_level_compaction ==
+          BottommostLevelCompaction::kForceOptimized ||
+      compact_range_options.bottommost_level_compaction ==
+          BottommostLevelCompaction::kIfHaveCompactionFilter) {
+    file_num_to_ignore = max_file_num_to_ignore;
+  }
+  assert(file_num_to_ignore == std::numeric_limits<uint64_t>::max() ||
+         (input_level > 0 && input_level == output_level));
+
   // Avoid compacting too much in one shot in case the range is large.
   // But we cannot do this for level-0 since level-0 files can overlap
   // and we must not pick one file and drop another older file if the
@@ -801,11 +813,28 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
     const uint64_t limit = mutable_cf_options.max_compaction_bytes;
     int hint_index = -1;
     assert(!inputs.empty());
-    // Always include first file for progress.
-    uint64_t input_level_total = inputs[0]->fd.GetFileSize();
-    InternalKey* smallest = &(inputs[0]->smallest);
+    uint64_t input_level_total = 0;
+    InternalKey* smallest = nullptr;
     InternalKey* largest = nullptr;
-    for (size_t i = 1; i < inputs.size(); ++i) {
+
+    std::vector<FileMetaData*> selected;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (inputs[i]->fd.GetNumber() >= file_num_to_ignore) {
+        if (selected.empty()) {
+          continue;
+        }
+        // Whatever is left after this file is handled by a follow-up
+        // compaction, so report that this one does not cover the whole range.
+        covering_the_whole_range = false;
+        break;
+      }
+      if (selected.empty()) {
+        // Always include first file for progress.
+        selected.push_back(inputs[i]);
+        input_level_total = inputs[i]->fd.GetFileSize();
+        smallest = &(inputs[i]->smallest);
+        continue;
+      }
       // Consider whether to include inputs[i]
       largest = &inputs[i]->largest;
 
@@ -826,51 +855,21 @@ Compaction* CompactionPicker::PickCompactionForCompactRange(
         // To ensure compaction size is <= limit, leave out inputs from
         // index i onwards.
         covering_the_whole_range = false;
-        inputs.files.resize(i);
         break;
       }
+      selected.push_back(inputs[i]);
+    }
+    if (selected.empty()) {
+      // Every file in the range was created by the current manual compaction.
+      return nullptr;
+    }
+    if (selected.size() != inputs.size()) {
+      inputs.files.swap(selected);
     }
   }
 
   assert(compact_range_options.target_path_id <
          static_cast<uint32_t>(ioptions_.cf_paths.size()));
-
-  // for BOTTOM LEVEL compaction only, use max_file_num_to_ignore to filter out
-  // files that are created during the current compaction.
-  if ((compact_range_options.bottommost_level_compaction ==
-           BottommostLevelCompaction::kForceOptimized ||
-       compact_range_options.bottommost_level_compaction ==
-           BottommostLevelCompaction::kIfHaveCompactionFilter) &&
-      max_file_num_to_ignore != std::numeric_limits<uint64_t>::max()) {
-    assert(input_level == output_level);
-    // inputs_shrunk holds a continuous subset of input files which were all
-    // created before the current manual compaction
-    std::vector<FileMetaData*> inputs_shrunk;
-    size_t skip_input_index = inputs.size();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      if (inputs[i]->fd.GetNumber() < max_file_num_to_ignore) {
-        inputs_shrunk.push_back(inputs[i]);
-      } else if (!inputs_shrunk.empty()) {
-        // inputs[i] was created during the current manual compaction and
-        // need to be skipped
-        skip_input_index = i;
-        break;
-      }
-    }
-    if (inputs_shrunk.empty()) {
-      return nullptr;
-    }
-    if (inputs.size() != inputs_shrunk.size()) {
-      inputs.files.swap(inputs_shrunk);
-    }
-    // set covering_the_whole_range to false if there is any file that need to
-    // be compacted in the range of inputs[skip_input_index+1, inputs.size())
-    for (size_t i = skip_input_index + 1; i < inputs.size(); ++i) {
-      if (inputs[i]->fd.GetNumber() < max_file_num_to_ignore) {
-        covering_the_whole_range = false;
-      }
-    }
-  }
 
   InternalKey key_storage;
   InternalKey* next_smallest = &key_storage;

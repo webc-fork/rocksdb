@@ -583,6 +583,37 @@ TEST_F(RepairTest, RepairColumnFamilyOptions) {
   }
 }
 
+TEST_F(RepairTest, RepairRecordsBlobFileSetWhenEnabled) {
+  Options options = CurrentOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  DestroyAndReopen(options);
+
+  const std::string kValue(1000, 'a');
+  ASSERT_OK(Put("key", kValue));
+  ASSERT_OK(Flush());
+
+  std::string manifest_path =
+      DescriptorFileName(dbname_, dbfull()->TEST_Current_Manifest_FileNo());
+  Close();
+  ASSERT_OK(env_->FileExists(manifest_path));
+  ASSERT_OK(env_->DeleteFile(manifest_path));
+
+  Options repair_options = options;
+  repair_options.enable_blob_file_set_record = true;
+  ASSERT_OK(RepairDB(dbname_, repair_options));
+  Reopen(repair_options);
+
+  ASSERT_EQ(Get("key"), kValue);
+
+  std::vector<FileMetaData*> level0_files = GetLevelFileMetadatas(0);
+  ASSERT_EQ(level0_files.size(), 1);
+  ASSERT_NE(level0_files[0]->oldest_blob_file_number, kInvalidBlobFileNumber);
+  ASSERT_EQ(level0_files[0]->blob_file_set.size(), 1u);
+  ASSERT_TRUE(level0_files[0]->blob_file_set.contains(
+      level0_files[0]->oldest_blob_file_number));
+}
+
 TEST_F(RepairTest, DbNameContainsTrailingSlash) {
   {
     bool tmp;

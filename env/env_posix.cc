@@ -96,6 +96,77 @@ static const std::string kSharedLibExt = ".so";
 #endif
 #endif
 
+namespace port {
+
+constexpr bool is_leap_year(time_t year) noexcept {
+  return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+static const int g_daylight_active = [] {
+  tzset();  // Now 'timezone' global is populated.
+  time_t t = time(nullptr);
+  if (const struct tm* lt = localtime(&t)) {  // safe in global cons
+    return lt->tm_isdst;
+  }
+  return 0;
+}();
+
+static void nolocks_localtime(struct tm* tmp, time_t t, time_t tz,
+                              int dst) noexcept {
+  const int secs_min = 60;
+  const int secs_hour = 3600;
+  const int secs_day = 3600 * 24;
+
+  t -= tz;                         /* Adjust for timezone. */
+  t += 3600 * dst;                 /* Adjust for daylight time. */
+  int days = int(t / secs_day);    /* Days passed since epoch. */
+  int seconds = int(t % secs_day); /* Remaining seconds. */
+
+  tmp->tm_isdst = dst;
+  tmp->tm_hour = seconds / secs_hour;
+  tmp->tm_min = (seconds % secs_hour) / secs_min;
+  tmp->tm_sec = (seconds % secs_hour) % secs_min;
+
+  /* 1/1/1970 was a Thursday, that is, day 4 from the POV of the tm structure
+   * where sunday = 0, so to calculate the day of the week we have to add 4
+   * and take the modulo by 7. */
+  tmp->tm_wday = (days + 4) % 7;
+
+  /* Calculate the current year. */
+  tmp->tm_year = 1970;
+  while (1) {
+    /* Leap years have one day more. */
+    int days_this_year = 365 + is_leap_year(tmp->tm_year);
+    if (days_this_year > days) break;
+    days -= days_this_year;
+    tmp->tm_year++;
+  }
+  tmp->tm_yday = days; /* Number of day of the current year. */
+  /* We need to calculate in which month and day of the month we are. To do
+   * so we need to skip days according to how many days there are in each
+   * month, and adjust for the leap year that has one more day in February. */
+  static constexpr int kMonthDays[2][12] = {
+      {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+      {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}};
+  const int* mdays = kMonthDays[is_leap_year(tmp->tm_year)];
+
+  tmp->tm_mon = 0;
+  while (days >= mdays[tmp->tm_mon]) {
+    days -= mdays[tmp->tm_mon];
+    tmp->tm_mon++;
+  }
+
+  tmp->tm_mday = days + 1; /* Add 1 since our 'days' is zero-based. */
+  tmp->tm_year -= 1900;    /* Surprisingly tm_year is year-1900. */
+}
+
+struct tm* LocalTimeR(const time_t* timep, struct tm* result) {
+  nolocks_localtime(result, *timep, timezone, g_daylight_active);
+  return result;
+}
+
+}  // namespace port
+
 namespace {
 
 ThreadStatusUpdater* CreateThreadStatusUpdater() {

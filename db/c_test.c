@@ -418,6 +418,50 @@ static unsigned char CFilterFilter(void* arg, int level, const char* key,
   return 0;
 }
 
+static unsigned char CFilterBlobFallback(void* arg, int level, const char* key,
+                                         size_t key_length,
+                                         const char* existing_value,
+                                         size_t value_length, char** new_value,
+                                         size_t* new_value_length,
+                                         unsigned char* value_changed) {
+  (void)arg;
+  (void)level;
+  (void)new_value;
+  (void)new_value_length;
+  (void)value_changed;
+  CheckCondition(key_length == 3 && memcmp(key, "u01", key_length) == 0);
+  CheckCondition(value_length == 8 &&
+                 memcmp(existing_value, "uvalue00", value_length) == 0);
+  return 0; /* keep */
+}
+
+static int CFilterBlobByKey(void* arg, int level, const char* key,
+                            size_t key_length, char** new_value,
+                            size_t* new_value_length, char** skip_until,
+                            size_t* skip_until_length) {
+  (void)arg;
+  (void)level;
+  if (key_length == 3) {
+    if (memcmp(key, "bar", key_length) == 0) {
+      return 1; /* remove */
+    } else if (memcmp(key, "baz", key_length) == 0) {
+      *new_value = strdup("newbazvalue");
+      *new_value_length = 11;
+      return 2; /* change value */
+    } else if (memcmp(key, "u01", key_length) == 0) {
+      // Hand the decision back to RocksDB, which then reads the blob value and
+      // consults the plain filter.
+      return 8; /* undetermined */
+    }
+  } else if (key_length == 2 && memcmp(key, "k1", key_length) == 0) {
+    // Drop the whole ["k1", "k4") range in one go.
+    *skip_until = strdup("k4");
+    *skip_until_length = 2;
+    return 3; /* remove and skip until */
+  }
+  return 0; /* keep */
+}
+
 static void CFilterFactoryDestroy(void* arg) { (void)arg; }
 static const char* CFilterFactoryName(void* arg) {
   (void)arg;
@@ -789,6 +833,81 @@ void GetAndCheckMetaDataCf(rocksdb_t* db,
       rocksdb_get_column_family_metadata_cf(db, handle);
 
   CheckMetaData(cf_meta, cf_name);
+
+  rocksdb_column_family_metadata_destroy(cf_meta);
+}
+
+void CheckBlobMetaData(rocksdb_column_family_metadata_t* cf_meta) {
+  size_t blob_file_count =
+      rocksdb_column_family_metadata_get_blob_file_count(cf_meta);
+  assert(blob_file_count > 0);
+
+  uint64_t total_blob_file_size = 0;
+  for (size_t b = 0; b < blob_file_count; ++b) {
+    rocksdb_blob_metadata_t* blob_meta =
+        rocksdb_column_family_metadata_get_blob_metadata(cf_meta, b);
+    assert(blob_meta);
+
+    assert(rocksdb_blob_metadata_get_blob_file_number(blob_meta) > 0);
+
+    uint64_t blob_file_size =
+        rocksdb_blob_metadata_get_blob_file_size(blob_meta);
+    assert(blob_file_size > 0);
+    total_blob_file_size += blob_file_size;
+
+    uint64_t total_blob_count =
+        rocksdb_blob_metadata_get_total_blob_count(blob_meta);
+    uint64_t total_blob_bytes =
+        rocksdb_blob_metadata_get_total_blob_bytes(blob_meta);
+    assert(total_blob_count > 0);
+    assert(total_blob_bytes > 0);
+    // Besides the blob records the file also holds a header and a footer.
+    assert(blob_file_size > total_blob_bytes);
+    assert(rocksdb_blob_metadata_get_garbage_blob_count(blob_meta) <=
+           total_blob_count);
+    assert(rocksdb_blob_metadata_get_garbage_blob_bytes(blob_meta) <=
+           total_blob_bytes);
+
+    assert(rocksdb_blob_metadata_get_full_linked_ssts_count(blob_meta) >=
+           rocksdb_blob_metadata_get_linked_ssts_count(blob_meta));
+
+    rocksdb_blob_metadata_destroy(blob_meta);
+  }
+  assert(rocksdb_column_family_metadata_get_blob_file_size(cf_meta) ==
+         total_blob_file_size);
+  assert(rocksdb_column_family_metadata_get_blob_metadata(
+             cf_meta, blob_file_count) == NULL);
+
+  // At least one of the SST files must point at a blob file.
+  size_t blob_referencing_files = 0;
+  size_t level_count = rocksdb_column_family_metadata_get_level_count(cf_meta);
+  for (size_t l = 0; l < level_count; ++l) {
+    rocksdb_level_metadata_t* level_meta =
+        rocksdb_column_family_metadata_get_level_metadata(cf_meta, l);
+    assert(level_meta);
+    size_t file_count = rocksdb_level_metadata_get_file_count(level_meta);
+    for (size_t f = 0; f < file_count; ++f) {
+      rocksdb_sst_file_metadata_t* file_meta =
+          rocksdb_level_metadata_get_sst_file_metadata(level_meta, f);
+      assert(file_meta);
+      if (rocksdb_sst_file_metadata_get_oldest_blob_file_number(file_meta) !=
+          0) {
+        blob_referencing_files++;
+        assert(rocksdb_sst_file_metadata_get_blob_file_set_count(file_meta) >
+               0);
+      }
+      rocksdb_sst_file_metadata_destroy(file_meta);
+    }
+    rocksdb_level_metadata_destroy(level_meta);
+  }
+  assert(blob_referencing_files > 0);
+}
+
+void GetAndCheckBlobMetaData(rocksdb_t* db) {
+  rocksdb_column_family_metadata_t* cf_meta =
+      rocksdb_get_column_family_metadata(db);
+
+  CheckBlobMetaData(cf_meta);
 
   rocksdb_column_family_metadata_destroy(cf_meta);
 }
@@ -2684,6 +2803,92 @@ int main(int argc, char** argv) {
     rocksdb_options_destroy(options_with_filter_factory);
   }
 
+  StartPhase("compaction_filter_blob_by_key");
+  {
+    rocksdb_options_t* options_with_blob_filter = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(options_with_blob_filter, 1);
+    // Store every value in a blob file so that compaction reaches the keys
+    // through CompactionFilter::FilterBlobByKey.
+    rocksdb_options_set_enable_blob_files(options_with_blob_filter, 1);
+    rocksdb_options_set_min_blob_size(options_with_blob_filter, 0);
+    rocksdb_compactionfilter_t* cfilter;
+    cfilter = rocksdb_compactionfilter_create(NULL, CFilterDestroy,
+                                              CFilterBlobFallback, CFilterName);
+    rocksdb_compactionfilter_set_filter_blob_by_key(cfilter, CFilterBlobByKey);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options_with_blob_filter, dbname, &err);
+    rocksdb_options_set_compaction_filter(options_with_blob_filter, cfilter);
+    db = rocksdb_open(options_with_blob_filter, dbname, &err);
+    CheckNoError(err);
+
+    rocksdb_put(db, woptions, "foo", 3, "foovalue", 8, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar", 3, "barvalue", 8, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "baz", 3, "bazvalue", 8, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "u01", 3, "uvalue00", 8, &err);
+    CheckNoError(err);
+    // "k1" drops the range ["k1", "k4"), so only "k0" and "k4" survive.
+    int i;
+    for (i = 0; i < 5; i++) {
+      char key[3] = {'k', (char)('0' + i), '\0'};
+      char val[3] = {'v', (char)('0' + i), '\0'};
+      rocksdb_put(db, woptions, key, 2, val, 2, &err);
+      CheckNoError(err);
+    }
+
+    // A single compaction, so that every key is still a blob index and the
+    // plain filter is never a legitimate fallback.
+    rocksdb_compact_range(db, NULL, 0, NULL, 0);
+
+    CheckGet(db, roptions, "foo", "foovalue");    /* decision 0: keep */
+    CheckGet(db, roptions, "bar", NULL);          /* decision 1: remove */
+    CheckGet(db, roptions, "baz", "newbazvalue"); /* decision 2: change value */
+    CheckGet(db, roptions, "k0", "v0");
+    CheckGet(db, roptions, "k1", NULL); /* decision 3: remove and skip until */
+    CheckGet(db, roptions, "k2", NULL);
+    CheckGet(db, roptions, "k3", NULL);
+    CheckGet(db, roptions, "k4", "v4");
+    /* decision 8: undetermined, kept by the plain filter it fell back to */
+    CheckGet(db, roptions, "u01", "uvalue00");
+
+    rocksdb_options_set_compaction_filter(options_with_blob_filter, NULL);
+    rocksdb_compactionfilter_destroy(cfilter);
+    rocksdb_options_destroy(options_with_blob_filter);
+  }
+
+  StartPhase("blob_metadata");
+  {
+    rocksdb_options_t* options_with_blob = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(options_with_blob, 1);
+    rocksdb_options_set_enable_blob_files(options_with_blob, 1);
+    rocksdb_options_set_min_blob_size(options_with_blob, 0);
+    rocksdb_options_set_enable_blob_file_set_record(options_with_blob, 1);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options_with_blob, dbname, &err);
+    CheckNoError(err);
+    db = rocksdb_open(options_with_blob, dbname, &err);
+    CheckNoError(err);
+
+    int i;
+    for (i = 0; i < 5; i++) {
+      char key[4] = {'b', 'k', (char)('0' + i), '\0'};
+      rocksdb_put(db, woptions, key, 3, "blobvalue", 9, &err);
+      CheckNoError(err);
+    }
+    // Flushes the memtable and compacts, producing both the SST files and the
+    // blob files they reference.
+    rocksdb_compact_range(db, NULL, 0, NULL, 0);
+    CheckGet(db, roptions, "bk0", "blobvalue");
+
+    GetAndCheckBlobMetaData(db);
+
+    rocksdb_options_destroy(options_with_blob);
+  }
+
   StartPhase("merge_operator");
   {
     rocksdb_mergeoperator_t* merge_operator;
@@ -4044,6 +4249,59 @@ int main(int argc, char** argv) {
 
     rocksdb_options_set_prepopulate_blob_cache(o, 1 /* flush only */);
     CheckCondition(1 == rocksdb_options_get_prepopulate_blob_cache(o));
+
+    rocksdb_options_set_enable_blob_file_set_record(o, 1);
+    CheckCondition(1 == rocksdb_options_get_enable_blob_file_set_record(o));
+
+    rocksdb_options_set_enable_blob_list_gc(o, 1);
+    CheckCondition(1 == rocksdb_options_get_enable_blob_list_gc(o));
+
+    rocksdb_options_set_blob_list_gc_overall_garbage_ratio_low(o, 0.1);
+    CheckCondition(
+        0.1 == rocksdb_options_get_blob_list_gc_overall_garbage_ratio_low(o));
+
+    rocksdb_options_set_blob_list_gc_overall_garbage_ratio_middle(o, 0.2);
+    CheckCondition(
+        0.2 ==
+        rocksdb_options_get_blob_list_gc_overall_garbage_ratio_middle(o));
+
+    rocksdb_options_set_blob_list_gc_overall_gc_garbage_ratio_high(o, 0.3);
+    CheckCondition(
+        0.3 ==
+        rocksdb_options_get_blob_list_gc_overall_gc_garbage_ratio_high(o));
+
+    rocksdb_options_set_blob_list_gc_gc_garbage_ratio(o, 0.4);
+    CheckCondition(0.4 == rocksdb_options_get_blob_list_gc_gc_garbage_ratio(o));
+
+    rocksdb_options_set_blob_list_gc_hard_gc_garbage_ratio(o, 0.5);
+    CheckCondition(0.5 ==
+                   rocksdb_options_get_blob_list_gc_hard_gc_garbage_ratio(o));
+
+    rocksdb_options_set_blob_list_gc_max_blob_candidate_per_round(o, 20);
+    CheckCondition(
+        20 == rocksdb_options_get_blob_list_gc_max_blob_candidate_per_round(o));
+
+    rocksdb_options_set_blob_list_gc_max_blob_per_compaction(o, 21);
+    CheckCondition(21 ==
+                   rocksdb_options_get_blob_list_gc_max_blob_per_compaction(o));
+
+    rocksdb_options_set_blob_list_gc_max_sst_candidate_per_round(o, 30);
+    CheckCondition(
+        30 == rocksdb_options_get_blob_list_gc_max_sst_candidate_per_round(o));
+
+    rocksdb_options_set_blob_list_gc_sst_rewrite_garbage_bytes_ratio_threshold(
+        o, 0.8);
+    CheckCondition(
+        0.8 ==
+        rocksdb_options_get_blob_list_gc_sst_rewrite_garbage_bytes_ratio_threshold(
+            o));
+
+    rocksdb_options_set_blob_list_gc_hard_sst_rewrite_garbage_bytes_ratio_threshold(
+        o, 0.9);
+    CheckCondition(
+        0.9 ==
+        rocksdb_options_get_blob_list_gc_hard_sst_rewrite_garbage_bytes_ratio_threshold(
+            o));
 
     // Create a copy that should be equal to the original.
     rocksdb_options_t* copy;

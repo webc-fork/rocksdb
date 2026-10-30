@@ -570,8 +570,9 @@ Status CompactionOutputs::AddToOutput(
     smallest_preferred_seqno_ =
         std::min(smallest_preferred_seqno_, preferred_seqno);
   }
-  s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
-                                             ikey.type);
+  s = current_output().meta.UpdateBoundaries(
+      key, value, ikey.sequence, ikey.type,
+      compaction_->mutable_cf_options().enable_blob_file_set_record);
 
   return s;
 }

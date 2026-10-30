@@ -12,6 +12,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -116,6 +117,11 @@ enum NewFileCustomTag : uint32_t {
   kTailSize = 15,
   kUserDefinedTimestampsPersisted = 16,
   kFileOpenMetadata = 17,
+
+  // used to store the list of blob files referenced by this SST file
+  // should be careful when newFile4+ is introduced whether 63 is still safe to
+  // use
+  kBlobFileList = 63,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -284,6 +290,14 @@ struct FileMetaData {
   // refers to. 0 is an invalid value; BlobDB numbers the files starting from 1.
   uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
 
+  // Complete set of blob files referenced by this SST.
+  std::unordered_set<uint64_t> blob_file_set;
+
+  bool HasUntrackedBlobRefs() const noexcept {
+    return oldest_blob_file_number != kInvalidBlobFileNumber &&
+           blob_file_set.empty();
+  }
+
   // For flush output file, oldest ancestor time is the oldest key time in the
   // file.  If the oldest key time is not available, flush time is used.
   //
@@ -355,7 +369,8 @@ struct FileMetaData {
                const uint64_t _compensated_range_deletion_size,
                uint64_t _tail_size, bool _user_defined_timestamps_persisted,
                const std::string& _min_timestamp,
-               const std::string& _max_timestamp)
+               const std::string& _max_timestamp,
+               std::unordered_set<uint64_t> _blob_file_set = {})
       : fd(file, file_path_id, file_size, smallest_seq, largest_seq),
         smallest(smallest_key),
         largest(largest_key),
@@ -363,6 +378,7 @@ struct FileMetaData {
         marked_for_compaction(marked_for_compact),
         temperature(_temperature),
         oldest_blob_file_number(oldest_blob_file),
+        blob_file_set(std::move(_blob_file_set)),
         oldest_ancestor_time(_oldest_ancestor_time),
         file_creation_time(_file_creation_time),
         epoch_number(_epoch_number),
@@ -376,10 +392,32 @@ struct FileMetaData {
     TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", this);
   }
 
+  FileMetaData(uint64_t file, uint32_t file_path_id, uint64_t file_size,
+               const InternalKey& smallest_key, const InternalKey& largest_key,
+               const SequenceNumber& smallest_seq,
+               const SequenceNumber& largest_seq, bool marked_for_compact,
+               Temperature _temperature, uint64_t oldest_blob_file,
+               uint64_t _oldest_ancestor_time, uint64_t _file_creation_time,
+               uint64_t _epoch_number, const std::string& _file_checksum,
+               const std::string& _file_checksum_func_name,
+               UniqueId64x2 _unique_id,
+               const uint64_t _compensated_range_deletion_size,
+               uint64_t _tail_size, bool _user_defined_timestamps_persisted,
+               std::unordered_set<uint64_t> _blob_file_set = {})
+      : FileMetaData(file, file_path_id, file_size, smallest_key, largest_key,
+                     smallest_seq, largest_seq, marked_for_compact,
+                     _temperature, oldest_blob_file, _oldest_ancestor_time,
+                     _file_creation_time, _epoch_number, _file_checksum,
+                     _file_checksum_func_name, std::move(_unique_id),
+                     _compensated_range_deletion_size, _tail_size,
+                     _user_defined_timestamps_persisted, "", "",
+                     std::move(_blob_file_set)) {}
+
   // REQUIRED: Keys must be given to the function in sorted order (it expects
   // the last key to be the largest).
   Status UpdateBoundaries(const Slice& key, const Slice& value,
-                          SequenceNumber seqno, ValueType value_type);
+                          SequenceNumber seqno, ValueType value_type,
+                          bool record_blob_file_set = false);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any
   // particular order.
@@ -837,9 +875,10 @@ class VersionEdit {
                const UniqueId64x2& unique_id,
                const uint64_t compensated_range_deletion_size,
                uint64_t tail_size, bool user_defined_timestamps_persisted,
-               const std::string& min_timestamp = "",
-               const std::string& max_timestamp = "",
-               const std::string& file_open_metadata = "") {
+               const std::string& min_timestamp,
+               const std::string& max_timestamp,
+               const std::string& file_open_metadata = "",
+               std::unordered_set<uint64_t> blob_file_set = {}) {
     assert(smallest_seqno <= largest_seqno);
     new_files_.emplace_back(
         level,
@@ -849,7 +888,8 @@ class VersionEdit {
             oldest_blob_file_number, oldest_ancestor_time, file_creation_time,
             epoch_number, file_checksum, file_checksum_func_name, unique_id,
             compensated_range_deletion_size, tail_size,
-            user_defined_timestamps_persisted, min_timestamp, max_timestamp));
+            user_defined_timestamps_persisted, min_timestamp, max_timestamp,
+            std::move(blob_file_set)));
     if (!file_open_metadata.empty()) {
       new_files_.back().second.file_open_metadata = file_open_metadata;
     }
@@ -857,6 +897,27 @@ class VersionEdit {
     if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
       SetLastSequence(largest_seqno);
     }
+  }
+
+  void AddFile(int level, uint64_t file, uint32_t file_path_id,
+               uint64_t file_size, const InternalKey& smallest,
+               const InternalKey& largest, const SequenceNumber& smallest_seqno,
+               const SequenceNumber& largest_seqno, bool marked_for_compaction,
+               Temperature temperature, uint64_t oldest_blob_file_number,
+               uint64_t oldest_ancestor_time, uint64_t file_creation_time,
+               uint64_t epoch_number, const std::string& file_checksum,
+               const std::string& file_checksum_func_name,
+               const UniqueId64x2& unique_id,
+               const uint64_t compensated_range_deletion_size,
+               uint64_t tail_size, bool user_defined_timestamps_persisted,
+               std::unordered_set<uint64_t> blob_file_set = {}) {
+    AddFile(level, file, file_path_id, file_size, smallest, largest,
+            smallest_seqno, largest_seqno, marked_for_compaction, temperature,
+            oldest_blob_file_number, oldest_ancestor_time, file_creation_time,
+            epoch_number, file_checksum, file_checksum_func_name, unique_id,
+            compensated_range_deletion_size, tail_size,
+            user_defined_timestamps_persisted, "", "", "",
+            std::move(blob_file_set));
   }
 
   void AddFile(int level, const FileMetaData& f) {

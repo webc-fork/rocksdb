@@ -1835,8 +1835,14 @@ void InternalStats::DumpCFMapStats(
 void InternalStats::DumpCFMapStats(
     const VersionStorageInfo* vstorage,
     std::map<int, std::map<LevelStatType, double>>* levels_stats,
-    CompactionStats* compaction_stats_sum) {
+    CompactionStats* compaction_stats_sum,
+    bool* found_untracked_sst_blob_refs) {
   assert(vstorage);
+
+  bool found_untracked_sst_blob = false;
+  const bool check_untracked_blob_refs =
+      found_untracked_sst_blob_refs != nullptr &&
+      cfd_->GetLatestMutableCFOptions().enable_blob_list_garbage_collection;
 
   int num_levels_to_check =
       (cfd_->ioptions().compaction_style == kCompactionStyleLevel)
@@ -1857,7 +1863,14 @@ void InternalStats::DumpCFMapStats(
       if (f->being_compacted) {
         ++files_being_compacted[level];
       }
+      if (!found_untracked_sst_blob && check_untracked_blob_refs &&
+          f->HasUntrackedBlobRefs()) {
+        found_untracked_sst_blob = true;
+      }
     }
+  }
+  if (found_untracked_sst_blob_refs != nullptr) {
+    *found_untracked_sst_blob_refs = found_untracked_sst_blob;
   }
 
   int total_files = 0;
@@ -2022,7 +2035,9 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
   const VersionStorageInfo* vstorage = cfd_->current()->storage_info();
   std::map<int, std::map<LevelStatType, double>> levels_stats;
   CompactionStats compaction_stats_sum;
-  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum);
+  bool found_untracked_sst_blob_refs = false;
+  DumpCFMapStats(vstorage, &levels_stats, &compaction_stats_sum,
+                 &found_untracked_sst_blob_refs);
   for (int l = 0; l < number_levels_; ++l) {
     if (levels_stats.find(l) != levels_stats.end()) {
       PrintLevelStats(buf, sizeof(buf), "L" + std::to_string(l),
@@ -2069,6 +2084,12 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
           priorities_stats[static_cast<int>(priority)]);
       value->append(buf);
     }
+  }
+
+  if (found_untracked_sst_blob_refs) {
+    value->append(
+        "\nWARNING: blob list GC enabled, but some blob file set records "
+        "are missing\n");
   }
 
   const auto blob_st = vstorage->GetBlobStats();

@@ -64,7 +64,8 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
-                                      ValueType value_type) {
+                                      ValueType value_type,
+                                      bool record_blob_file_set) {
   // Helper: update oldest_blob_file_number from a single BlobIndex.
   auto update_oldest_blob = [&](const BlobIndex& blob_index) -> Status {
     if (!blob_index.IsInlined() && !blob_index.HasTTL()) {
@@ -92,6 +93,10 @@ Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
       if (oldest_blob_file_number == kInvalidBlobFileNumber ||
           oldest_blob_file_number > blob_index.file_number()) {
         oldest_blob_file_number = blob_index.file_number();
+      }
+
+      if (record_blob_file_set) {
+        blob_file_set.insert(blob_index.file_number());
       }
     }
     return Status::OK();
@@ -407,6 +412,15 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     PutVarint32(dst, NewFileCustomTag::kFileOpenMetadata);
     PutLengthPrefixedSlice(dst, Slice(f.file_open_metadata));
   }
+  if (!f.blob_file_set.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kBlobFileList);
+    std::string val;
+    PutVarint32(&val, static_cast<uint32_t>(f.blob_file_set.size()));
+    for (uint64_t blob_num : f.blob_file_set) {
+      PutVarint64(&val, blob_num);
+    }
+    PutLengthPrefixedSlice(dst, Slice(val));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -555,6 +569,22 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
         case kFileOpenMetadata:
           f.file_open_metadata = field.ToString();
           break;
+        case kBlobFileList: {
+          uint32_t count;
+          if (!GetVarint32(&field, &count)) {
+            return "blob file list: missing count";
+          }
+          f.blob_file_set.clear();
+          f.blob_file_set.reserve(count);
+          for (uint32_t i = 0; i < count; i++) {
+            uint64_t blob_num;
+            if (!GetVarint64(&field, &blob_num)) {
+              return "blob file list: missing entry";
+            }
+            f.blob_file_set.insert(blob_num);
+          }
+          break;
+        }
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it
@@ -566,6 +596,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
   } else {
     return "new-file4 entry";
   }
+
   f.fd =
       FileDescriptor(number, path_id, file_size, smallest_seqno, largest_seqno);
   new_files.emplace_back(level, f);
@@ -1042,6 +1073,13 @@ std::string VersionEdit::DebugString(bool hex_key) const {
       r.append(" blob_file:");
       AppendNumberTo(&r, f.oldest_blob_file_number);
     }
+    if (!f.blob_file_set.empty()) {
+      r.append(" blob_file_set:");
+      for (uint64_t blob_num : f.blob_file_set) {
+        r.append(" ");
+        AppendNumberTo(&r, blob_num);
+      }
+    }
     // Misspelled label kept for compatibility with tools parsing this output
     r.append(" oldest_ancester_time:");
     AppendNumberTo(&r, f.oldest_ancestor_time);
@@ -1197,6 +1235,14 @@ std::string VersionEdit::DebugJSON(int edit_num, bool hex_key) const {
       }
       if (f.oldest_blob_file_number != kInvalidBlobFileNumber) {
         jw << "OldestBlobFile" << f.oldest_blob_file_number;
+      }
+      if (!f.blob_file_set.empty()) {
+        jw << "BlobFileSet";
+        jw.StartArray();
+        for (uint64_t blob_num : f.blob_file_set) {
+          jw << blob_num;
+        }
+        jw.EndArray();
       }
       if (f.temperature != Temperature::kUnknown) {
         // Maybe change to human readable format whenthe feature becomes

@@ -8765,6 +8765,8 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
   }
 
   MoveFilesToLevel(2);
+  const int old_l2_files = NumTableFilesAtLevel(2);
+  ASSERT_GT(old_l2_files, 0);
 
   for (auto i = 0; i < 8; ++i) {
     for (auto j = 0; j < 10; ++j) {
@@ -8785,7 +8787,7 @@ TEST_F(DBCompactionTest, ManualCompactionBottomLevelOptimized) {
   const std::vector<InternalStats::CompactionStats>& comp_stats2 =
       internal_stats_ptr->TEST_GetCompactionStats();
   num = comp_stats2[2].num_input_files_in_output_level;
-  ASSERT_EQ(num, 0);
+  ASSERT_EQ(num, old_l2_files);
 }
 
 TEST_F(DBCompactionTest, ManualCompactionMax) {
@@ -10060,6 +10062,174 @@ TEST_F(DBCompactionTest, SingleOverlappingNonL0BottommostManualCompaction) {
     cro.bottommost_level_compaction = b;
     ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
     ASSERT_EQ(NumTableFilesAtLevel(4), 1);
+  }
+}
+
+TEST_F(DBCompactionTest, BottommostManualCompactionSkipNewFilesAndFinishRange) {
+  class CompactionInputRecorder : public EventListener {
+   public:
+    struct Event {
+      int base_input_level;
+      int output_level;
+      std::vector<uint64_t> input_file_numbers;
+      std::vector<uint64_t> output_file_numbers;
+    };
+
+    void OnCompactionCompleted(DB* /*db*/,
+                               const CompactionJobInfo& ci) override {
+      std::lock_guard<std::mutex> lock(mutex_);
+      Event e;
+      e.base_input_level = ci.base_input_level;
+      e.output_level = ci.output_level;
+      for (const auto& f : ci.input_file_infos) {
+        e.input_file_numbers.push_back(f.file_number);
+      }
+      for (const auto& f : ci.output_file_infos) {
+        e.output_file_numbers.push_back(f.file_number);
+      }
+      events_.push_back(std::move(e));
+    }
+
+    void Reset() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      events_.clear();
+    }
+
+    std::vector<Event> GetEvents() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return events_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::vector<Event> events_;
+  };
+
+  constexpr int kBottomLevel = 6;
+  constexpr int kNumBottomFiles = 10;
+  constexpr int kKeysPerFile = 100;
+  constexpr int kValueSize = 100;
+  // Index of the pre-existing L6 file that the L5 -> L6 push-down rewrites.
+  // Keeping it away from both ends leaves old files on either side of it.
+  constexpr int kRewrittenFileIdx = 5;
+
+  auto recorder = std::make_shared<CompactionInputRecorder>();
+  Options options = CurrentOptions();
+  options.num_levels = kBottomLevel + 1;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.disable_auto_compactions = true;
+  // Keep each compaction's output in a single file so the file counts asserted
+  // below are unambiguous, and make sure `max_compaction_bytes` never cuts the
+  // manual compaction: the only cut under test is the file-number based one.
+  options.target_file_size_base = 64 << 20;
+  options.max_compaction_bytes = 1 << 30;
+  options.listeners.emplace_back(recorder);
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  // L6: `kNumBottomFiles` non-overlapping files, all created before (and hence
+  // "old" with respect to) the `CompactRange()` below.
+  for (int i = 0; i < kNumBottomFiles; i++) {
+    for (int j = 0; j < kKeysPerFile; j++) {
+      ASSERT_OK(Put(Key(i * kKeysPerFile + j), rnd.RandomString(kValueSize)));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(kBottomLevel);
+  ASSERT_EQ(kNumBottomFiles, NumTableFilesAtLevel(kBottomLevel));
+
+  // L5: one file overlapping exactly one L6 file. That makes the push-down a
+  // real compaction rather than a trivial move, so its output gets a file
+  // number above the `max_file_num_to_ignore` snapshot that `CompactRange()`
+  // takes before pushing data down.
+  for (int j = 0; j < kKeysPerFile; j++) {
+    ASSERT_OK(Put(Key(kRewrittenFileIdx * kKeysPerFile + j),
+                  rnd.RandomString(kValueSize)));
+  }
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(kBottomLevel - 1);
+  ASSERT_EQ(1, NumTableFilesAtLevel(kBottomLevel - 1));
+  ASSERT_EQ(kNumBottomFiles, NumTableFilesAtLevel(kBottomLevel));
+
+  // Remember which L6 files existed before the manual compaction.
+  std::set<uint64_t> old_bottom_files;
+  {
+    ColumnFamilyMetaData cf_meta;
+    db_->GetColumnFamilyMetaData(&cf_meta);
+    ASSERT_EQ(static_cast<size_t>(options.num_levels), cf_meta.levels.size());
+    for (const auto& f : cf_meta.levels[kBottomLevel].files) {
+      old_bottom_files.insert(f.file_number);
+    }
+  }
+  ASSERT_EQ(static_cast<size_t>(kNumBottomFiles), old_bottom_files.size());
+
+  recorder->Reset();
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForceOptimized;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  // Sort the compactions this `CompactRange()` ran into the L5 -> L6 push-down
+  // and the bottommost intra-level rounds.
+  std::set<uint64_t> pushed_down_inputs;   // old L6 files eaten by L5 -> L6
+  std::set<uint64_t> pushed_down_outputs;  // the "new" L6 files
+  std::set<uint64_t> intra_level_inputs;
+  int num_intra_level_compactions = 0;
+  for (const auto& e : recorder->GetEvents()) {
+    if (e.base_input_level == kBottomLevel - 1 &&
+        e.output_level == kBottomLevel) {
+      for (uint64_t n : e.input_file_numbers) {
+        if (old_bottom_files.contains(n)) {
+          pushed_down_inputs.insert(n);
+        }
+      }
+      pushed_down_outputs.insert(e.output_file_numbers.begin(),
+                                 e.output_file_numbers.end());
+    } else if (e.base_input_level == kBottomLevel &&
+               e.output_level == kBottomLevel) {
+      num_intra_level_compactions++;
+      intra_level_inputs.insert(e.input_file_numbers.begin(),
+                                e.input_file_numbers.end());
+    }
+  }
+
+  // Sanity check on the setup: the push-down did rewrite one old L6 file in the
+  // middle of the level. Without this the rest of the test would be vacuous.
+  ASSERT_EQ(1U, pushed_down_inputs.size());
+  ASSERT_FALSE(pushed_down_outputs.empty());
+
+  // (1) `max_file_num_to_ignore` works: nothing the push-down just wrote is fed
+  //     back into the bottommost intra-level compaction.
+  for (uint64_t n : pushed_down_outputs) {
+    ASSERT_FALSE(intra_level_inputs.contains(n))
+        << "file #" << n << " was created by this CompactRange() and must not "
+        << "be an input of the bottommost intra-level compaction";
+  }
+
+  // (2) The cut from (1) does not end the manual compaction early: every old L6
+  //     file the push-down did not consume is rewritten, including the ones
+  //     sorting after the skipped file.
+  std::set<uint64_t> expected_intra_level_inputs;
+  for (uint64_t n : old_bottom_files) {
+    if (!pushed_down_inputs.contains(n)) {
+      expected_intra_level_inputs.insert(n);
+    }
+  }
+  ASSERT_EQ(expected_intra_level_inputs, intra_level_inputs);
+  // It takes exactly two rounds because the skipped file splits the range in
+  // two; with the old code the second round never happened.
+  ASSERT_EQ(2, num_intra_level_compactions);
+
+  // L5 is drained and L6 holds one file for the old files before the skipped
+  // one, the skipped file itself, and one file for the old files after it.
+  ASSERT_EQ(0, NumTableFilesAtLevel(kBottomLevel - 1));
+  ASSERT_EQ(3, NumTableFilesAtLevel(kBottomLevel));
+
+  // No data was lost along the way.
+  for (int i = 0; i < kNumBottomFiles; i++) {
+    for (int j = 0; j < kKeysPerFile; j++) {
+      ASSERT_NE("NOT_FOUND", Get(Key(i * kKeysPerFile + j)));
+    }
   }
 }
 
