@@ -15,6 +15,8 @@
 #include <functional>
 #include <future>
 #include <tuple>
+#include <unordered_set>
+#include <vector>
 
 #include "db/blob/blob_log_writer.h"
 #include "db/db_impl/db_impl.h"
@@ -62,8 +64,7 @@ class GenerateLevelFilesBriefTest : public testing::Test {
         kInvalidBlobFileNumber, kUnknownOldestAncestorTime,
         kUnknownFileCreationTime, kUnknownEpochNumber, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
-        /* max timestamp */ "");
+        /* user_defined_timestamps_persisted */ true, {});
     files_.push_back(f);
   }
 
@@ -159,19 +160,23 @@ class VersionStorageInfoTestBase : public testing::Test {
   void Add(int level, uint32_t file_number, const char* smallest,
            const char* largest, uint64_t file_size = 0,
            uint64_t oldest_blob_file_number = kInvalidBlobFileNumber,
+           const std::vector<uint64_t>& blob_file_set = {},
            uint64_t compensated_range_deletion_size = 0) {
     constexpr SequenceNumber dummy_seq = 0;
 
     Add(level, file_number, GetInternalKey(smallest, dummy_seq),
         GetInternalKey(largest, dummy_seq), file_size, oldest_blob_file_number,
-        compensated_range_deletion_size);
+        blob_file_set, compensated_range_deletion_size);
   }
 
   void Add(int level, uint32_t file_number, const InternalKey& smallest,
            const InternalKey& largest, uint64_t file_size = 0,
            uint64_t oldest_blob_file_number = kInvalidBlobFileNumber,
+           const std::vector<uint64_t>& blob_file_set = {},
            uint64_t compensated_range_deletion_size = 0) {
     assert(level < vstorage_.num_levels());
+    std::unordered_set<uint64_t> blob_files(blob_file_set.begin(),
+                                            blob_file_set.end());
     FileMetaData* f = new FileMetaData(
         file_number, 0, file_size, smallest, largest, /* smallest_seq */ 0,
         /* largest_seq */ 0, /* marked_for_compact */ false,
@@ -179,22 +184,22 @@ class VersionStorageInfoTestBase : public testing::Test {
         kUnknownOldestAncestorTime, kUnknownFileCreationTime,
         kUnknownEpochNumber, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
         kNullUniqueId64x2, compensated_range_deletion_size, 0,
-        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
-        /* max timestamp */ "");
+        /* user_defined_timestamps_persisted */ true, std::move(blob_files));
     vstorage_.AddFile(level, f);
   }
 
   void AddBlob(uint64_t blob_file_number, uint64_t total_blob_count,
                uint64_t total_blob_bytes,
                BlobFileMetaData::LinkedSsts linked_ssts,
+               BlobFileMetaData::FullLinkedSsts full_linked_ssts,
                uint64_t garbage_blob_count, uint64_t garbage_blob_bytes) {
     auto shared_meta = SharedBlobFileMetaData::Create(
         blob_file_number, total_blob_count, total_blob_bytes,
         /* checksum_method */ std::string(),
         /* checksum_value */ std::string());
-    auto meta =
-        BlobFileMetaData::Create(std::move(shared_meta), std::move(linked_ssts),
-                                 garbage_blob_count, garbage_blob_bytes);
+    auto meta = BlobFileMetaData::Create(
+        std::move(shared_meta), std::move(linked_ssts),
+        std::move(full_linked_ssts), garbage_blob_count, garbage_blob_bytes);
 
     vstorage_.AddBlobFile(std::move(meta));
   }
@@ -675,7 +680,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
     constexpr char largest[] = "foo1";
     constexpr uint64_t file_size = 1000;
 
-    Add(level, sst, smallest, largest, file_size, first_blob);
+    Add(level, sst, smallest, largest, file_size, first_blob,
+        {first_blob, second_blob, third_blob, fourth_blob});
   }
 
   {
@@ -685,7 +691,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
     constexpr uint64_t garbage_blob_bytes = 15000;
 
     AddBlob(first_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{sst}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{sst},
+            BlobFileMetaData::FullLinkedSsts{sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -696,7 +703,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
     constexpr uint64_t garbage_blob_bytes = 235000;
 
     AddBlob(second_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{},
+            BlobFileMetaData::FullLinkedSsts{sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -707,7 +715,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
     constexpr uint64_t garbage_blob_bytes = 400000;
 
     AddBlob(third_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{},
+            BlobFileMetaData::FullLinkedSsts{sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -718,7 +727,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCSingleBatch) {
     constexpr uint64_t garbage_blob_bytes = 600000;
 
     AddBlob(fourth_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{},
+            BlobFileMetaData::FullLinkedSsts{sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -794,7 +804,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr char largest[] = "foo1";
     constexpr uint64_t file_size = 1000;
 
-    Add(level, first_sst, smallest, largest, file_size, first_blob);
+    Add(level, first_sst, smallest, largest, file_size, first_blob,
+        {first_blob, second_blob});
   }
 
   {
@@ -802,7 +813,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr char largest[] = "foo2";
     constexpr uint64_t file_size = 2000;
 
-    Add(level, second_sst, smallest, largest, file_size, first_blob);
+    Add(level, second_sst, smallest, largest, file_size, first_blob,
+        {first_blob, second_blob});
   }
 
   {
@@ -810,7 +822,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr char largest[] = "foo3";
     constexpr uint64_t file_size = 3000;
 
-    Add(level, third_sst, smallest, largest, file_size, third_blob);
+    Add(level, third_sst, smallest, largest, file_size, third_blob,
+        {third_blob, fourth_blob});
   }
 
   {
@@ -821,6 +834,7 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
 
     AddBlob(first_blob, total_blob_count, total_blob_bytes,
             BlobFileMetaData::LinkedSsts{first_sst, second_sst},
+            BlobFileMetaData::FullLinkedSsts{first_sst, second_sst},
             garbage_blob_count, garbage_blob_bytes);
   }
 
@@ -831,8 +845,9 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr uint64_t garbage_blob_bytes = 235000;
 
     AddBlob(second_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{}, garbage_blob_count,
-            garbage_blob_bytes);
+            BlobFileMetaData::LinkedSsts{},
+            BlobFileMetaData::FullLinkedSsts{first_sst, second_sst},
+            garbage_blob_count, garbage_blob_bytes);
   }
 
   {
@@ -842,7 +857,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr uint64_t garbage_blob_bytes = 123456;
 
     AddBlob(third_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{third_sst}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{third_sst},
+            BlobFileMetaData::FullLinkedSsts{third_sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -853,7 +869,8 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     constexpr uint64_t garbage_blob_bytes = 88888888;
 
     AddBlob(fourth_blob, total_blob_count, total_blob_bytes,
-            BlobFileMetaData::LinkedSsts{}, garbage_blob_count,
+            BlobFileMetaData::LinkedSsts{},
+            BlobFileMetaData::FullLinkedSsts{third_sst}, garbage_blob_count,
             garbage_blob_bytes);
   }
 
@@ -915,6 +932,354 @@ TEST_F(VersionStorageInfoTest, ForcedBlobGCMultipleBatches) {
     ASSERT_EQ(ssts_to_be_compacted[0], expected_ssts_to_be_compacted[0]);
     ASSERT_EQ(ssts_to_be_compacted[1], expected_ssts_to_be_compacted[1]);
   }
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCBelowLowThreshold) {
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t blob = 10;
+
+  Add(level, sst, "a", "z", /*file_size=*/1000, blob, {blob});
+  AddBlob(blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{sst},
+          BlobFileMetaData::FullLinkedSsts{sst},
+          /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/5000);
+
+  UpdateVersionStorageInfo();
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.05);
+}
+
+TEST_F(VersionStorageInfoTest,
+       ForceBlobListGCSkipsBlobWithoutFullLinkedSstsButCountsOverallRatio) {
+  constexpr int level = 0;
+  constexpr uint64_t sst = 1;
+  constexpr uint64_t linked_blob = 10;
+  constexpr uint64_t unlinked_blob = 11;
+
+  Add(level, sst, "a", "z", /*file_size=*/1000, linked_blob, {linked_blob});
+  AddBlob(linked_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{sst},
+          BlobFileMetaData::FullLinkedSsts{sst},
+          /*garbage_blob_count=*/8, /*garbage_blob_bytes=*/80000);
+  AddBlob(unlinked_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{sst}, BlobFileMetaData::FullLinkedSsts{},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  const auto& marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 1U);
+  ASSERT_EQ(marked[0].first, level);
+  ASSERT_EQ(marked[0].second->fd.GetNumber(), sst);
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.85);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCLowTierRewriteFilter) {
+  constexpr int level = 0;
+  constexpr uint64_t high_efficiency_sst = 1;
+  constexpr uint64_t low_efficiency_sst = 2;
+  constexpr uint64_t high_garbage_blob = 10;
+  constexpr uint64_t clean_blob1 = 11;
+  constexpr uint64_t clean_blob2 = 12;
+
+  Add(level, high_efficiency_sst, "a", "m", /*file_size=*/10000,
+      high_garbage_blob, {high_garbage_blob});
+  Add(level, low_efficiency_sst, "n", "z", /*file_size=*/100000,
+      high_garbage_blob, {high_garbage_blob});
+
+  AddBlob(
+      high_garbage_blob, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/100000, BlobFileMetaData::LinkedSsts{},
+      BlobFileMetaData::FullLinkedSsts{high_efficiency_sst, low_efficiency_sst},
+      /*garbage_blob_count=*/8, /*garbage_blob_bytes=*/85000);
+  AddBlob(clean_blob1, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{high_efficiency_sst},
+          /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/10000);
+  AddBlob(clean_blob2, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{low_efficiency_sst},
+          /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/10000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  const auto& marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 1U);
+  ASSERT_EQ(marked[0].first, level);
+  ASSERT_EQ(marked[0].second->fd.GetNumber(), high_efficiency_sst);
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.35);
+}
+
+TEST_F(VersionStorageInfoTest,
+       ForceBlobListGCLowTierZeroRewriteThresholdSkipsFilter) {
+  constexpr int level = 0;
+  constexpr uint64_t high_efficiency_sst = 1;
+  constexpr uint64_t low_efficiency_sst = 2;
+  constexpr uint64_t high_garbage_blob = 10;
+  constexpr uint64_t clean_blob1 = 11;
+  constexpr uint64_t clean_blob2 = 12;
+
+  Add(level, high_efficiency_sst, "a", "m", /*file_size=*/10000,
+      high_garbage_blob, {high_garbage_blob});
+  Add(level, low_efficiency_sst, "n", "z", /*file_size=*/100000,
+      high_garbage_blob, {high_garbage_blob});
+
+  AddBlob(
+      high_garbage_blob, /*total_blob_count=*/10,
+      /*total_blob_bytes=*/100000, BlobFileMetaData::LinkedSsts{},
+      BlobFileMetaData::FullLinkedSsts{high_efficiency_sst, low_efficiency_sst},
+      /*garbage_blob_count=*/8, /*garbage_blob_bytes=*/85000);
+  AddBlob(clean_blob1, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{high_efficiency_sst},
+          /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/10000);
+  AddBlob(clean_blob2, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{low_efficiency_sst},
+          /*garbage_blob_count=*/1, /*garbage_blob_bytes=*/10000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+  mutable_cf_options_
+      .blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold = 0.0;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  auto marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 2U);
+
+  std::sort(marked.begin(), marked.end(),
+            [](const std::pair<int, FileMetaData*>& lhs,
+               const std::pair<int, FileMetaData*>& rhs) {
+              return lhs.second->fd.GetNumber() < rhs.second->fd.GetNumber();
+            });
+
+  ASSERT_EQ(marked[0].second->fd.GetNumber(), high_efficiency_sst);
+  ASSERT_EQ(marked[1].second->fd.GetNumber(), low_efficiency_sst);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCHighTierNoRewriteFilter) {
+  constexpr int level = 0;
+  constexpr uint64_t first_sst = 1;
+  constexpr uint64_t second_sst = 2;
+  constexpr uint64_t high_garbage_blob = 10;
+  constexpr uint64_t low_garbage_blob = 11;
+
+  Add(level, first_sst, "a", "m", /*file_size=*/10000, high_garbage_blob,
+      {high_garbage_blob});
+  Add(level, second_sst, "n", "z", /*file_size=*/200000, high_garbage_blob,
+      {high_garbage_blob});
+
+  AddBlob(high_garbage_blob, /*total_blob_count=*/40,
+          /*total_blob_bytes=*/400000, BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{first_sst, second_sst},
+          /*garbage_blob_count=*/38, /*garbage_blob_bytes=*/380000);
+  AddBlob(low_garbage_blob, /*total_blob_count=*/10,
+          /*total_blob_bytes=*/100000, BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{first_sst},
+          /*garbage_blob_count=*/5, /*garbage_blob_bytes=*/50000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  auto marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 2U);
+
+  std::sort(marked.begin(), marked.end(),
+            [](const std::pair<int, FileMetaData*>& lhs,
+               const std::pair<int, FileMetaData*>& rhs) {
+              return lhs.second->fd.GetNumber() < rhs.second->fd.GetNumber();
+            });
+
+  ASSERT_EQ(marked[0].second->fd.GetNumber(), first_sst);
+  ASSERT_EQ(marked[1].second->fd.GetNumber(), second_sst);
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.86);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCMiddleTierRewriteFilter) {
+  constexpr int level = 0;
+  constexpr uint64_t sst_pass = 1;
+  constexpr uint64_t sst_fail = 2;
+  constexpr uint64_t mid_blob = 10;
+
+  Add(level, sst_pass, "a", "m", /*file_size=*/25000, mid_blob, {mid_blob});
+  Add(level, sst_fail, "n", "z", /*file_size=*/100000, mid_blob, {mid_blob});
+
+  AddBlob(mid_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{sst_pass, sst_fail},
+          /*garbage_blob_count=*/6, /*garbage_blob_bytes=*/55000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+  mutable_cf_options_.blob_list_garbage_hard_gc_garbage_ratio = 0.3;
+  mutable_cf_options_.blob_list_garbage_gc_garbage_ratio = 0.8;
+  mutable_cf_options_
+      .blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold = 1.0;
+  mutable_cf_options_
+      .blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold = 5.0;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.55);
+
+  const auto& marked = vstorage_.FilesMarkedForForcedBlobGC();
+  ASSERT_EQ(marked.size(), 1U);
+  ASSERT_EQ(marked[0].first, level);
+  ASSERT_EQ(marked[0].second->fd.GetNumber(), sst_pass);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCMaxBlobCandidatePerRound) {
+  constexpr int level = 0;
+  constexpr uint64_t first_sst = 1;
+  constexpr uint64_t second_sst = 2;
+  constexpr uint64_t third_sst = 3;
+  constexpr uint64_t first_blob = 10;
+  constexpr uint64_t second_blob = 11;
+  constexpr uint64_t third_blob = 12;
+
+  Add(level, first_sst, "a", "i", /*file_size=*/10000, first_blob,
+      {first_blob});
+  Add(level, second_sst, "j", "r", /*file_size=*/10000, second_blob,
+      {second_blob});
+  Add(level, third_sst, "s", "z", /*file_size=*/10000, third_blob,
+      {third_blob});
+
+  AddBlob(first_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{first_sst},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+  AddBlob(second_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{second_sst},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+  AddBlob(third_blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{third_sst},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+  mutable_cf_options_.blob_list_garbage_hard_gc_garbage_ratio = 0.5;
+  mutable_cf_options_.blob_list_garbage_max_blob_candidate_per_round = 1;
+  mutable_cf_options_.blob_list_garbage_max_sst_candidate_per_round = 100;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  ASSERT_TRUE(vstorage_.OverallBlobGarbageRatio().has_value());
+  ASSERT_DOUBLE_EQ(*vstorage_.OverallBlobGarbageRatio(), 0.9);
+
+  ASSERT_EQ(vstorage_.FilesMarkedForForcedBlobGC().size(), 1U);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCMaxSstCandidatePerRound) {
+  constexpr int level = 0;
+  constexpr uint64_t first_sst = 1;
+  constexpr uint64_t second_sst = 2;
+  constexpr uint64_t third_sst = 3;
+  constexpr uint64_t blob = 10;
+
+  Add(level, first_sst, "a", "i", /*file_size=*/10000, blob, {blob});
+  Add(level, second_sst, "j", "r", /*file_size=*/10000, blob, {blob});
+  Add(level, third_sst, "s", "z", /*file_size=*/10000, blob, {blob});
+
+  AddBlob(blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{first_sst, second_sst, third_sst},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+  mutable_cf_options_.blob_list_garbage_hard_gc_garbage_ratio = 0.5;
+  mutable_cf_options_.blob_list_garbage_max_blob_candidate_per_round = 100;
+  mutable_cf_options_.blob_list_garbage_max_sst_candidate_per_round = 2;
+
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+
+  ASSERT_EQ(vstorage_.FilesMarkedForForcedBlobGC().size(), 2U);
+}
+
+TEST_F(VersionStorageInfoTest, ForceBlobListGCZeroCandidateCapsDisableGC) {
+  constexpr int level = 0;
+  constexpr uint64_t first_sst = 1;
+  constexpr uint64_t second_sst = 2;
+  constexpr uint64_t blob = 10;
+
+  Add(level, first_sst, "a", "m", /*file_size=*/10000, blob, {blob});
+  Add(level, second_sst, "n", "z", /*file_size=*/10000, blob, {blob});
+
+  AddBlob(blob, /*total_blob_count=*/10, /*total_blob_bytes=*/100000,
+          BlobFileMetaData::LinkedSsts{},
+          BlobFileMetaData::FullLinkedSsts{first_sst, second_sst},
+          /*garbage_blob_count=*/9, /*garbage_blob_bytes=*/90000);
+
+  UpdateVersionStorageInfo();
+
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_low = 0.3;
+  mutable_cf_options_.blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+  mutable_cf_options_.blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+  mutable_cf_options_.blob_list_garbage_hard_gc_garbage_ratio = 0.5;
+
+  mutable_cf_options_.blob_list_garbage_max_blob_candidate_per_round = 0;
+  mutable_cf_options_.blob_list_garbage_max_sst_candidate_per_round = 100;
+  vstorage_.ComputeOverallBlobGarbageRatio();
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+
+  mutable_cf_options_.blob_list_garbage_max_blob_candidate_per_round = 100;
+  mutable_cf_options_.blob_list_garbage_max_sst_candidate_per_round = 0;
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+  ASSERT_TRUE(vstorage_.FilesMarkedForForcedBlobGC().empty());
+
+  mutable_cf_options_.blob_list_garbage_max_blob_candidate_per_round = 100;
+  mutable_cf_options_.blob_list_garbage_max_sst_candidate_per_round = 100;
+  vstorage_.ComputeFilesMarkedForForceBlobListGC(mutable_cf_options_);
+  ASSERT_EQ(vstorage_.FilesMarkedForForcedBlobGC().size(), 2U);
 }
 
 class VersionStorageInfoTimestampTest : public VersionStorageInfoTestBase {
@@ -1818,7 +2183,8 @@ TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
 
     auto meta = BlobFileMetaData::Create(
         std::move(shared_meta), BlobFileMetaData::LinkedSsts(),
-        garbage_blob_count, garbage_blob_bytes);
+        BlobFileMetaData::FullLinkedSsts{}, garbage_blob_count,
+        garbage_blob_bytes);
 
     storage_info->AddBlobFile(std::move(meta));
   }
@@ -1839,7 +2205,8 @@ TEST_F(VersionSetTest, PersistBlobFileStateInNewManifest) {
 
     auto meta = BlobFileMetaData::Create(
         std::move(shared_meta), BlobFileMetaData::LinkedSsts(),
-        garbage_blob_count, garbage_blob_bytes);
+        BlobFileMetaData::FullLinkedSsts{}, garbage_blob_count,
+        garbage_blob_bytes);
 
     storage_info->AddBlobFile(std::move(meta));
   }
@@ -1897,7 +2264,8 @@ TEST_F(VersionSetTest, AddLiveBlobFiles) {
 
   auto first_meta = BlobFileMetaData::Create(
       std::move(first_shared_meta), BlobFileMetaData::LinkedSsts(),
-      garbage_blob_count, garbage_blob_bytes);
+      BlobFileMetaData::FullLinkedSsts{}, garbage_blob_count,
+      garbage_blob_bytes);
 
   first_storage_info->AddBlobFile(first_meta);
 
@@ -1937,7 +2305,8 @@ TEST_F(VersionSetTest, AddLiveBlobFiles) {
 
   auto second_meta = BlobFileMetaData::Create(
       std::move(second_shared_meta), BlobFileMetaData::LinkedSsts(),
-      garbage_blob_count, garbage_blob_bytes);
+      BlobFileMetaData::FullLinkedSsts{}, garbage_blob_count,
+      garbage_blob_bytes);
 
   second_storage_info->AddBlobFile(std::move(first_meta));
   second_storage_info->AddBlobFile(std::move(second_meta));
@@ -2941,7 +3310,7 @@ TEST_F(VersionSetTest, ManifestContentValidationOnCloseOpenFails) {
 TEST_F(VersionStorageInfoTest, AddRangeDeletionCompensatedFileSize) {
   // Tests that compensated range deletion size is added to compensated file
   // size.
-  Add(4, 100U, "1", "2", 100U, kInvalidBlobFileNumber, 1000U);
+  Add(4, 100U, "1", "2", 100U, kInvalidBlobFileNumber, {}, 1000U);
 
   UpdateVersionStorageInfo();
 
@@ -4544,8 +4913,7 @@ TEST_F(VersionSetTestMissingFiles, ManifestFarBehindSst) {
         largest_ikey, 0, 0, false, Temperature::kUnknown, 0, 0, 0,
         file_num /* epoch_number */, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
-        /* max timestamp */ "");
+        /* user_defined_timestamps_persisted */ true, {});
     added_files.emplace_back(0, meta);
   }
   WriteFileAdditionAndDeletionToManifest(
@@ -4606,8 +4974,7 @@ TEST_F(VersionSetTestMissingFiles, ManifestAheadofSst) {
         largest_ikey, 0, 0, false, Temperature::kUnknown, 0, 0, 0,
         file_num /* epoch_number */, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
-        /* max timestamp */ "");
+        /* user_defined_timestamps_persisted */ true, {});
     added_files.emplace_back(0, meta);
   }
   WriteFileAdditionAndDeletionToManifest(

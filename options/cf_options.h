@@ -175,6 +175,31 @@ struct MutableCFOptions {
             options.blob_garbage_collection_age_cutoff),
         blob_garbage_collection_force_threshold(
             options.blob_garbage_collection_force_threshold),
+        enable_blob_file_set_record(options.enable_blob_file_set_record),
+        enable_blob_list_garbage_collection(
+            options.enable_blob_list_garbage_collection),
+        blob_list_garbage_overall_garbage_ratio_low(
+            options.blob_list_garbage_overall_garbage_ratio_low),
+        blob_list_garbage_overall_garbage_ratio_middle(
+            options.blob_list_garbage_overall_garbage_ratio_middle),
+        blob_list_garbage_overall_gc_garbage_ratio_high(
+            options.blob_list_garbage_overall_gc_garbage_ratio_high),
+        blob_list_garbage_gc_garbage_ratio(
+            options.blob_list_garbage_gc_garbage_ratio),
+        blob_list_garbage_hard_gc_garbage_ratio(
+            options.blob_list_garbage_hard_gc_garbage_ratio),
+        blob_list_garbage_max_blob_candidate_per_round(
+            options.blob_list_garbage_max_blob_candidate_per_round),
+        blob_list_garbage_max_blob_per_compaction(
+            options.blob_list_garbage_max_blob_per_compaction),
+        blob_list_garbage_max_sst_candidate_per_round(
+            options.blob_list_garbage_max_sst_candidate_per_round),
+        blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold(
+            options
+                .blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold),
+        blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold(
+            options
+                .blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold),
         blob_compaction_readahead_size(options.blob_compaction_readahead_size),
         blob_file_starting_level(options.blob_file_starting_level),
         prepopulate_blob_cache(options.prepopulate_blob_cache),
@@ -250,6 +275,18 @@ struct MutableCFOptions {
         enable_blob_garbage_collection(false),
         blob_garbage_collection_age_cutoff(0.0),
         blob_garbage_collection_force_threshold(0.0),
+        enable_blob_file_set_record(false),
+        enable_blob_list_garbage_collection(false),
+        blob_list_garbage_overall_garbage_ratio_low(0.0),
+        blob_list_garbage_overall_garbage_ratio_middle(0.0),
+        blob_list_garbage_overall_gc_garbage_ratio_high(0.0),
+        blob_list_garbage_gc_garbage_ratio(0.0),
+        blob_list_garbage_hard_gc_garbage_ratio(0.0),
+        blob_list_garbage_max_blob_candidate_per_round(0),
+        blob_list_garbage_max_blob_per_compaction(0),
+        blob_list_garbage_max_sst_candidate_per_round(0),
+        blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold(0.0),
+        blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold(0.0),
         blob_compaction_readahead_size(0),
         blob_file_starting_level(0),
         prepopulate_blob_cache(PrepopulateBlobCache::kDisable),
@@ -358,6 +395,18 @@ struct MutableCFOptions {
   bool enable_blob_garbage_collection;
   double blob_garbage_collection_age_cutoff;
   double blob_garbage_collection_force_threshold;
+  bool enable_blob_file_set_record;
+  bool enable_blob_list_garbage_collection;
+  double blob_list_garbage_overall_garbage_ratio_low;
+  double blob_list_garbage_overall_garbage_ratio_middle;
+  double blob_list_garbage_overall_gc_garbage_ratio_high;
+  double blob_list_garbage_gc_garbage_ratio;
+  double blob_list_garbage_hard_gc_garbage_ratio;
+  uint32_t blob_list_garbage_max_blob_candidate_per_round;
+  uint32_t blob_list_garbage_max_blob_per_compaction;
+  uint32_t blob_list_garbage_max_sst_candidate_per_round;
+  double blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold;
+  double blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold;
   uint64_t blob_compaction_readahead_size;
   int blob_file_starting_level;
   PrepopulateBlobCache prepopulate_blob_cache;

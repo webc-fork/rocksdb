@@ -285,7 +285,8 @@ TEST_F(ObsoleteFilesTest, BlobFiles) {
 
   auto meta = BlobFileMetaData::Create(
       std::move(shared_meta), BlobFileMetaData::LinkedSsts(),
-      second_garbage_blob_count, second_garbage_blob_bytes);
+      BlobFileMetaData::FullLinkedSsts{}, second_garbage_blob_count,
+      second_garbage_blob_bytes);
 
   storage_info->AddBlobFile(std::move(meta));
 

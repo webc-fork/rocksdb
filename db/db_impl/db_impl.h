@@ -1090,7 +1090,7 @@ class DBImpl : public DB
     int max_compactions;
   };
   // Returns maximum background flushes and compactions allowed to be scheduled
-  BGJobLimits GetBGJobLimits() const;
+  BGJobLimits GetBGJobLimits(bool check_blob_garbage) const;
   // Need a static version that can be called during SanitizeOptions().
   static BGJobLimits GetBGJobLimits(int max_background_flushes,
                                     int max_background_compactions,

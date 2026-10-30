@@ -111,6 +111,30 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
           options.blob_garbage_collection_age_cutoff),
       blob_garbage_collection_force_threshold(
           options.blob_garbage_collection_force_threshold),
+      enable_blob_file_set_record(options.enable_blob_file_set_record),
+      enable_blob_list_garbage_collection(
+          options.enable_blob_list_garbage_collection),
+      blob_list_garbage_overall_garbage_ratio_low(
+          options.blob_list_garbage_overall_garbage_ratio_low),
+      blob_list_garbage_overall_garbage_ratio_middle(
+          options.blob_list_garbage_overall_garbage_ratio_middle),
+      blob_list_garbage_overall_gc_garbage_ratio_high(
+          options.blob_list_garbage_overall_gc_garbage_ratio_high),
+      blob_list_garbage_gc_garbage_ratio(
+          options.blob_list_garbage_gc_garbage_ratio),
+      blob_list_garbage_hard_gc_garbage_ratio(
+          options.blob_list_garbage_hard_gc_garbage_ratio),
+      blob_list_garbage_max_blob_candidate_per_round(
+          options.blob_list_garbage_max_blob_candidate_per_round),
+      blob_list_garbage_max_blob_per_compaction(
+          options.blob_list_garbage_max_blob_per_compaction),
+      blob_list_garbage_max_sst_candidate_per_round(
+          options.blob_list_garbage_max_sst_candidate_per_round),
+      blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold(
+          options.blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold),
+      blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold(
+          options
+              .blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold),
       blob_compaction_readahead_size(options.blob_compaction_readahead_size),
       blob_file_starting_level(options.blob_file_starting_level),
       blob_cache(options.blob_cache),
@@ -461,6 +485,45 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
                    blob_garbage_collection_age_cutoff);
   ROCKS_LOG_HEADER(log, "Options.blob_garbage_collection_force_threshold: %f",
                    blob_garbage_collection_force_threshold);
+  ROCKS_LOG_HEADER(log, "           Options.enable_blob_file_set_record: %s",
+                   enable_blob_file_set_record ? "true" : "false");
+  ROCKS_LOG_HEADER(log, "Options.enable_blob_list_garbage_collection: %s",
+                   enable_blob_list_garbage_collection ? "true" : "false");
+  ROCKS_LOG_HEADER(log,
+                   "Options.blob_list_garbage_overall_garbage_ratio_low: %f",
+                   blob_list_garbage_overall_garbage_ratio_low);
+  ROCKS_LOG_HEADER(
+      log, "Options.blob_list_garbage_overall_garbage_ratio_middle: %f",
+      blob_list_garbage_overall_garbage_ratio_middle);
+  ROCKS_LOG_HEADER(
+      log, "Options.blob_list_garbage_overall_gc_garbage_ratio_high: %f",
+      blob_list_garbage_overall_gc_garbage_ratio_high);
+  ROCKS_LOG_HEADER(log,
+                   "         Options.blob_list_garbage_gc_garbage_ratio: %f",
+                   blob_list_garbage_gc_garbage_ratio);
+  ROCKS_LOG_HEADER(log,
+                   "   Options.blob_list_garbage_hard_gc_garbage_ratio: %f",
+                   blob_list_garbage_hard_gc_garbage_ratio);
+  ROCKS_LOG_HEADER(log,
+                   "Options.blob_list_garbage_max_blob_candidate_per_round: "
+                   "%u",
+                   blob_list_garbage_max_blob_candidate_per_round);
+  ROCKS_LOG_HEADER(
+      log, "      Options.blob_list_garbage_max_blob_per_compaction: %u",
+      blob_list_garbage_max_blob_per_compaction);
+  ROCKS_LOG_HEADER(
+      log, "Options.blob_list_garbage_max_sst_candidate_per_round: %u",
+      blob_list_garbage_max_sst_candidate_per_round);
+  ROCKS_LOG_HEADER(
+      log,
+      "Options.blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold: "
+      "%f",
+      blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold);
+  ROCKS_LOG_HEADER(
+      log,
+      "Options.blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_"
+      "threshold: %f",
+      blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold);
   ROCKS_LOG_HEADER(log,
                    "         Options.blob_compaction_readahead_size: %" PRIu64,
                    blob_compaction_readahead_size);

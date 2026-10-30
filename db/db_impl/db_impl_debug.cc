@@ -338,12 +338,12 @@ Status DBImpl::TEST_GetLatestMutableCFOptions(
 
 int DBImpl::TEST_BGCompactionsAllowed() const {
   InstrumentedMutexLock l(&mutex_);
-  return GetBGJobLimits().max_compactions;
+  return GetBGJobLimits(true).max_compactions;
 }
 
 int DBImpl::TEST_BGFlushesAllowed() const {
   InstrumentedMutexLock l(&mutex_);
-  return GetBGJobLimits().max_flushes;
+  return GetBGJobLimits(false).max_flushes;
 }
 
 int DBImpl::TEST_NumRunningBottomCompactions() const {

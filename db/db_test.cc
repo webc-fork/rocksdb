@@ -1424,6 +1424,7 @@ void AddBlobFile(const ColumnFamilyHandle* cfh, uint64_t blob_file_number,
 
   auto meta = BlobFileMetaData::Create(std::move(shared_meta),
                                        BlobFileMetaData::LinkedSsts(),
+                                       BlobFileMetaData::FullLinkedSsts{},
                                        garbage_blob_count, garbage_blob_bytes);
 
   storage_info->AddBlobFile(std::move(meta));
@@ -1433,7 +1434,8 @@ static void CheckBlobMetaData(
     const BlobMetaData& bmd, uint64_t blob_file_number,
     uint64_t total_blob_count, uint64_t total_blob_bytes,
     const std::string& checksum_method, const std::string& checksum_value,
-    uint64_t garbage_blob_count = 0, uint64_t garbage_blob_bytes = 0) {
+    uint64_t garbage_blob_count = 0, uint64_t garbage_blob_bytes = 0,
+    uint64_t linked_ssts_count = 0, uint64_t full_linked_ssts_count = 0) {
   ASSERT_EQ(bmd.blob_file_number, blob_file_number);
   ASSERT_EQ(bmd.blob_file_name, BlobFileName("", blob_file_number));
   ASSERT_EQ(bmd.blob_file_size,
@@ -1445,6 +1447,8 @@ static void CheckBlobMetaData(
   ASSERT_EQ(bmd.garbage_blob_bytes, garbage_blob_bytes);
   ASSERT_EQ(bmd.checksum_method, checksum_method);
   ASSERT_EQ(bmd.checksum_value, checksum_value);
+  ASSERT_EQ(bmd.linked_ssts_count, linked_ssts_count);
+  ASSERT_EQ(bmd.full_linked_ssts_count, full_linked_ssts_count);
 }
 
 TEST_F(DBTest, MetaDataTest) {

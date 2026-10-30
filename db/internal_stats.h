@@ -682,7 +682,7 @@ class InternalStats {
   void DumpCFMapStats(
       const VersionStorageInfo* vstorage,
       std::map<int, std::map<LevelStatType, double>>* level_stats,
-      CompactionStats* compaction_stats_sum);
+      CompactionStats* compaction_stats_sum, bool* found_untracked_sst_blob);
   void DumpCFMapStatsByPriority(
       std::map<int, std::map<LevelStatType, double>>* priorities_stats);
   void DumpCFStats(std::string* value);

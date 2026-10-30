@@ -165,8 +165,7 @@ class CompactionPickerTestBase : public testing::Test {
         kInvalidBlobFileNumber, kUnknownOldestAncestorTime,
         kUnknownFileCreationTime, epoch_number, kUnknownFileChecksum,
         kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
-        true /* user_defined_timestamps_persisted */, "" /* min timestamp */,
-        "" /* max timestamp */);
+        true /* user_defined_timestamps_persisted */, {});
     f->compensated_file_size =
         (compensated_file_size != 0) ? compensated_file_size : file_size;
     // oldest_ancestor_time is only used if newest_key_time is not available
@@ -233,6 +232,7 @@ class CompactionPickerTestBase : public testing::Test {
         /*checksum_method=*/"", /*checksum_value=*/"");
     auto meta =
         BlobFileMetaData::Create(std::move(shared_meta), std::move(linked_ssts),
+                                 /*full_linked_ssts=*/{},
                                  /*garbage_blob_count=*/0,
                                  /*garbage_blob_bytes=*/0);
     vstorage_->AddBlobFile(std::move(meta));

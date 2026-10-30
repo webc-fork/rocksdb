@@ -208,6 +208,8 @@ CompactionIterator::CompactionIterator(
               ? *blob_gc_cutoff_file_number
               : ComputeBlobGarbageCollectionCutoffFileNumber(
                     compaction_.get())),
+      blob_list_gc_blob_file_numbers_(
+          ComputeBlobListGarbageCollectionBlobFileNumbers(compaction_.get())),
       blob_fetcher_(CreateBlobFetcherIfNeeded(compaction_.get(), input_version,
                                               blob_read_io_activity)),
       prefetch_buffers_(
@@ -1463,7 +1465,13 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
   }
 
   // GC for integrated BlobDB
-  if (compaction_->enable_blob_garbage_collection()) {
+  if (compaction_->enable_blob_garbage_collection() ||
+      compaction_->enable_blob_list_garbage_collection()) {
+    if (compaction_->enable_blob_list_garbage_collection() &&
+        blob_list_gc_blob_file_numbers_.empty()) {
+      return;
+    }
+
     TEST_SYNC_POINT_CALLBACK(
         "CompactionIterator::GarbageCollectBlobIfNeeded::TamperWithBlobIndex",
         &value_);
@@ -1481,9 +1489,16 @@ void CompactionIterator::GarbageCollectBlobIfNeeded() {
       }
     }
 
-    if (blob_index.file_number() >=
-        blob_garbage_collection_cutoff_file_number_) {
-      return;
+    if (compaction_->enable_blob_list_garbage_collection()) {
+      if (blob_list_gc_blob_file_numbers_.find(blob_index.file_number()) ==
+          blob_list_gc_blob_file_numbers_.end()) {
+        return;
+      }
+    } else {
+      if (blob_index.file_number() >=
+          blob_garbage_collection_cutoff_file_number_) {
+        return;
+      }
     }
 
     FilePrefetchBuffer* prefetch_buffer =
@@ -2057,7 +2072,8 @@ uint64_t CompactionIterator::ComputeBlobGarbageCollectionCutoffFileNumber(
     return 0;
   }
 
-  if (!compaction->enable_blob_garbage_collection()) {
+  if (!compaction->enable_blob_garbage_collection() ||
+      compaction->enable_blob_list_garbage_collection()) {
     return 0;
   }
 
@@ -2080,6 +2096,83 @@ uint64_t CompactionIterator::ComputeBlobGarbageCollectionCutoffFileNumber(
   assert(meta);
 
   return meta->GetBlobFileNumber();
+}
+
+std::unordered_set<uint64_t>
+CompactionIterator::ComputeBlobListGarbageCollectionBlobFileNumbers(
+    const CompactionProxy* compaction) {
+  if (!compaction || !compaction->enable_blob_list_garbage_collection()) {
+    return {};
+  }
+
+  const Compaction* const c = compaction->real_compaction();
+  if (!c) {
+    return std::unordered_set<uint64_t>{};
+  }
+
+  const Version* const version = compaction->input_version();
+  assert(version);
+
+  const VersionStorageInfo* const storage_info = version->storage_info();
+  assert(storage_info);
+
+  const MutableCFOptions& mutable_cf_options = c->mutable_cf_options();
+
+  if (!storage_info->OverallBlobGarbageRatio().has_value()) {
+    return std::unordered_set<uint64_t>{};
+  }
+
+  const double overall_garbage_ratio = *storage_info->OverallBlobGarbageRatio();
+
+  double per_blob_threshold;
+  if (overall_garbage_ratio >=
+          mutable_cf_options.blob_list_garbage_overall_garbage_ratio_middle ||
+      overall_garbage_ratio >=
+          mutable_cf_options.blob_list_garbage_overall_gc_garbage_ratio_high) {
+    per_blob_threshold =
+        mutable_cf_options.blob_list_garbage_hard_gc_garbage_ratio;
+  } else if (overall_garbage_ratio >=
+             mutable_cf_options.blob_list_garbage_overall_garbage_ratio_low) {
+    per_blob_threshold = mutable_cf_options.blob_list_garbage_gc_garbage_ratio;
+  } else {
+    return std::unordered_set<uint64_t>{};
+  }
+
+  std::unordered_set<uint64_t> blob_file_numbers;
+  std::unordered_set<uint64_t> seen_blob_file_numbers;
+  const uint32_t max_blob_per_compaction =
+      mutable_cf_options.blob_list_garbage_max_blob_per_compaction;
+  for (size_t lvl_idx = 0; lvl_idx < c->num_input_levels(); ++lvl_idx) {
+    for (size_t i = 0; i < c->num_input_files(lvl_idx); ++i) {
+      const FileMetaData* const sst_meta = c->input(lvl_idx, i);
+      assert(sst_meta);
+      for (uint64_t blob_file_number : sst_meta->blob_file_set) {
+        if (!seen_blob_file_numbers.insert(blob_file_number).second) {
+          continue;
+        }
+        const std::shared_ptr<BlobFileMetaData> blob_meta =
+            storage_info->GetBlobFileMetaData(blob_file_number);
+        if (!blob_meta) {
+          continue;
+        }
+        const uint64_t total_blob_bytes = blob_meta->GetTotalBlobBytes();
+        if (total_blob_bytes == 0) {
+          continue;
+        }
+        const double blob_garbage_ratio =
+            static_cast<double>(blob_meta->GetGarbageBlobBytes()) /
+            static_cast<double>(total_blob_bytes);
+        if (blob_garbage_ratio >= per_blob_threshold) {
+          blob_file_numbers.insert(blob_file_number);
+          if (max_blob_per_compaction > 0 &&
+              blob_file_numbers.size() >= max_blob_per_compaction) {
+            return blob_file_numbers;
+          }
+        }
+      }
+    }
+  }
+  return blob_file_numbers;
 }
 
 std::unique_ptr<BlobFetcher> CompactionIterator::CreateBlobFetcherIfNeeded(

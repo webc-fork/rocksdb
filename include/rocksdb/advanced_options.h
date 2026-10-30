@@ -1073,8 +1073,19 @@ struct AdvancedColumnFamilyOptions {
   // of indirection for reads. See also the options min_blob_size,
   // blob_file_size, blob_compression_type, enable_blob_garbage_collection,
   // blob_garbage_collection_age_cutoff,
-  // blob_garbage_collection_force_threshold, and blob_compaction_readahead_size
-  // below.
+  // blob_garbage_collection_force_threshold,
+  // enable_blob_list_garbage_collection,
+  // blob_list_garbage_overall_garbage_ratio_low,
+  // blob_list_garbage_overall_garbage_ratio_middle,
+  // blob_list_garbage_overall_gc_garbage_ratio_high,
+  // blob_list_garbage_gc_garbage_ratio,
+  // blob_list_garbage_hard_gc_garbage_ratio,
+  // blob_list_garbage_max_blob_candidate_per_round,
+  // blob_list_garbage_max_blob_per_compaction,
+  // blob_list_garbage_max_sst_candidate_per_round,
+  // blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold,
+  // blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold, and
+  // blob_compaction_readahead_size below.
   //
   // Default: false
   //
@@ -1164,6 +1175,99 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_force_threshold = 1.0;
+
+  // Enable recording per-SST blob_file_set metadata for newly flushed or
+  // compacted SSTs. Disabling this avoids the blob file set tracking overhead
+  // for new SSTs.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_file_set_record = false;
+
+  // Enable list-based blob garbage collection that marks SST files for rewrite
+  // based on blob garbage ratios. Requires enable_blob_files and a complete
+  // blob list in the LSM version.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through the SetOptions() API
+  bool enable_blob_list_garbage_collection = false;
+
+  // Overall blob garbage ratio thresholds for list-based blob garbage
+  // collection tiers. See blob_list_garbage_gc_garbage_ratio and related
+  // options below.
+  //
+  // Default: 0.3
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_overall_garbage_ratio_low = 0.3;
+
+  // Default: 0.5
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_overall_garbage_ratio_middle = 0.5;
+
+  // Default: 0.7
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_overall_gc_garbage_ratio_high = 0.7;
+
+  // Per-blob garbage ratio threshold for list-based blob garbage collection.
+  //
+  // Default: 0.8
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_gc_garbage_ratio = 0.8;
+
+  // Per-blob garbage ratio threshold for harder (more aggressive) list-based
+  // blob garbage collection.
+  //
+  // Default: 0.5
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_hard_gc_garbage_ratio = 0.5;
+
+  // Maximum number of blob files to consider as GC candidates per round of
+  // list-based blob garbage collection.
+  //
+  // Default: 10
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint32_t blob_list_garbage_max_blob_candidate_per_round = 10;
+
+  // Maximum number of blob files to garbage collect in one compaction for
+  // list-based blob garbage collection. `0` means unlimited.
+  //
+  // Default: 0
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint32_t blob_list_garbage_max_blob_per_compaction = 0;
+
+  // Maximum number of SST files to mark for rewrite per round of list-based
+  // blob garbage collection.
+  //
+  // Default: 10
+  //
+  // Dynamically changeable through the SetOptions() API
+  uint32_t blob_list_garbage_max_sst_candidate_per_round = 10;
+
+  // If the ratio of the sum of garbage bytes in related blob files whose
+  // per-blob garbage ratio exceeds blob_list_garbage_gc_garbage_ratio to the
+  // SST file size exceeds this threshold, the SST is considered for rewrite.
+  //
+  // Default: 5.0
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold = 5.0;
+
+  // Same as blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold, but
+  // uses blob_list_garbage_hard_gc_garbage_ratio to filter related blobs.
+  //
+  // Default: 1.0
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold = 1.0;
 
   // Compaction readahead for blob files.
   //

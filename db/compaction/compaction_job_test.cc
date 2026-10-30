@@ -11,6 +11,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
@@ -329,6 +330,7 @@ class CompactionJobTestBase : public testing::Test {
     SequenceNumber smallest_seqno = kMaxSequenceNumber;
     SequenceNumber largest_seqno = 0;
     uint64_t oldest_blob_file_number = kInvalidBlobFileNumber;
+    std::unordered_set<uint64_t> blob_file_set;
     for (const auto& kv : contents) {
       ParsedInternalKey key;
       std::string skey;
@@ -369,6 +371,7 @@ class CompactionJobTestBase : public testing::Test {
             oldest_blob_file_number > blob_index.file_number()) {
           oldest_blob_file_number = blob_index.file_number();
         }
+        blob_file_set.insert(blob_index.file_number());
       }
     }
 
@@ -394,7 +397,7 @@ class CompactionJobTestBase : public testing::Test {
         versions_->GetColumnFamilySet()->GetDefault()->NewEpochNumber(),
         kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
         /*compensated_range_deletion_size=*/0, /*tail_size=*/0,
-        /*user_defined_timestamps_persisted=*/true);
+        /*user_defined_timestamps_persisted=*/true, blob_file_set);
 
     mutex_.Lock();
     EXPECT_OK(versions_->LogAndApply(

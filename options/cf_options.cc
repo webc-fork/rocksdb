@@ -692,6 +692,65 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    blob_garbage_collection_force_threshold),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"enable_blob_file_set_record",
+         {offsetof(struct MutableCFOptions, enable_blob_file_set_record),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"enable_blob_list_garbage_collection",
+         {offsetof(struct MutableCFOptions,
+                   enable_blob_list_garbage_collection),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_overall_garbage_ratio_low",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_overall_garbage_ratio_low),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_overall_garbage_ratio_middle",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_overall_garbage_ratio_middle),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_overall_gc_garbage_ratio_high",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_overall_gc_garbage_ratio_high),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_gc_garbage_ratio",
+         {offsetof(struct MutableCFOptions, blob_list_garbage_gc_garbage_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_hard_gc_garbage_ratio",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_hard_gc_garbage_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_max_blob_candidate_per_round",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_max_blob_candidate_per_round),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_max_blob_per_compaction",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_max_blob_per_compaction),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_max_sst_candidate_per_round",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_max_sst_candidate_per_round),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold",
+         {offsetof(struct MutableCFOptions,
+                   blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold",
+         {offsetof(
+              struct MutableCFOptions,
+              blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"blob_compaction_readahead_size",
          {offsetof(struct MutableCFOptions, blob_compaction_readahead_size),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1393,6 +1452,33 @@ void MutableCFOptions::Dump(Logger* log) const {
                  blob_garbage_collection_age_cutoff);
   ROCKS_LOG_INFO(log, "  blob_garbage_collection_force_threshold: %f",
                  blob_garbage_collection_force_threshold);
+  ROCKS_LOG_INFO(log, "             enable_blob_file_set_record: %s",
+                 enable_blob_file_set_record ? "true" : "false");
+  ROCKS_LOG_INFO(log, " enable_blob_list_garbage_collection: %s",
+                 enable_blob_list_garbage_collection ? "true" : "false");
+  ROCKS_LOG_INFO(log, "blob_list_garbage_overall_garbage_ratio_low: %f",
+                 blob_list_garbage_overall_garbage_ratio_low);
+  ROCKS_LOG_INFO(log, "blob_list_garbage_overall_garbage_ratio_middle: %f",
+                 blob_list_garbage_overall_garbage_ratio_middle);
+  ROCKS_LOG_INFO(log, "blob_list_garbage_overall_gc_garbage_ratio_high: %f",
+                 blob_list_garbage_overall_gc_garbage_ratio_high);
+  ROCKS_LOG_INFO(log, "       blob_list_garbage_gc_garbage_ratio: %f",
+                 blob_list_garbage_gc_garbage_ratio);
+  ROCKS_LOG_INFO(log, " blob_list_garbage_hard_gc_garbage_ratio: %f",
+                 blob_list_garbage_hard_gc_garbage_ratio);
+  ROCKS_LOG_INFO(log, " blob_list_garbage_max_blob_candidate_per_round: %u",
+                 blob_list_garbage_max_blob_candidate_per_round);
+  ROCKS_LOG_INFO(log, "       blob_list_garbage_max_blob_per_compaction: %u",
+                 blob_list_garbage_max_blob_per_compaction);
+  ROCKS_LOG_INFO(log, "  blob_list_garbage_max_sst_candidate_per_round: %u",
+                 blob_list_garbage_max_sst_candidate_per_round);
+  ROCKS_LOG_INFO(
+      log, "blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold: %f",
+      blob_list_garbage_sst_rewrite_garbage_bytes_ratio_threshold);
+  ROCKS_LOG_INFO(
+      log,
+      "blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold: %f",
+      blob_list_garbage_hard_sst_rewrite_garbage_bytes_ratio_threshold);
   ROCKS_LOG_INFO(log, "           blob_compaction_readahead_size: %" PRIu64,
                  blob_compaction_readahead_size);
   ROCKS_LOG_INFO(log, "                 blob_file_starting_level: %d",
