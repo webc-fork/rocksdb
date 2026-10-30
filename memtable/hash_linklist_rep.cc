@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-
 #include <algorithm>
 #include <atomic>
 
@@ -81,7 +80,8 @@ struct Node {
   void NoBarrier_SetNext(Node* x) { next_.store(x, std::memory_order_relaxed); }
 
   // Needed for placement new below which is fine
-  Node() {}
+  Node() = default;
+  [[maybe_unused]] ~Node() = default;
 
  private:
   std::atomic<Node*> next_;
@@ -89,6 +89,8 @@ struct Node {
   // Prohibit copying due to the below
   Node(const Node&) = delete;
   Node& operator=(const Node&) = delete;
+  Node(Node&&) = delete;
+  Node& operator=(Node&&) = delete;
 
  public:
   char key[1];
@@ -265,7 +267,7 @@ class HashLinkListRep : public MemTableRep {
     explicit FullListIterator(MemtableSkipList* list, Allocator* allocator)
         : iter_(list), full_list_(list), allocator_(allocator) {}
 
-    ~FullListIterator() override {}
+    ~FullListIterator() override = default;
 
     // Returns true iff the iterator is positioned at a valid node.
     bool Valid() const override { return iter_.Valid(); }
@@ -332,7 +334,7 @@ class HashLinkListRep : public MemTableRep {
           head_(head),
           node_(nullptr) {}
 
-    ~LinkListIterator() override {}
+    ~LinkListIterator() override = default;
 
     // Returns true iff the iterator is positioned at a valid node.
     bool Valid() const override { return node_ != nullptr; }
@@ -482,7 +484,7 @@ class HashLinkListRep : public MemTableRep {
     // This is used when there wasn't a bucket. It is cheaper than
     // instantiating an empty bucket over which to iterate.
    public:
-    EmptyIterator() {}
+    EmptyIterator() = default;
     bool Valid() const override { return false; }
     const char* key() const override {
       assert(false);
@@ -526,7 +528,7 @@ HashLinkListRep::HashLinkListRep(
   }
 }
 
-HashLinkListRep::~HashLinkListRep() {}
+HashLinkListRep::~HashLinkListRep() = default;
 
 KeyHandle HashLinkListRep::Allocate(const size_t len, char** buf) {
   char* mem = allocator_->AllocateAligned(sizeof(Node) + len);
@@ -887,14 +889,15 @@ class HashLinkListRepFactory : public MemTableRepFactory {
   }
 
   using MemTableRepFactory::CreateMemTableRep;
-  virtual MemTableRep* CreateMemTableRep(
-      const MemTableRep::KeyComparator& compare, Allocator* allocator,
-      const SliceTransform* transform, Logger* logger) override;
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator& compare,
+                                 Allocator* allocator,
+                                 const SliceTransform* transform,
+                                 Logger* logger) override;
 
   static const char* kClassName() { return "HashLinkListRepFactory"; }
   static const char* kNickName() { return "hash_linkedlist"; }
-  virtual const char* Name() const override { return kClassName(); }
-  virtual const char* NickName() const override { return kNickName(); }
+  const char* Name() const override { return kClassName(); }
+  const char* NickName() const override { return kNickName(); }
 
  private:
   HashLinkListRepOptions options_;

@@ -19,11 +19,11 @@ import org.rocksdb.util.BytewiseComparator;
 /**
  * This test confirms that the following issues were in fact resolved
  * by a change made between 6.2.2 and 6.22.1,
- * to wit {@link <a href="https://github.com/facebook/rocksdb/commit/7242dae7">...</a>}
+ * to wit {@link <a href="https://github.com/meta/rocksdb/commit/7242dae7">...</a>}
  * which as part of its effect, changed the Java bytewise comparators.
- *
- * {@link <a href="https://github.com/facebook/rocksdb/issues/5891">...</a>}
- * {@link <a href="https://github.com/facebook/rocksdb/issues/2001">...</a>}
+ * <p>
+ * {@link <a href="https://github.com/meta/rocksdb/issues/5891">...</a>}
+ * {@link <a href="https://github.com/meta/rocksdb/issues/2001">...</a>}
  */
 public class BytewiseComparatorRegressionTest {
   @ClassRule
@@ -34,30 +34,36 @@ public class BytewiseComparatorRegressionTest {
 
   @Rule public TemporaryFolder temporarySSTFolder = new TemporaryFolder();
 
-  private final static byte[][] testData = {{10, -11, 13}, {10, 11, 12}, {10, 11, 14}};
-  private final static byte[][] orderedData = {{10, 11, 12}, {10, 11, 14}, {10, -11, 13}};
+  private static final byte[][] testData = {{10, -11, 13}, {10, 11, 12}, {10, 11, 14}};
+  private static final byte[][] orderedData = {{10, 11, 12}, {10, 11, 14}, {10, -11, 13}};
 
   /**
-   * {@link <a href="https://github.com/facebook/rocksdb/issues/5891">...</a>}
+   * {@link <a href="https://github.com/meta/rocksdb/issues/5891">...</a>}
    */
   @Test
   public void testJavaComparator() throws RocksDBException {
     final BytewiseComparator comparator = new BytewiseComparator(new ComparatorOptions());
-    performTest(new Options().setCreateIfMissing(true).setComparator(comparator));
+    try (final Options options = new Options().setCreateIfMissing(true).setComparator(comparator)) {
+      performTest(options);
+    }
   }
 
   @Test
   public void testDefaultComparator() throws RocksDBException {
-    performTest(new Options().setCreateIfMissing(true));
+    try (final Options options = new Options().setCreateIfMissing(true)) {
+      performTest(options);
+    }
   }
 
   /**
-   * {@link <a href="https://github.com/facebook/rocksdb/issues/5891">...</a>}
+   * {@link <a href="https://github.com/meta/rocksdb/issues/5891">...</a>}
    */
   @Test
   public void testCppComparator() throws RocksDBException {
-    performTest(new Options().setCreateIfMissing(true).setComparator(
-        BuiltinComparator.BYTEWISE_COMPARATOR));
+    try (final Options options = new Options().setCreateIfMissing(true).setComparator(
+             BuiltinComparator.BYTEWISE_COMPARATOR)) {
+      performTest(options);
+    }
   }
 
   private void performTest(final Options options) throws RocksDBException {
@@ -101,7 +107,7 @@ public class BytewiseComparatorRegressionTest {
   }
 
   /**
-   * {@link <a href="https://github.com/facebook/rocksdb/issues/2001">...</a>}
+   * {@link <a href="https://github.com/meta/rocksdb/issues/2001">...</a>}
    *
    * @throws RocksDBException if something goes wrong, or if the regression occurs
    * @throws IOException if we can't make the temporary file

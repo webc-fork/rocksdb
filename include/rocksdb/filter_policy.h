@@ -29,12 +29,12 @@
 
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/customizable.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/types.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Slice;
 struct BlockBasedTableOptions;
 struct ConfigOptions;
 
@@ -47,7 +47,8 @@ class FilterBitsReader;
 // structs because this is expected to be a temporary, stack-allocated object.
 struct FilterBuildingContext {
   // This constructor is for internal use only and subject to change.
-  FilterBuildingContext(const BlockBasedTableOptions& table_options);
+  // Keeps a reference to table_options.
+  explicit FilterBuildingContext(const BlockBasedTableOptions& table_options);
 
   // Options for the table being built
   const BlockBasedTableOptions& table_options;
@@ -66,6 +67,12 @@ struct FilterBuildingContext {
   // TODO: consider changing to Slice
   std::string column_family_name;
 
+  // Name (path) of the DB the table is being built for, or empty if there is
+  // no such DB, as with SstFileWriter. Under remote compaction this is the DB
+  // name as opened by the worker, which can differ from the primary's.
+  // Non-owning; do not retain beyond the call receiving this context.
+  Slice db_name;
+
   // The table level at time of constructing the SST file, or -1 if unknown
   // or N/A as in SstFileWriter. (The table file could later be used at a
   // different level.)
@@ -78,6 +85,11 @@ struct FilterBuildingContext {
 
   // Reason for creating the file with the filter
   TableFileCreationReason reason = TableFileCreationReason::kMisc;
+
+  // True if the file is being built by a remote (offloaded) compaction worker
+  // via CompactionService. False otherwise (including local/fallback
+  // compactions, flushes, and SstFileWriter).
+  bool is_remote_compaction = false;
 };
 
 // Determines what kind of filter (if any) to generate in SST files, and under
@@ -87,7 +99,7 @@ struct FilterBuildingContext {
 // GetBuilderWithContext.
 class FilterPolicy : public Customizable {
  public:
-  virtual ~FilterPolicy();
+  ~FilterPolicy() override;
   static const char* Type() { return "FilterPolicy"; }
 
   // The name used for identifying whether a filter on disk is readable
@@ -134,7 +146,7 @@ class FilterPolicy : public Customizable {
 
 // Return a new filter policy that uses a bloom filter with approximately
 // the specified number of bits per key. See
-// https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter
+// https://github.com/meta/rocksdb/wiki/RocksDB-Bloom-Filter
 //
 // bits_per_key: average bits allocated per key in bloom filter. A good
 // choice is 9.9, which yields a filter with ~ 1% false positive rate.
@@ -162,7 +174,7 @@ class FilterPolicy : public Customizable {
 // ignores trailing spaces, it would be incorrect to use a
 // FilterPolicy (like NewBloomFilterPolicy) that does not ignore
 // trailing spaces in keys.
-extern const FilterPolicy* NewBloomFilterPolicy(
+const FilterPolicy* NewBloomFilterPolicy(
     double bits_per_key, bool IGNORED_use_block_based_builder = false);
 
 // A new Bloom alternative that saves about 30% space compared to
@@ -184,6 +196,11 @@ extern const FilterPolicy* NewBloomFilterPolicy(
 // flushes under Level and Universal compaction styles.
 // bloom_before_level=-1 -> Always generate Ribbon filters (except in
 // some extreme or exceptional cases).
+// bloom_before_level=INT_MAX -> Always generate Bloom filters.
+//
+// The bloom_before_level option is mutable in the Configurable interface
+// and through the SetOptions() API, as in
+// db->SetOptions({{"table_factory.filter_policy.bloom_before_level", "3"}});
 //
 // Ribbon filters are compatible with RocksDB >= 6.15.0. Earlier
 // versions reading the data will behave as if no filter was used
@@ -200,7 +217,7 @@ extern const FilterPolicy* NewBloomFilterPolicy(
 //
 // Also consider using optimize_filters_for_memory to save filter
 // memory.
-extern const FilterPolicy* NewRibbonFilterPolicy(
-    double bloom_equivalent_bits_per_key, int bloom_before_level = 0);
+FilterPolicy* NewRibbonFilterPolicy(double bloom_equivalent_bits_per_key,
+                                    int bloom_before_level = 0);
 
 }  // namespace ROCKSDB_NAMESPACE

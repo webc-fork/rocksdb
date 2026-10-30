@@ -22,6 +22,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class Block;
 class BlockBuilder;
 class BlockHandle;
 class Env;
@@ -32,7 +33,7 @@ struct TableProperties;
 
 // Meta block names for metaindex
 extern const std::string kPropertiesBlockName;
-extern const std::string kPropertiesBlockOldName;
+extern const std::string kIndexBlockName;
 extern const std::string kCompressionDictBlockName;
 extern const std::string kRangeDelBlockName;
 
@@ -40,6 +41,9 @@ class MetaIndexBuilder {
  public:
   MetaIndexBuilder(const MetaIndexBuilder&) = delete;
   MetaIndexBuilder& operator=(const MetaIndexBuilder&) = delete;
+  MetaIndexBuilder(MetaIndexBuilder&&) = delete;
+  MetaIndexBuilder& operator=(MetaIndexBuilder&&) = delete;
+  ~MetaIndexBuilder() = default;
 
   MetaIndexBuilder();
   void Add(const std::string& key, const BlockHandle& handle);
@@ -58,6 +62,9 @@ class PropertyBlockBuilder {
  public:
   PropertyBlockBuilder(const PropertyBlockBuilder&) = delete;
   PropertyBlockBuilder& operator=(const PropertyBlockBuilder&) = delete;
+  PropertyBlockBuilder(PropertyBlockBuilder&&) = delete;
+  PropertyBlockBuilder& operator=(PropertyBlockBuilder&&) = delete;
+  ~PropertyBlockBuilder() = default;
 
   PropertyBlockBuilder();
 
@@ -72,6 +79,10 @@ class PropertyBlockBuilder {
  private:
   std::unique_ptr<BlockBuilder> properties_block_;
   stl_wrappers::KVMap props_;
+#ifndef NDEBUG
+  const Comparator* comparator_ = BytewiseComparator();
+  Slice last_prop_added_to_block_;
+#endif /* !NDEBUG */
 };
 
 // Were we encounter any error occurs during user-defined statistics collection,
@@ -87,19 +98,36 @@ void LogPropertiesCollectionError(Logger* info_log, const std::string& method,
 // property collectors.
 bool NotifyCollectTableCollectorsOnAdd(
     const Slice& key, const Slice& value, uint64_t file_size,
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
     Logger* info_log);
 
 void NotifyCollectTableCollectorsOnBlockAdd(
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
     uint64_t block_uncomp_bytes, uint64_t block_compressed_bytes_fast,
     uint64_t block_compressed_bytes_slow);
 
 // NotifyCollectTableCollectorsOnFinish() triggers the `Finish` event for all
 // property collectors. The collected properties will be added to `builder`.
+// It will also populate `user_collected_properties` and `readable_properties`
+// with the collected properties.
 bool NotifyCollectTableCollectorsOnFinish(
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
-    Logger* info_log, PropertyBlockBuilder* builder);
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
+    Logger* info_log, PropertyBlockBuilder* builder,
+    UserCollectedProperties& user_collected_properties,
+    UserCollectedProperties& readable_properties);
+
+// The optional offset is relative to the start of the properties block.
+Status ParsePropertiesBlock(
+    const ImmutableOptions& ioptions, Block& block,
+    std::unique_ptr<TableProperties>& new_table_properties,
+    uint32_t* global_seqno_value_offset);
+
+// Sets global_seqno to the sequence number that should replace per-entry
+// sequence numbers while reading this file. When largest_seqno is
+// kDisableGlobalSequenceNumber, leaves the stored sequence numbers unchanged.
+Status GetGlobalSequenceNumber(const TableProperties& table_properties,
+                               SequenceNumber largest_seqno,
+                               SequenceNumber* global_seqno);
 
 // Read table properties from a file using known BlockHandle.
 // @returns a status to indicate if the operation succeeded. On success,
@@ -119,6 +147,7 @@ Status ReadTablePropertiesHelper(
 Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
                            uint64_t table_magic_number,
                            const ImmutableOptions& ioptions,
+                           const ReadOptions& read_options,
                            std::unique_ptr<TableProperties>* properties,
                            MemoryAllocator* memory_allocator = nullptr,
                            FilePrefetchBuffer* prefetch_buffer = nullptr);
@@ -139,6 +168,7 @@ Status FindMetaBlock(InternalIterator* meta_index_iter,
 Status FindMetaBlockInFile(RandomAccessFileReader* file, uint64_t file_size,
                            uint64_t table_magic_number,
                            const ImmutableOptions& ioptions,
+                           const ReadOptions& read_options,
                            const std::string& meta_block_name,
                            BlockHandle* block_handle,
                            MemoryAllocator* memory_allocator = nullptr,
@@ -149,6 +179,7 @@ Status FindMetaBlockInFile(RandomAccessFileReader* file, uint64_t file_size,
 Status ReadMetaIndexBlockInFile(RandomAccessFileReader* file,
                                 uint64_t file_size, uint64_t table_magic_number,
                                 const ImmutableOptions& ioptions,
+                                const ReadOptions& read_options,
                                 BlockContents* block_contents,
                                 MemoryAllocator* memory_allocator = nullptr,
                                 FilePrefetchBuffer* prefetch_buffer = nullptr,
@@ -161,6 +192,7 @@ Status ReadMetaBlock(RandomAccessFileReader* file,
                      FilePrefetchBuffer* prefetch_buffer, uint64_t file_size,
                      uint64_t table_magic_number,
                      const ImmutableOptions& ioptions,
+                     const ReadOptions& read_options,
                      const std::string& meta_block_name, BlockType block_type,
                      BlockContents* contents,
                      MemoryAllocator* memory_allocator = nullptr);

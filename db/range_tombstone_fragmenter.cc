@@ -11,6 +11,7 @@
 #include <functional>
 #include <set>
 
+#include "db/read_callback.h"
 #include "util/autovector.h"
 #include "util/kv_map.h"
 #include "util/vector_iterator.h"
@@ -20,7 +21,8 @@ namespace ROCKSDB_NAMESPACE {
 FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
     std::unique_ptr<InternalIterator> unfragmented_tombstones,
     const InternalKeyComparator& icmp, bool for_compaction,
-    const std::vector<SequenceNumber>& snapshots) {
+    const std::vector<SequenceNumber>& snapshots,
+    const bool tombstone_end_include_ts) {
   if (unfragmented_tombstones == nullptr) {
     return;
   }
@@ -45,14 +47,20 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
       last_start_key = pinned_last_start_key.Encode();
     }
   }
-  if (is_sorted) {
+
+  auto ucmp = icmp.user_comparator();
+  assert(ucmp);
+  const size_t ts_sz = ucmp->timestamp_size();
+  bool pad_min_ts_for_end = ts_sz > 0 && !tombstone_end_include_ts;
+  if (is_sorted && !pad_min_ts_for_end) {
     FragmentTombstones(std::move(unfragmented_tombstones), icmp, for_compaction,
                        snapshots);
     return;
   }
 
   // Sort the tombstones before fragmenting them.
-  std::vector<std::string> keys, values;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   keys.reserve(num_unfragmented_tombstones_);
   values.reserve(num_unfragmented_tombstones_);
   // Reset the counter to zero for the next iteration over keys.
@@ -63,8 +71,16 @@ FragmentedRangeTombstoneList::FragmentedRangeTombstoneList(
                                       unfragmented_tombstones->value().size();
     keys.emplace_back(unfragmented_tombstones->key().data(),
                       unfragmented_tombstones->key().size());
-    values.emplace_back(unfragmented_tombstones->value().data(),
-                        unfragmented_tombstones->value().size());
+    Slice value = unfragmented_tombstones->value();
+    if (pad_min_ts_for_end) {
+      AppendKeyWithMinTimestamp(&values.emplace_back(), value, ts_sz);
+    } else {
+      values.emplace_back(value.data(), value.size());
+    }
+  }
+  num_unfragmented_tombstones_ = keys.size();
+  if (pad_min_ts_for_end) {
+    total_tombstone_payload_bytes_ += num_unfragmented_tombstones_ * ts_sz;
   }
   // VectorIterator implicitly sorts by key during construction.
   auto iter = std::make_unique<VectorIterator>(std::move(keys),
@@ -476,6 +492,29 @@ SequenceNumber FragmentedRangeTombstoneIterator::MaxCoveringTombstoneSeqnum(
              : 0;
 }
 
+SequenceNumber FragmentedRangeTombstoneIterator::MaxCoveringTombstoneSeqnum(
+    const Slice& target_user_key, ReadCallback* callback) {
+  assert(callback != nullptr);
+  SeekToCoveringTombstone(target_user_key);
+  if (!ValidPos() ||
+      ucmp_->CompareWithoutTimestamp(start_key(), target_user_key) > 0) {
+    return 0;
+  }
+
+  const auto seq_end = tombstones_->seq_iter(pos_->seq_end_idx);
+  // Sequence numbers are ordered newest to oldest and seq_pos_ is already
+  // bounded by upper_bound_. Return the first tombstone the metadata callback
+  // considers newer than the read snapshot.
+  while (seq_pos_ != seq_end && *seq_pos_ >= lower_bound_) {
+    const SequenceNumber candidate_seq = *seq_pos_;
+    if (callback->IsNewerVisibleForMetadataRead(candidate_seq)) {
+      return candidate_seq;
+    }
+    ++seq_pos_;
+  }
+  return 0;
+}
+
 std::map<SequenceNumber, std::unique_ptr<FragmentedRangeTombstoneIterator>>
 FragmentedRangeTombstoneIterator::SplitBySnapshot(
     const std::vector<SequenceNumber>& snapshots) {
@@ -483,6 +522,9 @@ FragmentedRangeTombstoneIterator::SplitBySnapshot(
       splits;
   SequenceNumber lower = 0;
   SequenceNumber upper;
+  // Safe to dereference icmp_ below: SplitBySnapshot is construction-time work
+  // (called synchronously from the range-del aggregator while the reader that
+  // owns *icmp_ is alive). See the icmp_ note in the header.
   for (size_t i = 0; i <= snapshots.size(); i++) {
     if (i >= snapshots.size()) {
       upper = kMaxSequenceNumber;

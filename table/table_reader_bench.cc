@@ -84,7 +84,7 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
   Env* env = Env::Default();
   auto* clock = env->GetSystemClock().get();
   TableBuilder* tb = nullptr;
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   Status s;
   const ImmutableOptions ioptions(opts);
   const ColumnFamilyOptions cfo(opts);
@@ -95,14 +95,16 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
                                          FileOptions(env_options), &file_writer,
                                          nullptr));
 
-    IntTblPropCollectorFactories int_tbl_prop_collector_factories;
+    InternalTblPropCollFactories internal_tbl_prop_coll_factories;
 
     int unknown_level = -1;
+    const WriteOptions write_options;
     tb = opts.table_factory->NewTableBuilder(
         TableBuilderOptions(
-            ioptions, moptions, ikc, &int_tbl_prop_collector_factories,
-            CompressionType::kNoCompression, CompressionOptions(),
-            0 /* column_family_id */, kDefaultColumnFamilyName, unknown_level),
+            ioptions, moptions, read_options, write_options, ikc,
+            &internal_tbl_prop_coll_factories, CompressionType::kNoCompression,
+            CompressionOptions(), 0 /* column_family_id */,
+            kDefaultColumnFamilyName, unknown_level, kUnknownNewestKeyTime),
         file_writer.get());
   } else {
     s = DB::Open(opts, dbname, &db);
@@ -122,7 +124,7 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
   }
   if (!through_db) {
     tb->Finish();
-    file_writer->Close();
+    file_writer->Close(IOOptions());
   } else {
     db->Flush(FlushOptions());
   }
@@ -143,8 +145,9 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
     std::unique_ptr<RandomAccessFileReader> file_reader(
         new RandomAccessFileReader(std::move(raf), file_name));
     s = opts.table_factory->NewTableReader(
-        TableReaderOptions(ioptions, moptions.prefix_extractor, env_options,
-                           ikc),
+        TableReaderOptions(ioptions, moptions.prefix_extractor,
+                           moptions.compression_manager.get(), env_options, ikc,
+                           0 /* block_protection_bytes_per_key */),
         std::move(file_reader), file_size, &table_reader);
     if (!s.ok()) {
       fprintf(stderr, "Open Table Error: %s\n", s.ToString().c_str());
@@ -254,8 +257,7 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
   if (!through_db) {
     env->DeleteFile(file_name);
   } else {
-    delete db;
-    db = nullptr;
+    db.reset();
     DestroyDB(dbname, opts);
   }
 }

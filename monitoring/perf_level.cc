@@ -4,13 +4,14 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-#include <assert.h>
+#include <cassert>
 
 #include "monitoring/perf_level_imp.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-thread_local PerfLevel perf_level = kEnableCount;
+thread_local constinit PerfLevel perf_level = kEnableCount;
+thread_local constinit bool async_read_cpu_time_enabled = false;
 
 void SetPerfLevel(PerfLevel level) {
   assert(level > kUninitialized);
@@ -19,5 +20,11 @@ void SetPerfLevel(PerfLevel level) {
 }
 
 PerfLevel GetPerfLevel() { return perf_level; }
+
+void SetAsyncReadCPUTimeEnabled(bool enabled) {
+  async_read_cpu_time_enabled = enabled;
+}
+
+bool GetAsyncReadCPUTimeEnabled() { return async_read_cpu_time_enabled; }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -26,16 +26,18 @@ class ConcurrentTaskLimiterImpl : public ConcurrentTaskLimiter {
   ConcurrentTaskLimiterImpl(const ConcurrentTaskLimiterImpl&) = delete;
   ConcurrentTaskLimiterImpl& operator=(const ConcurrentTaskLimiterImpl&) =
       delete;
+  ConcurrentTaskLimiterImpl(ConcurrentTaskLimiterImpl&&) = delete;
+  ConcurrentTaskLimiterImpl& operator=(ConcurrentTaskLimiterImpl&&) = delete;
 
-  virtual ~ConcurrentTaskLimiterImpl();
+  ~ConcurrentTaskLimiterImpl() override;
 
-  virtual const std::string& GetName() const override;
+  const std::string& GetName() const override;
 
-  virtual void SetMaxOutstandingTask(int32_t limit) override;
+  void SetMaxOutstandingTask(int32_t limit) override;
 
-  virtual void ResetMaxOutstandingTask() override;
+  void ResetMaxOutstandingTask() override;
 
-  virtual int32_t GetOutstandingTask() const override;
+  int32_t GetOutstandingTask() const override;
 
   // Request token for adding a new task.
   // If force == true, it requests a token bypassing throttle.
@@ -62,6 +64,8 @@ class TaskLimiterToken {
   // no copying allowed
   TaskLimiterToken(const TaskLimiterToken&) = delete;
   void operator=(const TaskLimiterToken&) = delete;
+  TaskLimiterToken(TaskLimiterToken&&) = delete;
+  void operator=(TaskLimiterToken&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

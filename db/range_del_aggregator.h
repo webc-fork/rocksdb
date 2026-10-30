@@ -22,7 +22,6 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/types.h"
 #include "table/internal_iterator.h"
-#include "table/scoped_arena_iterator.h"
 #include "table/table_builder.h"
 #include "util/heap.h"
 #include "util/kv_map.h"
@@ -36,6 +35,10 @@ class TruncatedRangeDelIterator {
       const InternalKeyComparator* icmp, const InternalKey* smallest,
       const InternalKey* largest);
 
+  void SetRangeDelReadSeqno(SequenceNumber read_seqno) {
+    iter_->SetRangeDelReadSeqno(read_seqno);
+  }
+
   bool Valid() const;
 
   void Next() { iter_->TopNext(); }
@@ -48,6 +51,9 @@ class TruncatedRangeDelIterator {
   // the earliest tombstone that ends after target.
   // REQUIRES: target is a user key.
   void Seek(const Slice& target);
+
+  // Seeks to the first range tombstone with end_key() > target.
+  void SeekInternalKey(const Slice& target);
 
   // Seeks to the tombstone with the highest visible sequence number that covers
   // target (a user key). If no such tombstone exists, the position will be at
@@ -282,7 +288,7 @@ class RangeDelAggregator {
  public:
   explicit RangeDelAggregator(const InternalKeyComparator* icmp)
       : icmp_(icmp) {}
-  virtual ~RangeDelAggregator() {}
+  virtual ~RangeDelAggregator() = default;
 
   virtual void AddTombstones(
       std::unique_ptr<FragmentedRangeTombstoneIterator> input_iter,
@@ -341,7 +347,8 @@ class RangeDelAggregator {
 
     // If user-defined timestamp is enabled, `start` and `end` are user keys
     // with timestamp.
-    bool IsRangeOverlapped(const Slice& start, const Slice& end);
+    bool IsRangeOverlapped(const Slice& start, const Slice& end,
+                           bool end_exclusive);
 
    private:
     bool InStripe(SequenceNumber seq) const {
@@ -372,7 +379,7 @@ class ReadRangeDelAggregator final : public RangeDelAggregator {
                          SequenceNumber upper_bound)
       : RangeDelAggregator(icmp),
         rep_(icmp, upper_bound, 0 /* lower_bound */) {}
-  ~ReadRangeDelAggregator() override {}
+  ~ReadRangeDelAggregator() override = default;
 
   using RangeDelAggregator::ShouldDelete;
   void AddTombstones(
@@ -381,14 +388,15 @@ class ReadRangeDelAggregator final : public RangeDelAggregator {
       const InternalKey* largest = nullptr) override;
 
   bool ShouldDelete(const ParsedInternalKey& parsed,
-                    RangeDelPositioningMode mode) final override {
+                    RangeDelPositioningMode mode) final {
     if (rep_.IsEmpty()) {
       return false;
     }
     return ShouldDeleteImpl(parsed, mode);
   }
 
-  bool IsRangeOverlapped(const Slice& start, const Slice& end);
+  bool IsRangeOverlapped(const Slice& start, const Slice& end,
+                         bool end_exclusive);
 
   void InvalidateRangeDelMapPositions() override { rep_.Invalidate(); }
 
@@ -423,7 +431,7 @@ class CompactionRangeDelAggregator : public RangeDelAggregator {
       }
     }
   }
-  ~CompactionRangeDelAggregator() override {}
+  ~CompactionRangeDelAggregator() override = default;
 
   void AddTombstones(
       std::unique_ptr<FragmentedRangeTombstoneIterator> input_iter,
@@ -452,16 +460,15 @@ class CompactionRangeDelAggregator : public RangeDelAggregator {
   }
 
   // Creates an iterator over all the range tombstones in the aggregator, for
-  // use in compaction. Nullptr arguments indicate that the iterator range is
-  // unbounded.
-  // NOTE: the boundaries are used for optimization purposes to reduce the
-  // number of tombstones that are passed to the fragmenter; they do not
-  // guarantee that the resulting iterator only contains range tombstones that
-  // cover keys in the provided range. If required, these bounds must be
+  // use in compaction.
+  //
+  // NOTE: the internal key boundaries are used for optimization purposes to
+  // reduce the number of tombstones that are passed to the fragmenter; they do
+  // not guarantee that the resulting iterator only contains range tombstones
+  // that cover keys in the provided range. If required, these bounds must be
   // enforced during iteration.
   std::unique_ptr<FragmentedRangeTombstoneIterator> NewIterator(
-      const Slice* lower_bound = nullptr, const Slice* upper_bound = nullptr,
-      bool upper_bound_inclusive = false);
+      const Slice* lower_bound = nullptr, const Slice* upper_bound = nullptr);
 
  private:
   std::vector<std::unique_ptr<TruncatedRangeDelIterator>> parent_iters_;

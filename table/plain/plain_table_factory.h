@@ -137,7 +137,6 @@ class TableBuilder;
 //
 class PlainTableFactory : public TableFactory {
  public:
-  ~PlainTableFactory() {}
   // user_key_len is the length of the user key. If it is set to be
   // kPlainTableVariableLength, then it means variable length. Otherwise, all
   // the keys need to have the fix length of this value. bloom_bits_per_key is
@@ -172,6 +171,10 @@ class PlainTableFactory : public TableFactory {
 
   std::string GetPrintableOptions() const override;
   static const char kValueTypeSeqId0 = char(~0);
+
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<PlainTableFactory>(*this);
+  }
 
  private:
   PlainTableOptions table_options_;

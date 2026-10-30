@@ -13,26 +13,29 @@
 #ifndef ROCKSDB_NO_DYNAMIC_EXTENSION
 #include <dlfcn.h>
 #endif
-#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#if defined(OS_LINUX) || defined(OS_SOLARIS) || defined(OS_ANDROID)
+
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#if defined(OS_LINUX) || defined(OS_ANDROID)
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
 #endif
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <time.h>
 
 #include <algorithm>
+#include <ctime>
+#include <exception>
+#include <stdexcept>
 // Get nano time includes
 #if defined(OS_LINUX) || defined(OS_FREEBSD)
 #elif defined(__MACH__)
@@ -50,18 +53,29 @@
 #include "env/io_posix.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_updater.h"
+#include "options/db_options.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "test_util/sync_point.h"
+#include "util/atomic.h"
 #include "util/coding.h"
 #include "util/compression_context_cache.h"
+#include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/string_util.h"
 #include "util/thread_local.h"
 #include "util/threadpool_imp.h"
+
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+#include "folly/executors/IOThreadPoolExecutor.h"
+#include "folly/executors/thread_factory/NamedThreadFactory.h"
+#include "folly/io/async/EventBase.h"
+#include "folly/io/async/EventBaseManager.h"
+#include "folly/io/async/IoUringBackend.h"
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
 
 #if !defined(TMPFS_MAGIC)
 #define TMPFS_MAGIC 0x01021994
@@ -82,6 +96,82 @@ namespace {
 inline mode_t GetDBFileMode(bool allow_non_owner_access) {
   return allow_non_owner_access ? 0644 : 0600;
 }
+
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+folly::IoUringOptions GetReadIOUringOptions() {
+  folly::IoUringOptions options;
+  options.setMaxSubmit(256);
+  options.setCapacity(1024);
+  options.setMinCapacity(512);
+  options.setRegisterRingFd(true);
+  options.setDeferTaskRun(true);
+  options.setTaskRunCoop(true);
+  return options;
+}
+
+struct ReadIOExecutorState {
+  ReadIOExecutorState() = default;
+  ReadIOExecutorState(const ReadIOExecutorState&) = delete;
+  ReadIOExecutorState& operator=(const ReadIOExecutorState&) = delete;
+  ReadIOExecutorState(ReadIOExecutorState&&) = delete;
+  ReadIOExecutorState& operator=(ReadIOExecutorState&&) = delete;
+
+  ~ReadIOExecutorState() {
+    delete executor_.LoadRelaxed();
+    delete event_base_manager_.LoadRelaxed();
+  }
+
+  folly::IOExecutor* GetExecutor() { return executor_.Load(); }
+
+  folly::EventBaseManager* GetEventBaseManager() {
+    return event_base_manager_.Load();
+  }
+
+  void SetThreads(int num) {
+    assert(num > 0);
+    MutexLock lock(&mutex_);
+    const size_t requested_threads = static_cast<size_t>(num);
+    auto* executor = executor_.Load();
+    if (executor != nullptr) {
+      if (requested_threads > executor->numThreads()) {
+        try {
+          executor->setNumThreads(requested_threads);
+        } catch (const std::exception&) {
+        }
+      }
+      return;
+    }
+    try {
+      folly::EventBase::Options event_base_options;
+      event_base_options.setBackendFactory(
+          []() -> std::unique_ptr<folly::EventBaseBackendBase> {
+            try {
+              auto backend = std::make_unique<folly::IoUringBackend>(
+                  GetReadIOUringOptions());
+              SetCurrentThreadReadIOUringBackendAvailable();
+              return backend;
+            } catch (const std::exception&) {
+              return folly::EventBase::getDefaultBackend();
+            }
+          });
+      auto event_base_manager =
+          std::make_unique<folly::EventBaseManager>(event_base_options);
+      auto new_executor = std::make_unique<folly::IOThreadPoolExecutor>(
+          requested_threads, 0,
+          std::make_shared<folly::NamedThreadFactory>("RocksDBAsyncRead"),
+          event_base_manager.get());
+      event_base_manager_.Store(event_base_manager.release());
+      executor_.Store(new_executor.release());
+    } catch (const std::exception&) {
+      return;
+    }
+  }
+
+  port::Mutex mutex_;
+  Atomic<folly::EventBaseManager*> event_base_manager_{nullptr};
+  Atomic<folly::IOThreadPoolExecutor*> executor_{nullptr};
+};
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
 
 // list of pathnames that are locked
 // Only used for error message.
@@ -110,12 +200,19 @@ class PosixFileLock : public FileLock {
   int fd_ = /*invalid*/ -1;
   std::string filename;
 
+  PosixFileLock() = default;
+  // No copying allowed
+  PosixFileLock(const PosixFileLock&) = delete;
+  PosixFileLock& operator=(const PosixFileLock&) = delete;
+  PosixFileLock(PosixFileLock&&) = delete;
+  PosixFileLock& operator=(PosixFileLock&&) = delete;
+
   void Clear() {
     fd_ = -1;
     filename.clear();
   }
 
-  virtual ~PosixFileLock() override {
+  ~PosixFileLock() override {
     // Check for destruction without UnlockFile
     assert(fd_ == -1);
   }
@@ -143,7 +240,17 @@ class PosixFileSystem : public FileSystem {
   const char* Name() const override { return kClassName(); }
   const char* NickName() const override { return kDefaultName(); }
 
-  ~PosixFileSystem() override {}
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+  folly::IOExecutor* GetReadExecutor() override {
+    return read_io_executor_state_.GetExecutor();
+  }
+
+  void SetReadIOExecutorThreads(int num) override {
+    read_io_executor_state_.SetThreads(num);
+  }
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
+
+  ~PosixFileSystem() override = default;
   bool IsInstanceOf(const std::string& name) const override {
     if (name == "posix") {
       return true;
@@ -168,7 +275,7 @@ class PosixFileSystem : public FileSystem {
     FILE* file = nullptr;
 
     if (options.use_direct_reads && !options.use_mmap_reads) {
-#if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
+#if !defined(OS_MACOSX) && !defined(OS_OPENBSD)
       flags |= O_DIRECT;
       TEST_SYNC_POINT_CALLBACK("NewSequentialFile:O_DIRECT", &flags);
 #endif
@@ -219,7 +326,7 @@ class PosixFileSystem : public FileSystem {
     int flags = cloexec_flags(O_RDONLY, &options);
 
     if (options.use_direct_reads && !options.use_mmap_reads) {
-#if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
+#if !defined(OS_MACOSX) && !defined(OS_OPENBSD)
       flags |= O_DIRECT;
       TEST_SYNC_POINT_CALLBACK("NewRandomAccessFile:O_DIRECT", &flags);
 #endif
@@ -241,10 +348,11 @@ class PosixFileSystem : public FileSystem {
       // Use mmap when virtual address-space is plentiful.
       uint64_t size;
       IOOptions opts;
-      s = GetFileSize(fname, opts, &size, nullptr);
+      s = GetFileSizeOnOpenedFile(fd, fname, &size);
       if (s.ok()) {
         void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
         if (base != MAP_FAILED) {
+          TsanAnnotateMappedMemory(base, static_cast<size_t>(size));
           result->reset(
               new PosixMmapReadableFile(fd, fname, base, size, options));
         } else {
@@ -266,9 +374,16 @@ class PosixFileSystem : public FileSystem {
       result->reset(new PosixRandomAccessFile(
           fname, fd, GetLogicalBlockSizeForReadIfNeeded(options, fname, fd),
           options
-#if defined(ROCKSDB_IOURING_PRESENT)
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
           ,
-          !IsIOUringEnabled() ? nullptr : thread_local_io_urings_.get()
+          read_io_executor_state_.GetEventBaseManager()
+#endif
+#if defined(ROCKSDB_IOURING_PRESENT)
+              ,
+          !IsIOUringEnabled() ? nullptr
+                              : thread_local_async_read_io_urings_.get(),
+          !IsIOUringEnabled() ? nullptr
+                              : thread_local_multi_read_io_urings_.get()
 #endif
               ));
     }
@@ -293,7 +408,7 @@ class PosixFileSystem : public FileSystem {
       // offset.
       // More info here: https://linux.die.net/man/2/pwrite
       flags |= O_WRONLY;
-#if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
+#if !defined(OS_MACOSX) && !defined(OS_OPENBSD)
       flags |= O_DIRECT;
 #endif
       TEST_SYNC_POINT_CALLBACK("NewWritableFile:O_DIRECT", &flags);
@@ -320,8 +435,17 @@ class PosixFileSystem : public FileSystem {
     if (options.use_mmap_writes) {
       MaybeForceDisableMmap(fd);
     }
+    uint64_t initial_file_size = 0;
+    if (reopen) {
+      s = GetFileSizeOnOpenedFile(fd, fname, &initial_file_size);
+      if (!s.ok()) {
+        close(fd);
+        return s;
+      }
+    }
     if (options.use_mmap_writes && !forceMmapOff_) {
-      result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      result->reset(
+          new PosixMmapFile(fname, fd, page_size_, options, initial_file_size));
     } else if (options.use_direct_writes && !options.use_mmap_writes) {
 #ifdef OS_MACOSX
       if (fcntl(fd, F_NOCACHE, 1) == -1) {
@@ -330,18 +454,10 @@ class PosixFileSystem : public FileSystem {
                     errno);
         return s;
       }
-#elif defined(OS_SOLARIS)
-      if (directio(fd, DIRECTIO_ON) == -1) {
-        if (errno != ENOTTY) {  // ZFS filesystems don't support DIRECTIO_ON
-          close(fd);
-          s = IOError("While calling directio()", fname, errno);
-          return s;
-        }
-      }
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, initial_file_size));
     } else {
       // disable mmap writes
       EnvOptions no_mmap_writes_options = options;
@@ -350,7 +466,7 @@ class PosixFileSystem : public FileSystem {
           new PosixWritableFile(fname, fd,
                                 GetLogicalBlockSizeForWriteIfNeeded(
                                     no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+                                no_mmap_writes_options, initial_file_size));
     }
     return s;
   }
@@ -381,7 +497,7 @@ class PosixFileSystem : public FileSystem {
     // Direct IO mode with O_DIRECT flag or F_NOCAHCE (MAC OSX)
     if (options.use_direct_writes && !options.use_mmap_writes) {
       flags |= O_WRONLY;
-#if !defined(OS_MACOSX) && !defined(OS_OPENBSD) && !defined(OS_SOLARIS)
+#if !defined(OS_MACOSX) && !defined(OS_OPENBSD)
       flags |= O_DIRECT;
 #endif
       TEST_SYNC_POINT_CALLBACK("NewWritableFile:O_DIRECT", &flags);
@@ -416,7 +532,8 @@ class PosixFileSystem : public FileSystem {
       MaybeForceDisableMmap(fd);
     }
     if (options.use_mmap_writes && !forceMmapOff_) {
-      result->reset(new PosixMmapFile(fname, fd, page_size_, options));
+      result->reset(new PosixMmapFile(fname, fd, page_size_, options,
+                                      /*initial_file_size=*/0));
     } else if (options.use_direct_writes && !options.use_mmap_writes) {
 #ifdef OS_MACOSX
       if (fcntl(fd, F_NOCACHE, 1) == -1) {
@@ -425,27 +542,19 @@ class PosixFileSystem : public FileSystem {
                     errno);
         return s;
       }
-#elif defined(OS_SOLARIS)
-      if (directio(fd, DIRECTIO_ON) == -1) {
-        if (errno != ENOTTY) {  // ZFS filesystems don't support DIRECTIO_ON
-          close(fd);
-          s = IOError("while calling directio()", fname, errno);
-          return s;
-        }
-      }
 #endif
       result->reset(new PosixWritableFile(
           fname, fd, GetLogicalBlockSizeForWriteIfNeeded(options, fname, fd),
-          options));
+          options, /*initial_file_size=*/0));
     } else {
       // disable mmap writes
       FileOptions no_mmap_writes_options = options;
       no_mmap_writes_options.use_mmap_writes = false;
-      result->reset(
-          new PosixWritableFile(fname, fd,
-                                GetLogicalBlockSizeForWriteIfNeeded(
-                                    no_mmap_writes_options, fname, fd),
-                                no_mmap_writes_options));
+      result->reset(new PosixWritableFile(
+          fname, fd,
+          GetLogicalBlockSizeForWriteIfNeeded(no_mmap_writes_options, fname,
+                                              fd),
+          no_mmap_writes_options, /*initial_file_size=*/0));
     }
     return s;
   }
@@ -497,7 +606,7 @@ class PosixFileSystem : public FileSystem {
     uint64_t size;
     if (status.ok()) {
       IOOptions opts;
-      status = GetFileSize(fname, opts, &size, nullptr);
+      status = GetFileSizeOnOpenedFile(fd, fname, &size);
     }
     void* base = nullptr;
     if (status.ok()) {
@@ -505,6 +614,8 @@ class PosixFileSystem : public FileSystem {
                   MAP_SHARED, fd, 0);
       if (base == MAP_FAILED) {
         status = IOError("while mmap file for read", fname, errno);
+      } else {
+        TsanAnnotateMappedMemory(base, static_cast<size_t>(size));
       }
     }
     if (status.ok()) {
@@ -659,7 +770,7 @@ class PosixFileSystem : public FileSystem {
 
   IOStatus GetFileSize(const std::string& fname, const IOOptions& /*opts*/,
                        uint64_t* size, IODebugContext* /*dbg*/) override {
-    struct stat sbuf;
+    struct stat sbuf{};
     if (stat(fname.c_str(), &sbuf) != 0) {
       *size = 0;
       return IOError("while stat a file for size", fname, errno);
@@ -805,7 +916,7 @@ class PosixFileSystem : public FileSystem {
 
   IOStatus UnlockFile(FileLock* lock, const IOOptions& /*opts*/,
                       IODebugContext* /*dbg*/) override {
-    PosixFileLock* my_lock = reinterpret_cast<PosixFileLock*>(lock);
+    PosixFileLock* my_lock = static_cast<PosixFileLock*>(lock);
     IOStatus result;
     mutex_locked_files.Lock();
     // If we are unlocking, then verify that we had locked it earlier,
@@ -856,7 +967,6 @@ class PosixFileSystem : public FileSystem {
       IOOptions opts;
       return CreateDirIfMissing(*result, opts, nullptr);
     }
-    return IOStatus::OK();
   }
 
   IOStatus GetFreeSpace(const std::string& fname, const IOOptions& /*opts*/,
@@ -913,7 +1023,7 @@ class PosixFileSystem : public FileSystem {
     optimized.use_direct_writes = false;
     optimized.bytes_per_sync = db_options.wal_bytes_per_sync;
     // TODO(icanadi) it's faster if fallocate_with_keep_size is false, but it
-    // breaks TransactionLogIteratorStallAtLastRecord unit test. Fix the unit
+    // breaks DBWalIteratorTest.StallAtLastRecord unit test. Fix the unit
     // test and make this false
     optimized.fallocate_with_keep_size = true;
     optimized.writable_file_max_buffer_size =
@@ -929,6 +1039,27 @@ class PosixFileSystem : public FileSystem {
     optimized.fallocate_with_keep_size = true;
     return optimized;
   }
+
+  FileOptions OptimizeForCompactionTableRead(
+      const FileOptions& file_options,
+      const ImmutableDBOptions& db_options) const override {
+    FileOptions fo =
+        FileSystem::OptimizeForCompactionTableRead(file_options, db_options);
+#ifdef OS_LINUX
+    // To fix https://github.com/meta/rocksdb/issues/12038
+    if (!fo.use_direct_reads && fo.compaction_readahead_size > 0) {
+      size_t system_limit =
+          GetCompactionReadaheadSizeSystemLimit(db_options.db_paths);
+      if (system_limit > 0 && fo.compaction_readahead_size > system_limit) {
+        fo.compaction_readahead_size = system_limit;
+      }
+    }
+#else
+    (void)db_options;
+#endif
+    return fo;
+  }
+
 #ifdef OS_LINUX
   Status RegisterDbPaths(const std::vector<std::string>& paths) override {
     return logical_block_size_cache_.RefAndCacheLogicalBlockSize(paths);
@@ -941,6 +1072,52 @@ class PosixFileSystem : public FileSystem {
  private:
   bool forceMmapOff_ = false;  // do we override Env options?
 
+  // This is a faster API comparing to the public method that uses stat to get
+  // file size. However this API only works on opened file.
+  IOStatus GetFileSizeOnOpenedFile(const int fd, const std::string& name,
+                                   uint64_t* size) {
+    struct stat sb{};
+    *size = 0;
+    // Get file information using fstat
+    if (fstat(fd, &sb) == -1) {
+      return IOError(
+          "while fstat a file for size with fd " + std::to_string(fd), name,
+          errno);
+    }
+    *size = sb.st_size;
+    return IOStatus::OK();
+  }
+
+#ifdef OS_LINUX
+  // Get the minimum "linux system limit" (i.e, the largest I/O size that the OS
+  // can issue to block devices under a directory, also known as
+  // "max_sectors_kb" ) among `db_paths`.
+  // Return 0 if no limit can be found or there is an error in
+  // retrieving such limit.
+  static size_t GetCompactionReadaheadSizeSystemLimit(
+      const std::vector<DbPath>& db_paths) {
+    Status s;
+    size_t limit_kb = 0;
+
+    for (const auto& db_path : db_paths) {
+      size_t dir_max_sectors_kb = 0;
+      s = PosixHelper::GetMaxSectorsKBOfDirectory(db_path.path,
+                                                  &dir_max_sectors_kb);
+      if (!s.ok()) {
+        break;
+      }
+
+      limit_kb = (limit_kb == 0) ? dir_max_sectors_kb
+                                 : std::min(limit_kb, dir_max_sectors_kb);
+    }
+
+    if (s.ok()) {
+      return limit_kb * 1024;
+    } else {
+      return 0;
+    }
+  }
+#endif
   // Returns true iff the named directory exists and is a directory.
   virtual bool DirExists(const std::string& dname) {
     struct stat statbuf;
@@ -997,21 +1174,20 @@ class PosixFileSystem : public FileSystem {
   }
 #endif  // ROCKSDB_IOURING_PRESENT
 
-  // EXPERIMENTAL
-  //
-  // TODO akankshamahajan:
+  // TODO:
   // 1. Update Poll API to take into account min_completions
   // and returns if number of handles in io_handles (any order) completed is
   // equal to atleast min_completions.
   // 2. Currently in case of direct_io, Read API is called because of which call
   // to Poll API fails as it expects IOHandle to be populated.
-  virtual IOStatus Poll(std::vector<void*>& io_handles,
-                        size_t /*min_completions*/) override {
+  IOStatus Poll(std::vector<void*>& io_handles,
+                size_t /*min_completions*/) override {
 #if defined(ROCKSDB_IOURING_PRESENT)
     // io_uring_queue_init.
     struct io_uring* iu = nullptr;
-    if (thread_local_io_urings_) {
-      iu = static_cast<struct io_uring*>(thread_local_io_urings_->Get());
+    if (thread_local_async_read_io_urings_) {
+      iu = static_cast<struct io_uring*>(
+          thread_local_async_read_io_urings_->Get());
     }
 
     // Init failed, platform doesn't support io_uring.
@@ -1030,8 +1206,10 @@ class PosixFileSystem : public FileSystem {
         struct io_uring_cqe* cqe = nullptr;
         ssize_t ret = io_uring_wait_cqe(iu, &cqe);
         if (ret) {
-          // abort as it shouldn't be in indeterminate state and there is no
-          // good way currently to handle this error.
+          if (ret == -EINTR || ret == -EAGAIN) {
+            continue;  // Retry
+          }
+          fprintf(stderr, "Poll: io_uring_wait_cqe failed: %ld\n", (long)ret);
           abort();
         }
 
@@ -1046,25 +1224,7 @@ class PosixFileSystem : public FileSystem {
         // Reset cqe data to catch any stray reuse of it
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
 
-        FSReadRequest req;
-        req.scratch = posix_handle->scratch;
-        req.offset = posix_handle->offset;
-        req.len = posix_handle->len;
-
-        size_t finished_len = 0;
-        size_t bytes_read = 0;
-        bool read_again = false;
-        UpdateResult(cqe, "", req.len, posix_handle->iov.iov_len,
-                     true /*async_read*/, posix_handle->use_direct_io,
-                     posix_handle->alignment, finished_len, &req, bytes_read,
-                     read_again);
-        posix_handle->is_finished = true;
-        io_uring_cqe_seen(iu, cqe);
-        posix_handle->cb(req, posix_handle->cb_arg);
-
-        (void)finished_len;
-        (void)bytes_read;
-        (void)read_again;
+        FinalizeAsyncRead(iu, cqe, posix_handle);
 
         if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
           break;
@@ -1074,16 +1234,17 @@ class PosixFileSystem : public FileSystem {
     return IOStatus::OK();
 #else
     (void)io_handles;
-    return IOStatus::NotSupported("Poll");
+    return IOStatus::NotSupported("Poll not implemented");
 #endif
   }
 
-  virtual IOStatus AbortIO(std::vector<void*>& io_handles) override {
+  IOStatus AbortIO(std::vector<void*>& io_handles) override {
 #if defined(ROCKSDB_IOURING_PRESENT)
     // io_uring_queue_init.
     struct io_uring* iu = nullptr;
-    if (thread_local_io_urings_) {
-      iu = static_cast<struct io_uring*>(thread_local_io_urings_->Get());
+    if (thread_local_async_read_io_urings_) {
+      iu = static_cast<struct io_uring*>(
+          thread_local_async_read_io_urings_->Get());
     }
 
     // Init failed, platform doesn't support io_uring.
@@ -1103,6 +1264,11 @@ class PosixFileSystem : public FileSystem {
       if (posix_handle->iu != iu) {
         return IOStatus::IOError("");
       }
+
+      // Mark this handle as being aborted. This is used when processing
+      // completions to distinguish between aborted handles (expect 2
+      // completions: original + cancel) and non-aborted handles (expect 1).
+      posix_handle->is_being_aborted = true;
 
       // Prepare the cancel request.
       struct io_uring_sqe* sqe;
@@ -1133,8 +1299,11 @@ class PosixFileSystem : public FileSystem {
         struct io_uring_cqe* cqe = nullptr;
         ssize_t ret = io_uring_wait_cqe(iu, &cqe);
         if (ret) {
-          // abort as it shouldn't be in indeterminate state and there is no
-          // good way currently to handle this error.
+          if (ret == -EINTR || ret == -EAGAIN) {
+            continue;  // Retry
+          }
+          fprintf(stderr, "AbortIO: io_uring_wait_cqe failed: %ld\n",
+                  (long)ret);
           abort();
         }
         assert(cqe != nullptr);
@@ -1147,6 +1316,14 @@ class PosixFileSystem : public FileSystem {
           return IOStatus::IOError("");
         }
         posix_handle->req_count++;
+
+        if (!posix_handle->is_being_aborted) {
+          // This is a completion for a handle NOT being aborted.
+          // It only has 1 outstanding request (the original read), so we
+          // should finalize it now.
+          FinalizeAsyncRead(iu, cqe, posix_handle);
+          continue;
+        }
 
         // Reset cqe data to catch any stray reuse of it
         static_cast<struct io_uring_cqe*>(cqe)->user_data = 0xd5d5d5d5d5d5d5d5;
@@ -1161,16 +1338,23 @@ class PosixFileSystem : public FileSystem {
         // - And finally, if the request to cancel wasn't
         //   found, the cancel request is completed with -ENOENT.
         //
-        // Every handle has to wait for 2 requests completion: original one and
-        // the cancel request which is tracked by PosixHandle::req_count.
-        if (posix_handle->req_count == 2 &&
-            static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
+        // Every handle being aborted has to wait for 2 requests completion:
+        // original one and the cancel request which is tracked by
+        // PosixHandle::req_count.
+        // Note: We must mark is_finished and invoke the callback for ANY handle
+        // that reaches req_count == 2, not just the one we're currently waiting
+        // for (io_handles[i]). Otherwise, if completions arrive out of order,
+        // we consume another handle's completions without marking it finished,
+        // causing an infinite hang when we later wait for that handle.
+        if (posix_handle->req_count == 2) {
           posix_handle->is_finished = true;
           FSReadRequest req;
           req.status = IOStatus::Aborted();
           posix_handle->cb(req, posix_handle->cb_arg);
 
-          break;
+          if (static_cast<Posix_IOHandle*>(io_handles[i]) == posix_handle) {
+            break;
+          }
         }
       }
     }
@@ -1183,9 +1367,48 @@ class PosixFileSystem : public FileSystem {
 #endif
   }
 
+  void SupportedOps(int64_t& supported_ops) override {
+    supported_ops = 0;
+#if defined(ROCKSDB_IOURING_PRESENT)
+    if (IsIOUringEnabled() && thread_local_async_read_io_urings_) {
+      // Eagerly initialize the thread-local io_uring instance to verify that
+      // io_uring actually works on the calling thread before advertising
+      // kAsyncIO support. CreateIOUring() can fail per-thread even when the
+      // constructor's one-time probe on the main thread succeeded (e.g. due to
+      // kernel resource limits or flag incompatibilities).
+      static thread_local bool io_uring_init_attempted = false;
+      struct io_uring* iu = static_cast<struct io_uring*>(
+          thread_local_async_read_io_urings_->Get());
+      if (iu == nullptr && !io_uring_init_attempted) {
+        iu = CreateIOUring();
+        TEST_SYNC_POINT_CALLBACK("PosixFileSystem::SupportedOps:CreateIOUring",
+                                 &iu);
+        if (iu != nullptr) {
+          thread_local_async_read_io_urings_->Reset(iu);
+        } else {
+          fprintf(stdout,
+                  "SupportedOps: failed to init io_uring, disabling async IO "
+                  "support on thread %lu\n",
+                  static_cast<unsigned long>(pthread_self()));
+        }
+        io_uring_init_attempted = true;
+      }
+      if (iu != nullptr) {
+        supported_ops |= (1 << FSSupportedOps::kAsyncIO);
+      }
+    }
+#endif
+    supported_ops |= (1 << FSSupportedOps::kFSPrefetch);
+  }
+
+#if USE_COROUTINES && FOLLY_HAS_LIBURING
+  ReadIOExecutorState read_io_executor_state_;
+#endif  // USE_COROUTINES && FOLLY_HAS_LIBURING
+
 #if defined(ROCKSDB_IOURING_PRESENT)
   // io_uring instance
-  std::unique_ptr<ThreadLocalPtr> thread_local_io_urings_;
+  std::unique_ptr<ThreadLocalPtr> thread_local_async_read_io_urings_;
+  std::unique_ptr<ThreadLocalPtr> thread_local_multi_read_io_urings_;
 #endif
 
   size_t page_size_;
@@ -1240,13 +1463,13 @@ PosixFileSystem::PosixFileSystem()
       page_size_(getpagesize()),
       allow_non_owner_access_(true) {
 #if defined(ROCKSDB_IOURING_PRESENT)
-  // Test whether IOUring is supported, and if it does, create a managing
-  // object for thread local point so that in the future thread-local
-  // io_uring can be created.
+  // Test whether IOUring is supported with the same flags that ReadAsync and
+  // MultiRead will use at runtime.
   struct io_uring* new_io_uring = CreateIOUring();
   if (new_io_uring != nullptr) {
-    thread_local_io_urings_.reset(new ThreadLocalPtr(DeleteIOUring));
-    delete new_io_uring;
+    thread_local_async_read_io_urings_.reset(new ThreadLocalPtr(DeleteIOUring));
+    thread_local_multi_read_io_urings_.reset(new ThreadLocalPtr(DeleteIOUring));
+    DeleteIOUring(new_io_uring);
   }
 #endif
 }

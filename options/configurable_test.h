@@ -33,8 +33,8 @@ struct TestOptions {
   bool b = false;
   bool d = true;
   TestEnum e = TestEnum::kTestA;
-  std::string s = "";
-  std::string u = "";
+  std::string s;
+  std::string u;
 };
 
 static std::unordered_map<std::string, OptionTypeInfo> simple_option_info = {
@@ -51,8 +51,7 @@ static std::unordered_map<std::string, OptionTypeInfo> simple_option_info = {
 
 static std::unordered_map<std::string, OptionTypeInfo> enum_option_info = {
     {"enum",
-     OptionTypeInfo::Enum(offsetof(struct TestOptions, e), &test_enum_map)}
-};
+     OptionTypeInfo::Enum(offsetof(struct TestOptions, e), &test_enum_map)}};
 
 static std::unordered_map<std::string, OptionTypeInfo> unique_option_info = {
     {"unique",

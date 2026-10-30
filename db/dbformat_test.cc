@@ -23,17 +23,17 @@ static std::string IKey(const std::string& user_key, uint64_t seq,
 }
 
 static std::string Shorten(const std::string& s, const std::string& l) {
-  std::string result = s;
-  ShortenedIndexBuilder::FindShortestInternalKeySeparator(*BytewiseComparator(),
-                                                          &result, l);
-  return result;
+  std::string scratch;
+  return ShortenedIndexBuilder::FindShortestInternalKeySeparator(
+             *BytewiseComparator(), s, l, &scratch)
+      .ToString();
 }
 
 static std::string ShortSuccessor(const std::string& s) {
-  std::string result = s;
-  ShortenedIndexBuilder::FindShortInternalKeySuccessor(*BytewiseComparator(),
-                                                       &result);
-  return result;
+  std::string scratch;
+  return ShortenedIndexBuilder::FindShortInternalKeySuccessor(
+             *BytewiseComparator(), s, &scratch)
+      .ToString();
 }
 
 static void TestKey(const std::string& key, uint64_t seq, ValueType vt) {
@@ -178,6 +178,155 @@ TEST_F(FormatTest, IterKeyOperation) {
                         "abcdefghijklmnopqrstuvwxyz"));
 }
 
+class IterKeySwapTest
+    : public testing::TestWithParam<
+          std::tuple<size_t,  // a_key_len: inline (<=39) vs heap (>39)
+                     bool,    // a_copy: true = copied, false = pinned
+                     bool,    // a_use_secondary: key_ in secondary_buf_
+                     size_t,  // b_key_len
+                     bool,    // b_copy
+                     bool     // b_use_secondary
+                     >> {
+ protected:
+  // Populates an IterKey with a key of the given length. If !copy, the key is
+  // pinned (key_ points to external data); caller must keep `storage` alive.
+  // If use_secondary, moves key_ to the secondary buffer via
+  // TrimAppendWithTimestamp (only meaningful when copy=true).
+  static std::string PopulateKey(IterKey& k, size_t key_len, char fill,
+                                 bool copy, bool use_secondary,
+                                 std::string& storage) {
+    std::string base(key_len, fill);
+    if (!copy) {
+      storage = base;
+      k.SetUserKey(Slice(storage), false /* copy */);
+      return base;
+    }
+    k.SetUserKey(base);
+    if (use_secondary) {
+      size_t ts_sz = sizeof(uint64_t);
+      // Keep 1 byte from the existing key, append the rest + timestamp.
+      std::string suffix = base.substr(1);
+      k.TrimAppendWithTimestamp(1, suffix.data(), suffix.size(), ts_sz);
+      return base + std::string(ts_sz, '\0');
+    }
+    return base;
+  }
+};
+
+TEST_P(IterKeySwapTest, SwapAndDestroy) {
+  auto [a_key_len, a_copy, a_use_secondary, b_key_len, b_copy,
+        b_use_secondary] = GetParam();
+
+  std::string expected_a;
+  std::string expected_b;
+  // Storage for pinned keys -- must outlive the IterKeys.
+  std::string a_storage;
+  std::string b_storage;
+  IterKey a;
+  expected_a =
+      PopulateKey(a, a_key_len, 'a', a_copy, a_use_secondary, a_storage);
+  ASSERT_EQ(a.GetUserKey().ToString(), expected_a);
+
+  {
+    IterKey b;
+    expected_b =
+        PopulateKey(b, b_key_len, 'b', b_copy, b_use_secondary, b_storage);
+    ASSERT_EQ(b.GetUserKey().ToString(), expected_b);
+
+    a.Swap(b);
+
+    // After swap: a has b's old data, b has a's old data.
+    ASSERT_EQ(a.GetUserKey().ToString(), expected_b);
+    ASSERT_EQ(b.GetUserKey().ToString(), expected_a);
+  }  // b destroyed here -- must not corrupt a's data
+
+  // a must still hold valid data after b's destruction.
+  ASSERT_EQ(a.GetUserKey().ToString(), expected_b);
+}
+
+INSTANTIATE_TEST_CASE_P(
+    IterKeySwap, IterKeySwapTest,
+    ::testing::Combine(
+        /*a_key_len=*/::testing::Values(10, 50),  // inline vs heap
+        /*a_copy=*/::testing::Bool(),
+        /*a_use_secondary=*/::testing::Bool(),
+        /*b_key_len=*/::testing::Values(10, 50),  // inline vs heap
+        /*b_copy=*/::testing::Bool(),
+        /*b_use_secondary=*/::testing::Bool()));
+
+TEST_F(FormatTest, IterKeyWithTimestampOperation) {
+  IterKey k;
+  k.SetUserKey("");
+  const char p[] = "abcdefghijklmnopqrstuvwxyz";
+  const char q[] = "0123456789";
+
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            std::string(""));
+
+  size_t ts_sz = 8;
+  std::string min_timestamp(ts_sz, static_cast<unsigned char>(0));
+  k.TrimAppendWithTimestamp(0, p, 3, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abc" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(1, p, 3, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "aabc" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(0, p, 26, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abcdefghijklmnopqrstuvwxyz" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(26, q, 10, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abcdefghijklmnopqrstuvwxyz0123456789" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(36, q, 1, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abcdefghijklmnopqrstuvwxyz01234567890" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(26, q, 1, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abcdefghijklmnopqrstuvwxyz0" + min_timestamp);
+
+  k.TrimAppendWithTimestamp(27, p, 26, ts_sz);
+  ASSERT_EQ(std::string(k.GetUserKey().data(), k.GetUserKey().size()),
+            "abcdefghijklmnopqrstuvwxyz0"
+            "abcdefghijklmnopqrstuvwxyz" +
+                min_timestamp);
+  // IterKey holds an internal key, the last 8 bytes hold the key footer, the
+  // timestamp is expected to be added before the key footer.
+  std::string key_without_ts = "keywithoutts";
+  k.SetInternalKey(key_without_ts + min_timestamp + "internal");
+
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            key_without_ts + min_timestamp + "internal");
+  k.TrimAppendWithTimestamp(0, p, 10, ts_sz);
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            "ab" + min_timestamp + "cdefghij");
+
+  k.TrimAppendWithTimestamp(1, p, 8, ts_sz);
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            "a" + min_timestamp + "abcdefgh");
+
+  k.TrimAppendWithTimestamp(9, p, 3, ts_sz);
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            "aabc" + min_timestamp + "defghabc");
+
+  k.TrimAppendWithTimestamp(10, q, 10, ts_sz);
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            "aabcdefgha01" + min_timestamp + "23456789");
+
+  k.TrimAppendWithTimestamp(20, q, 1, ts_sz);
+  ASSERT_EQ(std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+            "aabcdefgha012" + min_timestamp + "34567890");
+
+  k.TrimAppendWithTimestamp(21, p, 26, ts_sz);
+  ASSERT_EQ(
+      std::string(k.GetInternalKey().data(), k.GetInternalKey().size()),
+      "aabcdefgha01234567890abcdefghijklmnopqr" + min_timestamp + "stuvwxyz");
+}
+
 TEST_F(FormatTest, UpdateInternalKey) {
   std::string user_key("abcdefghijklmnopqrstuvwxyz");
   uint64_t new_seq = 0x123456;
@@ -202,6 +351,106 @@ TEST_F(FormatTest, RangeTombstoneSerializeEndKey) {
   InternalKey k("b", 3, kTypeValue);
   const InternalKeyComparator cmp(BytewiseComparator());
   ASSERT_LT(cmp.Compare(t.SerializeEndKey(), k), 0);
+}
+
+TEST_F(FormatTest, PadInternalKeyWithMinTimestamp) {
+  std::string orig_user_key = "foo";
+  std::string orig_internal_key = IKey(orig_user_key, 100, kTypeValue);
+  size_t ts_sz = 8;
+
+  std::string key_buf;
+  PadInternalKeyWithMinTimestamp(&key_buf, orig_internal_key, ts_sz);
+  ParsedInternalKey key_with_timestamp;
+  Slice in(key_buf);
+  ASSERT_OK(ParseInternalKey(in, &key_with_timestamp, true /*log_err_key*/));
+
+  std::string min_timestamp(ts_sz, static_cast<unsigned char>(0));
+  ASSERT_EQ(orig_user_key + min_timestamp, key_with_timestamp.user_key);
+  ASSERT_EQ(100, key_with_timestamp.sequence);
+  ASSERT_EQ(kTypeValue, key_with_timestamp.type);
+}
+
+TEST_F(FormatTest, StripTimestampFromInternalKey) {
+  std::string orig_user_key = "foo";
+  size_t ts_sz = 8;
+  std::string timestamp(ts_sz, static_cast<unsigned char>(0));
+  orig_user_key.append(timestamp.data(), timestamp.size());
+  std::string orig_internal_key = IKey(orig_user_key, 100, kTypeValue);
+
+  std::string key_buf;
+  StripTimestampFromInternalKey(&key_buf, orig_internal_key, ts_sz);
+  ParsedInternalKey key_without_timestamp;
+  Slice in(key_buf);
+  ASSERT_OK(ParseInternalKey(in, &key_without_timestamp, true /*log_err_key*/));
+
+  ASSERT_EQ("foo", key_without_timestamp.user_key);
+  ASSERT_EQ(100, key_without_timestamp.sequence);
+  ASSERT_EQ(kTypeValue, key_without_timestamp.type);
+}
+
+TEST_F(FormatTest, ReplaceInternalKeyWithMinTimestamp) {
+  std::string orig_user_key = "foo";
+  size_t ts_sz = 8;
+  orig_user_key.append(ts_sz, static_cast<unsigned char>(1));
+  std::string orig_internal_key = IKey(orig_user_key, 100, kTypeValue);
+
+  std::string key_buf;
+  ReplaceInternalKeyWithMinTimestamp(&key_buf, orig_internal_key, ts_sz);
+  ParsedInternalKey new_key;
+  Slice in(key_buf);
+  ASSERT_OK(ParseInternalKey(in, &new_key, true /*log_err_key*/));
+
+  std::string min_timestamp(ts_sz, static_cast<unsigned char>(0));
+  size_t ukey_diff_offset = new_key.user_key.difference_offset(orig_user_key);
+  ASSERT_EQ(min_timestamp,
+            Slice(new_key.user_key.data() + ukey_diff_offset, ts_sz));
+  ASSERT_EQ(orig_user_key.size(), new_key.user_key.size());
+  ASSERT_EQ(100, new_key.sequence);
+  ASSERT_EQ(kTypeValue, new_key.type);
+}
+
+TEST(RocksdbVersionTest, Version) {
+  // Test preprocessor macros for versioning
+  ASSERT_GT(ROCKSDB_MAJOR, 0);
+  ASSERT_GE(ROCKSDB_MINOR, 0);
+  ASSERT_GE(ROCKSDB_PATCH, 0);
+  ASSERT_LT(ROCKSDB_MAJOR, 1000);
+  ASSERT_LT(ROCKSDB_MINOR, 1000);
+  ASSERT_LT(ROCKSDB_PATCH, 1000);
+  ASSERT_EQ(ROCKSDB_MAKE_VERSION_INT(123, 456, 789), 123456789);
+  ASSERT_GT(ROCKSDB_VERSION_INT, 9999999);
+  ASSERT_LT(ROCKSDB_VERSION_INT, 99999999);
+  static_assert(ROCKSDB_VERSION_GE(9, 8, 7));
+  static_assert(
+      ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH));
+  static_assert(
+      ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH - 1));
+  static_assert(
+      ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH - 100));
+  static_assert(
+      ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR - 1, ROCKSDB_PATCH + 1));
+  static_assert(ROCKSDB_VERSION_GE(ROCKSDB_MAJOR - 1, ROCKSDB_MINOR + 1,
+                                   ROCKSDB_PATCH + 1));
+  static_assert(
+      !ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH + 1));
+  static_assert(
+      !ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH + 100));
+  static_assert(
+      !ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR + 1, ROCKSDB_PATCH - 1));
+  static_assert(!ROCKSDB_VERSION_GE(ROCKSDB_MAJOR + 1, ROCKSDB_MINOR - 1,
+                                    ROCKSDB_PATCH - 1));
+  // More typical usage (but with literal numbers based on relevant API
+  // features)
+#if ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH)
+  static_assert(true);
+#else
+  static_assert(false);
+#endif
+#if !ROCKSDB_VERSION_GE(ROCKSDB_MAJOR, ROCKSDB_MINOR, ROCKSDB_PATCH + 1)
+  static_assert(true);
+#else
+  static_assert(false);
+#endif
 }
 
 }  // namespace ROCKSDB_NAMESPACE

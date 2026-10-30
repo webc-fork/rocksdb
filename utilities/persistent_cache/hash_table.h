@@ -5,7 +5,6 @@
 //
 #pragma once
 
-
 #include <assert.h>
 
 #include <list>
@@ -92,6 +91,12 @@ class HashTable {
   }
 
   virtual ~HashTable() { AssertEmptyBuckets(); }
+
+  // No copying allowed
+  HashTable(const HashTable&) = delete;
+  HashTable& operator=(const HashTable&) = delete;
+  HashTable(HashTable&&) = delete;
+  HashTable& operator=(HashTable&&) = delete;
 
   //
   // Insert given record to hash table
@@ -234,4 +239,3 @@ class HashTable {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

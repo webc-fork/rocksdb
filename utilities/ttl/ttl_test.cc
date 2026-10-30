@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include <map>
 #include <memory>
 
@@ -18,6 +17,11 @@
 #include "utilities/ttl/db_ttl_impl.h"
 #ifndef OS_WIN
 #include <unistd.h>
+#endif
+
+#if USE_COROUTINES
+#include "folly/coro/BlockingWait.h"
+#include "rocksdb/coro_db.h"
 #endif
 
 namespace ROCKSDB_NAMESPACE {
@@ -403,13 +407,95 @@ class TtlTest : public testing::Test {
   DBWithTTL* db_ttl_;
   std::unique_ptr<SpecialTimeEnv> env_;
 
- private:
+ protected:
   Options options_;
+
+ private:
   KVMap kvmap_;
   KVMap::iterator kv_it_;
   const std::string kNewValue_ = "new_value";
   std::unique_ptr<CompactionFilter> test_comp_filter_;
 };  // class TtlTest
+
+#if USE_COROUTINES
+TEST_F(TtlTest, GetCoroutine) {
+  options_.env = Env::Default();
+  OpenTtl();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
+
+  PinnableSlice value;
+  CoroDB* coro_db = db_ttl_->GetCoroDB();
+  ASSERT_NE(nullptr, coro_db);
+  std::string timestamp;
+  ASSERT_TRUE(
+      folly::coro::blockingWait(CoroDB::CoGet(db_ttl_, ReadOptions(),
+                                              db_ttl_->DefaultColumnFamily(),
+                                              "key", &value, &timestamp))
+          .IsNotSupported());
+
+  Status status = folly::coro::blockingWait(CoroDB::CoGet(
+      db_ttl_, ReadOptions(), db_ttl_->DefaultColumnFamily(), "key", &value,
+      /*timestamp=*/nullptr));
+
+  ASSERT_OK(status);
+  ASSERT_EQ("value", value.ToString());
+}
+
+TEST_F(TtlTest, MultiGetCoroutine) {
+  options_.env = Env::Default();
+  OpenTtl();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "value"));
+
+  ColumnFamilyHandle* column_families[] = {db_ttl_->DefaultColumnFamily()};
+  const Slice keys[] = {Slice("key")};
+  PinnableSlice values[1];
+  Status statuses[1];
+  CoroDB* coro_db = db_ttl_->GetCoroDB();
+  ASSERT_NE(nullptr, coro_db);
+  std::string timestamps[1];
+  folly::coro::blockingWait(
+      CoroDB::CoMultiGet(db_ttl_, ReadOptions(), 1, column_families, keys,
+                         values, timestamps, statuses, /*sorted_input=*/false));
+  ASSERT_TRUE(statuses[0].IsNotSupported());
+
+  folly::coro::blockingWait(CoroDB::CoMultiGet(
+      db_ttl_, ReadOptions(), 1, column_families, keys, values,
+      /*timestamps=*/nullptr, statuses, /*sorted_input=*/false));
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ("value", values[0].ToString());
+}
+#endif  // USE_COROUTINES
+
+TEST_F(TtlTest, SnapshotNewerVersionMetadata) {
+  OpenTtl();
+  assert(db_ttl_);
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "old"));
+  const Snapshot* snapshot = db_ttl_->GetSnapshot();
+  ASSERT_OK(db_ttl_->Put(WriteOptions(), "key", "new"));
+
+  ReadOptions read_options;
+  read_options.snapshot = snapshot;
+  OutputMetadata output_metadata;
+  output_metadata.WantNewerVersionPresent();
+  std::string value;
+  ASSERT_OK(
+      db_ttl_->GetWithMetadata(read_options, "key", &value, &output_metadata));
+  ASSERT_EQ("old", value);
+  ASSERT_TRUE(*output_metadata.newer_version_present);
+
+  MultiGetOutputMetadata multiget_output_metadata;
+  multiget_output_metadata.WantNewerVersionPresent();
+  std::vector<Slice> keys{"key"};
+  std::vector<std::string> values;
+  const std::vector<Status> statuses = db_ttl_->MultiGetWithMetadata(
+      read_options, keys, &values, &multiget_output_metadata);
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ("old", values[0]);
+  ASSERT_TRUE((*multiget_output_metadata.newer_version_present)[0]);
+
+  db_ttl_->ReleaseSnapshot(snapshot);
+}
 
 // If TTL is non positive or not provided, the behaviour is TTL = infinity
 // This test opens the db 3 times with such default behavior and inserts a
@@ -611,6 +697,16 @@ TEST_F(TtlTest, CompactionFilter) {
   CloseTtl();
 }
 
+TEST_F(TtlTest, UnregisteredMergeOperator) {
+  class UnregisteredMergeOperator : public MergeOperator {
+   public:
+    const char* Name() const override { return "UnregisteredMergeOperator"; }
+  };
+  options_.merge_operator = std::make_shared<UnregisteredMergeOperator>();
+  OpenTtl();
+  CloseTtl();
+}
+
 // Insert some key-values which KeyMayExist should be able to get and check that
 // values returned are fine
 TEST_F(TtlTest, KeyMayExist) {
@@ -635,25 +731,75 @@ TEST_F(TtlTest, MultiGetTest) {
   CloseTtl();
 }
 
+TEST_F(TtlTest, NewIteratorsStripTimestamps) {
+  OpenTtl();
+  ColumnFamilyHandle* second_cf;
+  ASSERT_OK(
+      db_ttl_->CreateColumnFamilyWithTtl(options_, "second", &second_cf, 0));
+
+  const std::vector<ColumnFamilyHandle*> column_families = {
+      db_ttl_->DefaultColumnFamily(), second_cf};
+  const std::vector<std::string> values = {"default-value", "second-value"};
+  for (size_t i = 0; i < column_families.size(); ++i) {
+    ASSERT_OK(
+        db_ttl_->Put(WriteOptions(), column_families[i], "key", values[i]));
+  }
+
+  const auto verify_iterators = [&](Status status,
+                                    std::vector<Iterator*>* iterators) {
+    ASSERT_OK(status);
+    ASSERT_EQ(iterators->size(), column_families.size());
+    for (size_t i = 0; i < iterators->size(); ++i) {
+      std::unique_ptr<Iterator> iterator((*iterators)[i]);
+      iterator->SeekToFirst();
+      ASSERT_TRUE(iterator->Valid());
+      ASSERT_EQ(iterator->value().ToString(), values[i]);
+      ASSERT_OK(iterator->status());
+    }
+  };
+
+  std::vector<Iterator*> iterators;
+  verify_iterators(
+      db_ttl_->NewIterators(ReadOptions(), column_families, &iterators),
+      &iterators);
+  verify_iterators(
+      db_ttl_->NewIterators(std::vector<ReadOptions>(column_families.size()),
+                            column_families, &iterators),
+      &iterators);
+
+  delete second_cf;
+}
+
+TEST_F(TtlTest, TtlFiftenYears) {
+  MakeKVMap(kSampleSize_);
+  // 15 year will lead int32_t overflow from now
+  const int kFifteenYearSeconds = 86400 * 365 * 15;
+  OpenTtl(kFifteenYearSeconds);
+  PutValues(0, kSampleSize_, true);
+  // trigger the compaction
+  SleepCompactCheck(1, 0, kSampleSize_);
+  CloseTtl();
+}
+
 TEST_F(TtlTest, ColumnFamiliesTest) {
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = true;
   options.env = env_.get();
 
-  DB::Open(options, dbname_, &db);
+  ASSERT_OK(DB::Open(options, dbname_, &db));
   ColumnFamilyHandle* handle;
   ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
                                    "ttl_column_family", &handle));
 
   delete handle;
-  delete db;
+  db.reset();
 
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(ColumnFamilyDescriptor(
-      kDefaultColumnFamilyName, ColumnFamilyOptions(options)));
-  column_families.push_back(ColumnFamilyDescriptor(
-      "ttl_column_family", ColumnFamilyOptions(options)));
+  column_families.emplace_back(kDefaultColumnFamilyName,
+                               ColumnFamilyOptions(options));
+  column_families.emplace_back("ttl_column_family",
+                               ColumnFamilyOptions(options));
 
   std::vector<ColumnFamilyHandle*> handles;
 
@@ -698,6 +844,9 @@ TEST_F(TtlTest, ChangeTtlOnOpenDb) {
 
   OpenTtl(1);  // T=0:Open the db with ttl = 2
   SetTtl(3);
+  int32_t ttl = 0;
+  ASSERT_OK(db_ttl_->GetTtl(db_ttl_->DefaultColumnFamily(), &ttl));
+  ASSERT_EQ(ttl, 3);
   PutValues(0, kSampleSize_);  // T=0:Insert Set1. Delete at t=2
   SleepCompactCheck(2, 0, kSampleSize_, true);  // T=2:Set1 should be there
   CloseTtl();
@@ -890,6 +1039,14 @@ TEST_F(TtlOptionsTest, LoadTtlMergeOperator) {
   std::shared_ptr<MergeOperator> copy;
   ASSERT_OK(MergeOperator::CreateFromString(config_options_, opts_str, &copy));
   ASSERT_TRUE(mo->AreEquivalent(config_options_, copy.get(), &mismatch));
+
+  // An unregistered user_operator will be null, which is not supported by the
+  // `TtlMergeOperator` implementation.
+  ASSERT_OK(MergeOperator::CreateFromString(
+      config_options_, "id=TtlMergeOperator; user_operator=unknown", &mo));
+  ASSERT_NE(mo.get(), nullptr);
+  ASSERT_STREQ(mo->Name(), TtlMergeOperator::kClassName());
+  ASSERT_NOK(mo->ValidateOptions(DBOptions(), ColumnFamilyOptions()));
 }
 }  // namespace ROCKSDB_NAMESPACE
 
@@ -899,4 +1056,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

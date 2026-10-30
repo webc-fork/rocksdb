@@ -4,13 +4,12 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-#include "rocksdb/comparator.h"
-
 #include <queue>
 #include <string>
 #include <vector>
 
 #include "memory/arena.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
@@ -43,6 +42,7 @@ using MinIterHeap =
     std::priority_queue<InternalIterator*, std::vector<InternalIterator*>,
                         MinIterComparator>;
 
+// TODO: name to TailingIterator
 /**
  * ForwardIterator is a special type of iterator that only supports Seek()
  * and Next(). It is expected to perform better than TailingIterator by
@@ -55,7 +55,7 @@ class ForwardIterator : public InternalIterator {
   ForwardIterator(DBImpl* db, const ReadOptions& read_options,
                   ColumnFamilyData* cfd, SuperVersion* current_sv = nullptr,
                   bool allow_unprepared_value = false);
-  virtual ~ForwardIterator();
+  ~ForwardIterator() override;
 
   void SeekForPrev(const Slice& /*target*/) override {
     status_ = Status::NotSupported("ForwardIterator::SeekForPrev()");
@@ -70,19 +70,19 @@ class ForwardIterator : public InternalIterator {
     valid_ = false;
   }
 
-  virtual bool Valid() const override;
+  bool Valid() const override;
   void SeekToFirst() override;
-  virtual void Seek(const Slice& target) override;
-  virtual void Next() override;
-  virtual Slice key() const override;
-  virtual Slice value() const override;
-  virtual Status status() const override;
-  virtual bool PrepareValue() override;
-  virtual Status GetProperty(std::string prop_name, std::string* prop) override;
-  virtual void SetPinnedItersMgr(
-      PinnedIteratorsManager* pinned_iters_mgr) override;
-  virtual bool IsKeyPinned() const override;
-  virtual bool IsValuePinned() const override;
+  void Seek(const Slice& target) override;
+  void Next() override;
+  Slice key() const override;
+  Slice value() const override;
+  uint64_t write_unix_time() const override;
+  Status status() const override;
+  bool PrepareValue() override;
+  Status GetProperty(std::string prop_name, std::string* prop) override;
+  void SetPinnedItersMgr(PinnedIteratorsManager* pinned_iters_mgr) override;
+  bool IsKeyPinned() const override;
+  bool IsValuePinned() const override;
 
   bool TEST_CheckDeletedIters(int* deleted_iters, int* num_iters);
 
@@ -122,7 +122,7 @@ class ForwardIterator : public InternalIterator {
   void DeleteIterator(InternalIterator* iter, bool is_arena = false);
 
   DBImpl* const db_;
-  const ReadOptions read_options_;
+  ReadOptions read_options_;
   ColumnFamilyData* const cfd_;
   const SliceTransform* const prefix_extractor_;
   const Comparator* user_comparator_;

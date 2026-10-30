@@ -79,7 +79,7 @@ struct CacheRecordHeader {
 };
 
 struct CacheRecord {
-  CacheRecord() {}
+  CacheRecord() = default;
   CacheRecord(const Slice& key, const Slice& val)
       : hdr_(MAGIC, static_cast<uint32_t>(key.size()),
              static_cast<uint32_t>(val.size())),
@@ -235,8 +235,8 @@ bool RandomAccessCacheFile::Read(const LBA& lba, Slice* key, Slice* val,
   }
 
   Slice result;
-  Status s = freader_->Read(IOOptions(), lba.off_, lba.size_, &result, scratch,
-                            nullptr, Env::IO_TOTAL /* rate_limiter_priority */);
+  Status s = freader_->Read(lba.off_, lba.size_, IOOptions(), &result, scratch,
+                            nullptr);
   if (!s.ok()) {
     Error(log_, "Error reading from file %s. %s", Path().c_str(),
           s.ToString().c_str());
@@ -254,7 +254,7 @@ bool RandomAccessCacheFile::ParseRec(const LBA& lba, Slice* key, Slice* val,
 
   CacheRecord rec;
   if (!rec.Deserialize(data)) {
-    assert(!"Error deserializing data");
+    assert(false && "Error deserializing data");
     Error(log_, "Error de-serializing record from file %s off %d",
           Path().c_str(), lba.off_);
     return false;
@@ -339,7 +339,7 @@ bool WriteableCacheFile::Append(const Slice& key, const Slice& val, LBA* lba) {
   CacheRecord rec(key, val);
   if (!rec.Serialize(&bufs_, &buf_woff_)) {
     // unexpected error: unable to serialize the data
-    assert(!"Error serializing record");
+    assert(false && "Error serializing record");
     return false;
   }
 
@@ -605,4 +605,3 @@ void ThreadedWriter::DispatchIO(const IO& io) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

@@ -10,7 +10,7 @@
 #include <memory>
 #include <string>
 
-#include "rocksdb/cache.h"
+#include "rocksdb/advanced_cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
@@ -34,21 +34,17 @@ class SimCache;
 // BlockBasedTableOptions.block_size = 4096 by default but is configurable,
 // Therefore, generally the actual memory overhead of SimCache is Less than
 // sim_capacity * 2%
-extern std::shared_ptr<SimCache> NewSimCache(std::shared_ptr<Cache> cache,
-                                             size_t sim_capacity,
-                                             int num_shard_bits);
+std::shared_ptr<SimCache> NewSimCache(std::shared_ptr<Cache> cache,
+                                      size_t sim_capacity, int num_shard_bits);
 
-extern std::shared_ptr<SimCache> NewSimCache(std::shared_ptr<Cache> sim_cache,
-                                             std::shared_ptr<Cache> cache,
-                                             int num_shard_bits);
+std::shared_ptr<SimCache> NewSimCache(std::shared_ptr<Cache> sim_cache,
+                                      std::shared_ptr<Cache> cache,
+                                      int num_shard_bits);
 
-class SimCache : public Cache {
+// An abstract base class (public interface) to the SimCache implementation
+class SimCache : public CacheWrapper {
  public:
-  SimCache() {}
-
-  ~SimCache() override {}
-
-  const char* Name() const override { return "SimCache"; }
+  using CacheWrapper::CacheWrapper;
 
   // returns the maximum configured capacity of the simcache for simulation
   virtual size_t GetSimCapacity() const = 0;
@@ -88,9 +84,13 @@ class SimCache : public Cache {
   // Status of cache logging happening in background
   virtual Status GetActivityLoggingStatus() = 0;
 
- private:
-  SimCache(const SimCache&);
-  SimCache& operator=(const SimCache&);
+  ~SimCache() override = default;
+
+  // No copying allowed
+  SimCache(const SimCache&) = delete;
+  SimCache& operator=(const SimCache&) = delete;
+  SimCache(SimCache&&) = delete;
+  SimCache& operator=(SimCache&&) = delete;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

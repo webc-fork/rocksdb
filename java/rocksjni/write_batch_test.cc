@@ -22,7 +22,6 @@
 #include "rocksdb/status.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "rocksjni/portal.h"
-#include "table/scoped_arena_iterator.h"
 #include "test_util/testharness.h"
 #include "util/string_util.h"
 
@@ -50,7 +49,8 @@ jbyteArray Java_org_rocksdb_WriteBatchTest_getContents(JNIEnv* env,
   ROCKSDB_NAMESPACE::MemTable* mem = new ROCKSDB_NAMESPACE::MemTable(
       cmp, ROCKSDB_NAMESPACE::ImmutableOptions(options),
       ROCKSDB_NAMESPACE::MutableCFOptions(options), &wb,
-      ROCKSDB_NAMESPACE::kMaxSequenceNumber, 0 /* column_family_id */);
+      ROCKSDB_NAMESPACE::kMaxSequenceNumber, 0 /* column_family_id */,
+      nullptr /* flush_initiator */);
   mem->Ref();
   std::string state;
   ROCKSDB_NAMESPACE::ColumnFamilyMemTablesDefault cf_mems_default(mem);
@@ -59,8 +59,10 @@ jbyteArray Java_org_rocksdb_WriteBatchTest_getContents(JNIEnv* env,
                                                         nullptr, nullptr);
   unsigned int count = 0;
   ROCKSDB_NAMESPACE::Arena arena;
-  ROCKSDB_NAMESPACE::ScopedArenaIterator iter(
-      mem->NewIterator(ROCKSDB_NAMESPACE::ReadOptions(), &arena));
+  ROCKSDB_NAMESPACE::ScopedArenaPtr<ROCKSDB_NAMESPACE::InternalIterator> iter(
+      mem->NewIterator(ROCKSDB_NAMESPACE::ReadOptions(),
+                       /*seqno_to_time_mapping=*/nullptr, &arena,
+                       /*prefix_extractor=*/nullptr, /*for_flush=*/false));
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     ROCKSDB_NAMESPACE::ParsedInternalKey ikey;
     ikey.clear();

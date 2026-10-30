@@ -9,14 +9,14 @@
 
 #include "rocksdb/slice.h"
 
-#include <stdio.h>
-
 #include <algorithm>
+#include <cstdio>
 
 #include "rocksdb/convenience.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "util/cast_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -60,10 +60,6 @@ class FixedPrefixTransform : public SliceTransform {
 
   bool InDomain(const Slice& src) const override {
     return (src.size() >= prefix_len_);
-  }
-
-  bool InRange(const Slice& dst) const override {
-    return (dst.size() == prefix_len_);
   }
 
   bool FullLengthEnabled(size_t* len) const override {
@@ -112,10 +108,6 @@ class CappedPrefixTransform : public SliceTransform {
 
   bool InDomain(const Slice& /*src*/) const override { return true; }
 
-  bool InRange(const Slice& dst) const override {
-    return (dst.size() <= cap_len_);
-  }
-
   bool FullLengthEnabled(size_t* len) const override {
     *len = cap_len_;
     return true;
@@ -128,7 +120,7 @@ class CappedPrefixTransform : public SliceTransform {
 
 class NoopTransform : public SliceTransform {
  public:
-  explicit NoopTransform() {}
+  explicit NoopTransform() = default;
 
   static const char* kClassName() { return "rocksdb.Noop"; }
   const char* Name() const override { return kClassName(); }
@@ -136,8 +128,6 @@ class NoopTransform : public SliceTransform {
   Slice Transform(const Slice& src) const override { return src; }
 
   bool InDomain(const Slice& /*src*/) const override { return true; }
-
-  bool InRange(const Slice& /*dst*/) const override { return true; }
 
   bool SameResultWhenAppended(const Slice& /*prefix*/) const override {
     return false;
@@ -173,7 +163,7 @@ static int RegisterBuiltinSliceTransform(ObjectLibrary& library,
           .AddNumber(":"),
       [](const std::string& uri, std::unique_ptr<const SliceTransform>* guard,
          std::string* /*errmsg*/) {
-        auto colon = uri.find(":");
+        auto colon = uri.find(':');
         auto len = ParseSizeT(uri.substr(colon + 1));
         guard->reset(NewFixedPrefixTransform(len));
         return guard->get();
@@ -193,7 +183,7 @@ static int RegisterBuiltinSliceTransform(ObjectLibrary& library,
           .AddNumber(":"),
       [](const std::string& uri, std::unique_ptr<const SliceTransform>* guard,
          std::string* /*errmsg*/) {
-        auto colon = uri.find(":");
+        auto colon = uri.find(':');
         auto len = ParseSizeT(uri.substr(colon + 1));
         guard->reset(NewCappedPrefixTransform(len));
         return guard->get();
@@ -333,14 +323,14 @@ bool Slice::DecodeHex(std::string* result) const {
   return true;
 }
 
-PinnableSlice::PinnableSlice(PinnableSlice&& other) {
+PinnableSlice::PinnableSlice(PinnableSlice&& other) : PinnableSlice() {
   *this = std::move(other);
 }
 
 PinnableSlice& PinnableSlice::operator=(PinnableSlice&& other) {
   if (this != &other) {
     Cleanable::Reset();
-    Cleanable::operator=(std::move(other));
+    Cleanable::operator=(std::move(up_cast<Cleanable>(other)));
     size_ = other.size_;
     pinned_ = other.pinned_;
     if (pinned_) {

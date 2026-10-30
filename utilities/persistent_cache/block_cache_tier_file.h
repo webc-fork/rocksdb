@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-
 #include <list>
 #include <memory>
 #include <string>
@@ -70,7 +69,7 @@ using LBA = LogicalBlockAddress;
 class Writer {
  public:
   explicit Writer(PersistentCacheTier* const cache) : cache_(cache) {}
-  virtual ~Writer() {}
+  virtual ~Writer() = default;
 
   // write buffer to file at the given offset
   virtual void Write(WritableFile* const file, CacheWriteBuffer* buf,
@@ -97,19 +96,19 @@ class BlockCacheFile : public LRUElement<BlockCacheFile> {
         dir_(dir),
         cache_id_(cache_id) {}
 
-  virtual ~BlockCacheFile() {}
+  ~BlockCacheFile() override = default;
 
   // append key/value to file and return LBA locator to user
   virtual bool Append(const Slice& /*key*/, const Slice& /*val*/,
                       LBA* const /*lba*/) {
-    assert(!"not implemented");
+    assert(false && "not implemented");
     return false;
   }
 
   // read from the record locator (LBA) and return key, value and status
   virtual bool Read(const LBA& /*lba*/, Slice* /*key*/, Slice* /*block*/,
                     char* /*scratch*/) {
-    assert(!"not implemented");
+    assert(false && "not implemented");
     return false;
   }
 
@@ -149,7 +148,7 @@ class RandomAccessCacheFile : public BlockCacheFile {
                                  const std::shared_ptr<Logger>& log)
       : BlockCacheFile(env, dir, cache_id), log_(log) {}
 
-  virtual ~RandomAccessCacheFile() {}
+  ~RandomAccessCacheFile() override = default;
 
   // open file for reading
   bool Open(const bool enable_direct_reads);
@@ -182,7 +181,7 @@ class WriteableCacheFile : public RandomAccessCacheFile {
         writer_(writer),
         max_size_(max_size) {}
 
-  virtual ~WriteableCacheFile();
+  ~WriteableCacheFile() override;
 
   // create file on disk
   bool Create(const bool enable_direct_writes, const bool enable_direct_reads);
@@ -260,6 +259,9 @@ class ThreadedWriter : public Writer {
 
     IO(const IO&) = default;
     IO& operator=(const IO&) = default;
+    IO(IO&&) = default;
+    IO& operator=(IO&&) = default;
+    ~IO() = default;
     size_t Size() const { return sizeof(IO); }
 
     WritableFile* file_ = nullptr;     // File to write to
@@ -271,7 +273,13 @@ class ThreadedWriter : public Writer {
 
   explicit ThreadedWriter(PersistentCacheTier* const cache, const size_t qdepth,
                           const size_t io_size);
-  virtual ~ThreadedWriter() { assert(threads_.empty()); }
+  ~ThreadedWriter() override { assert(threads_.empty()); }
+
+  // No copying allowed
+  ThreadedWriter(const ThreadedWriter&) = delete;
+  ThreadedWriter& operator=(const ThreadedWriter&) = delete;
+  ThreadedWriter(ThreadedWriter&&) = delete;
+  ThreadedWriter& operator=(ThreadedWriter&&) = delete;
 
   void Stop() override;
   void Write(WritableFile* const file, CacheWriteBuffer* buf,
@@ -288,4 +296,3 @@ class ThreadedWriter : public Writer {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

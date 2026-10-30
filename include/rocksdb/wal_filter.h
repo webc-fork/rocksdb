@@ -42,7 +42,7 @@ class WalFilter : public Customizable {
     kWalProcessingOptionMax = 4
   };
 
-  virtual ~WalFilter() {}
+  ~WalFilter() override = default;
 
   // Provide ColumnFamily->LogNumber map to filter
   // so that filter can determine whether a log number applies to a given
@@ -105,7 +105,7 @@ class WalFilter : public Customizable {
 
   // Returns a name that identifies this WAL filter.
   // The name will be printed to LOG file on start up for diagnosis.
-  virtual const char* Name() const override = 0;
+  const char* Name() const override = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

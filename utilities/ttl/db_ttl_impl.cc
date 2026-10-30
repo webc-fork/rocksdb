@@ -5,6 +5,11 @@
 
 #include "utilities/ttl/db_ttl_impl.h"
 
+#include <array>
+#include <memory>
+#include <utility>
+
+#include "db/db_impl/db_impl_metadata.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
 #include "logging/logging.h"
@@ -15,13 +20,49 @@
 #include "rocksdb/utilities/db_ttl.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/multiget_context.h"
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+Status CheckAndStripTimestamp(PinnableSlice* value) {
+  Status status = DBWithTTLImpl::SanityCheckTimestamp(*value);
+  if (status.ok()) {
+    status = DBWithTTLImpl::StripTS(value);
+  }
+  return status;
+}
+
+void ProcessMultiGetResults(size_t num_keys, PinnableSlice* values,
+                            Status* statuses) {
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (!statuses[i].ok()) {
+      continue;
+    }
+    PinnableSlice tmp_val = std::move(values[i]);
+    values[i].PinSelf(tmp_val);
+    assert(!values[i].IsPinned());
+    statuses[i] = CheckAndStripTimestamp(&values[i]);
+  }
+}
+
+Status WrapTtlIterators(Status status, std::vector<Iterator*>* iterators) {
+  if (status.ok()) {
+    for (Iterator*& iterator : *iterators) {
+      iterator = new TtlIterator(iterator);
+    }
+  }
+  return status;
+}
+
+}  // namespace
+
 static std::unordered_map<std::string, OptionTypeInfo> ttl_merge_op_type_info =
-    {{"user_operator",
-      OptionTypeInfo::AsCustomSharedPtr<MergeOperator>(
-          0, OptionVerificationType::kByName, OptionTypeFlags::kNone)}};
+    {{"user_operator", OptionTypeInfo::AsCustomSharedPtr<MergeOperator>(
+                           0, OptionVerificationType::kByNameAllowNull,
+                           OptionTypeFlags::kNone)}};
 
 TtlMergeOperator::TtlMergeOperator(
     const std::shared_ptr<MergeOperator>& merge_op, SystemClock* clock)
@@ -109,8 +150,7 @@ bool TtlMergeOperator::PartialMergeMulti(const Slice& key,
       return false;
     }
 
-    operands_without_ts.push_back(
-        Slice(operand.data(), operand.size() - ts_len));
+    operands_without_ts.emplace_back(operand.data(), operand.size() - ts_len);
   }
 
   // Apply the user partial-merge operator (store result in *new_value)
@@ -306,11 +346,12 @@ int RegisterTtlObjects(ObjectLibrary& library, const std::string& /*arg*/) {
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
 // Open the db inside DBWithTTLImpl because options needs pointer to its ttl
-DBWithTTLImpl::DBWithTTLImpl(DB* db) : DBWithTTL(db), closed_(false) {}
+DBWithTTLImpl::DBWithTTLImpl(std::unique_ptr<DB>&& db)
+    : DBWithTTLImplBase(std::move(db)), closed_(false) {}
 
 DBWithTTLImpl::~DBWithTTLImpl() {
   if (!closed_) {
-    Close().PermitUncheckedError();
+    DBWithTTLImpl::Close().PermitUncheckedError();
   }
 }
 
@@ -339,8 +380,7 @@ Status DBWithTTL::Open(const Options& options, const std::string& dbname,
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  column_families.emplace_back(kDefaultColumnFamilyName, cf_options);
   std::vector<ColumnFamilyHandle*> handles;
   Status s = DBWithTTL::Open(db_options, dbname, column_families, &handles,
                              dbptr, {ttl}, read_only);
@@ -374,7 +414,7 @@ Status DBWithTTL::Open(
     DBWithTTLImpl::SanitizeOptions(
         ttls[i], &column_families_sanitized[i].options, clock);
   }
-  DB* db;
+  std::unique_ptr<DB> db;
 
   Status st;
   if (read_only) {
@@ -384,7 +424,7 @@ Status DBWithTTL::Open(
     st = DB::Open(db_options, dbname, column_families_sanitized, handles, &db);
   }
   if (st.ok()) {
-    *dbptr = new DBWithTTLImpl(db);
+    *dbptr = new DBWithTTLImpl(std::move(db));
   } else {
     *dbptr = nullptr;
   }
@@ -451,7 +491,11 @@ bool DBWithTTLImpl::IsStale(const Slice& value, int32_t ttl,
   if (!clock->GetCurrentTime(&curtime).ok()) {
     return false;  // Treat the data as fresh if could not get current time
   }
-  int32_t timestamp_value =
+  /* int32_t may overflow when timestamp_value + ttl
+   * for example ttl = 86400 * 365 * 15
+   * convert timestamp_value to int64_t
+   */
+  int64_t timestamp_value =
       DecodeFixed32(value.data() + value.size() - kTSLength);
   return (timestamp_value + ttl) < curtime;
 }
@@ -487,36 +531,89 @@ Status DBWithTTLImpl::Put(const WriteOptions& options,
   return st;
 }
 
-Status DBWithTTLImpl::Get(const ReadOptions& options,
-                          ColumnFamilyHandle* column_family, const Slice& key,
-                          PinnableSlice* value) {
-  Status st = db_->Get(options, column_family, key, value);
+Status DBWithTTLImpl::GetWithMetadata(const ReadOptions& options,
+                                      ColumnFamilyHandle* column_family,
+                                      const Slice& key, PinnableSlice* value,
+                                      OutputMetadata* output_metadata) {
+  std::string* timestamp = GetOutputTimestamp(output_metadata);
+  bool* newer_version_present = GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    *newer_version_present = false;
+  }
+  if (value == nullptr) {
+    return Status::InvalidArgument(
+        "Cannot call GetWithMetadata with a null value");
+  }
+  if (timestamp) {
+    return Status::NotSupported(
+        "Get() that returns timestamp is not supported");
+  }
+  Status st = newer_version_present != nullptr && options.snapshot != nullptr
+                  ? DBWithTTLImplBase::GetWithMetadata(
+                        options, column_family, key, value, output_metadata)
+                  : DBWithTTLImplBase::Get(options, column_family, key, value,
+                                           /*timestamp=*/nullptr);
   if (!st.ok()) {
     return st;
   }
-  st = SanityCheckTimestamp(*value);
-  if (!st.ok()) {
-    return st;
-  }
-  return StripTS(value);
+  return CheckAndStripTimestamp(value);
 }
 
-std::vector<Status> DBWithTTLImpl::MultiGet(
-    const ReadOptions& options,
-    const std::vector<ColumnFamilyHandle*>& column_family,
-    const std::vector<Slice>& keys, std::vector<std::string>* values) {
-  auto statuses = db_->MultiGet(options, column_family, keys, values);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (!statuses[i].ok()) {
-      continue;
-    }
-    statuses[i] = SanityCheckTimestamp((*values)[i]);
-    if (!statuses[i].ok()) {
-      continue;
-    }
-    statuses[i] = StripTS(&(*values)[i]);
+void DBWithTTLImpl::MultiGetWithMetadata(
+    const ReadOptions& options, const size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
+  std::vector<std::string>* timestamps = GetOutputTimestamps(output_metadata);
+  if (timestamps != nullptr) {
+    timestamps->resize(num_keys);
   }
-  return statuses;
+  std::vector<uint8_t>* newer_version_present =
+      GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    newer_version_present->assign(num_keys, false);
+  }
+  MultiGetInternal(options, num_keys, column_families, keys, values,
+                   timestamps != nullptr ? timestamps->data() : nullptr,
+                   statuses, output_metadata, newer_version_present,
+                   sorted_input);
+}
+
+void DBWithTTLImpl::MultiGetInternal(
+    const ReadOptions& options, const size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, std::string* timestamps, Status* statuses,
+    MultiGetOutputMetadata* output_metadata,
+    std::vector<uint8_t>* newer_version_present, const bool sorted_input) {
+  if (timestamps) {
+    for (size_t i = 0; i < num_keys; ++i) {
+      statuses[i] = Status::NotSupported(
+          "MultiGet() returning timestamps not implemented.");
+    }
+    return;
+  }
+
+  if (newer_version_present != nullptr && options.snapshot != nullptr) {
+    DBWithTTLImplBase::MultiGetWithMetadata(options, num_keys, column_families,
+                                            keys, values, statuses,
+                                            output_metadata, sorted_input);
+  } else {
+    std::array<ColumnFamilyHandle*, MultiGetContext::MAX_BATCH_SIZE>
+        stack_column_families{};
+    std::unique_ptr<ColumnFamilyHandle*[]> heap_column_families;
+    ColumnFamilyHandle** mutable_column_families = stack_column_families.data();
+    if (num_keys > stack_column_families.size()) {
+      heap_column_families.reset(new ColumnFamilyHandle*[num_keys]);
+      mutable_column_families = heap_column_families.get();
+    }
+    for (size_t i = 0; i < num_keys; ++i) {
+      mutable_column_families[i] = column_families[i];
+    }
+    DBWithTTLImplBase::MultiGet(
+        options, num_keys, num_keys == 0 ? nullptr : mutable_column_families,
+        keys, values, /*timestamps=*/nullptr, statuses, sorted_input);
+  }
+  ProcessMultiGetResults(num_keys, values, statuses);
 }
 
 bool DBWithTTLImpl::KeyMayExist(const ReadOptions& options,
@@ -590,9 +687,35 @@ Status DBWithTTLImpl::Write(const WriteOptions& opts, WriteBatch* updates) {
   }
 }
 
-Iterator* DBWithTTLImpl::NewIterator(const ReadOptions& opts,
+Iterator* DBWithTTLImpl::NewIterator(const ReadOptions& _read_options,
                                      ColumnFamilyHandle* column_family) {
-  return new TtlIterator(db_->NewIterator(opts, column_family));
+  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+      _read_options.io_activity != Env::IOActivity::kDBIterator) {
+    return NewErrorIterator(Status::InvalidArgument(
+        "Can only call NewIterator with `ReadOptions::io_activity` is "
+        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`"));
+  }
+  ReadOptions read_options(_read_options);
+  if (read_options.io_activity == Env::IOActivity::kUnknown) {
+    read_options.io_activity = Env::IOActivity::kDBIterator;
+  }
+  return new TtlIterator(db_->NewIterator(read_options, column_family));
+}
+
+Status DBWithTTLImpl::NewIterators(
+    const ReadOptions& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  return WrapTtlIterators(
+      db_->NewIterators(read_options, column_families, iterators), iterators);
+}
+
+Status DBWithTTLImpl::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  return WrapTtlIterators(
+      db_->NewIterators(read_options, column_families, iterators), iterators);
 }
 
 void DBWithTTLImpl::SetTtl(ColumnFamilyHandle* h, int32_t ttl) {
@@ -601,8 +724,37 @@ void DBWithTTLImpl::SetTtl(ColumnFamilyHandle* h, int32_t ttl) {
   opts = GetOptions(h);
   filter = std::static_pointer_cast<TtlCompactionFilterFactory>(
       opts.compaction_filter_factory);
-  if (!filter) return;
+  if (!filter) {
+    return;
+  }
   filter->SetTtl(ttl);
 }
 
+Status DBWithTTLImpl::GetTtl(ColumnFamilyHandle* h, int32_t* ttl) {
+  if (h == nullptr || ttl == nullptr) {
+    return Status::InvalidArgument(
+        "column family handle or ttl cannot be null");
+  }
+  std::shared_ptr<TtlCompactionFilterFactory> filter;
+  Options opts;
+  opts = GetOptions(h);
+  filter = std::static_pointer_cast<TtlCompactionFilterFactory>(
+      opts.compaction_filter_factory);
+  if (!filter) {
+    return Status::InvalidArgument(
+        "TTLCompactionFilterFactory is not set for TTLDB");
+  }
+  *ttl = filter->GetTtl();
+  return Status::OK();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
+
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "utilities/ttl/db_ttl_impl_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "utilities/ttl/db_ttl_impl_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on

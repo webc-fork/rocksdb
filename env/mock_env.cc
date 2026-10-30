@@ -21,7 +21,7 @@
 #include "util/cast_util.h"
 #include "util/hash.h"
 #include "util/random.h"
-#include "util/rate_limiter.h"
+#include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -96,6 +96,8 @@ class MemFile {
   // No copying allowed.
   MemFile(const MemFile&) = delete;
   void operator=(const MemFile&) = delete;
+  MemFile(MemFile&&) = delete;
+  void operator=(MemFile&&) = delete;
 
   void Ref() {
     MutexLock lock(&mutex_);
@@ -260,6 +262,11 @@ class MockSequentialFile : public FSSequentialFile {
         pos_(0) {
     file_->Ref();
   }
+  // No copying allowed
+  MockSequentialFile(const MockSequentialFile&) = delete;
+  MockSequentialFile& operator=(const MockSequentialFile&) = delete;
+  MockSequentialFile(MockSequentialFile&&) = delete;
+  MockSequentialFile& operator=(MockSequentialFile&&) = delete;
 
   ~MockSequentialFile() override { file_->Unref(); }
 
@@ -301,6 +308,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
         use_mmap_read_(opts.use_mmap_reads) {
     file_->Ref();
   }
+  // No copying allowed
+  MockRandomAccessFile(const MockRandomAccessFile&) = delete;
+  MockRandomAccessFile& operator=(const MockRandomAccessFile&) = delete;
+  MockRandomAccessFile(MockRandomAccessFile&&) = delete;
+  MockRandomAccessFile& operator=(MockRandomAccessFile&&) = delete;
 
   ~MockRandomAccessFile() override { file_->Unref(); }
 
@@ -322,6 +334,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
     }
   }
 
+  IOStatus GetFileSize(uint64_t* size) override {
+    *size = file_->Size();
+    return IOStatus::OK();
+  }
+
  private:
   MemFile* file_;
   bool use_direct_io_;
@@ -331,6 +348,11 @@ class MockRandomAccessFile : public FSRandomAccessFile {
 class MockRandomRWFile : public FSRandomRWFile {
  public:
   explicit MockRandomRWFile(MemFile* file) : file_(file) { file_->Ref(); }
+  // No copying allowed
+  MockRandomRWFile(const MockRandomRWFile&) = delete;
+  MockRandomRWFile& operator=(const MockRandomRWFile&) = delete;
+  MockRandomRWFile(MockRandomRWFile&&) = delete;
+  MockRandomRWFile& operator=(MockRandomRWFile&&) = delete;
 
   ~MockRandomRWFile() override { file_->Unref(); }
 
@@ -370,6 +392,11 @@ class MockWritableFile : public FSWritableFile {
         rate_limiter_(opts.rate_limiter) {
     file_->Ref();
   }
+  // No copying allowed
+  MockWritableFile(const MockWritableFile&) = delete;
+  MockWritableFile& operator=(const MockWritableFile&) = delete;
+  MockWritableFile(MockWritableFile&&) = delete;
+  MockWritableFile& operator=(MockWritableFile&&) = delete;
 
   ~MockWritableFile() override { file_->Unref(); }
 
@@ -483,7 +510,7 @@ class TestMemLogger : public Logger {
         options_(options),
         dbg_(dbg),
         flush_pending_(false) {}
-  ~TestMemLogger() override {}
+  ~TestMemLogger() override = default;
 
   void Flush() override {
     if (flush_pending_) {
@@ -952,6 +979,13 @@ IOStatus MockFileSystem::LinkFile(const std::string& src,
   return IOStatus::OK();
 }
 
+IOStatus MockFileSystem::SyncFile(const std::string& /*fname*/,
+                                  const FileOptions& /*file_opts*/,
+                                  const IOOptions& /*io_opts*/,
+                                  bool /*use_fsync*/, IODebugContext* /*dbg*/) {
+  return IOStatus::OK();
+}
+
 IOStatus MockFileSystem::NewLogger(const std::string& fname,
                                    const IOOptions& io_opts,
                                    std::shared_ptr<Logger>* result,
@@ -1053,6 +1087,5 @@ Status MockEnv::CorruptBuffer(const std::string& fname) {
 
 // This is to maintain the behavior before swithcing from InMemoryEnv to MockEnv
 Env* NewMemEnv(Env* base_env) { return MockEnv::Create(base_env); }
-
 
 }  // namespace ROCKSDB_NAMESPACE

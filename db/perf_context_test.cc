@@ -6,23 +6,45 @@
 #include "rocksdb/perf_context.h"
 
 #include <algorithm>
+#include <atomic>
+#include <future>
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <vector>
 
+#include "env/composite_env_wrapper.h"
 #include "monitoring/histogram.h"
 #include "monitoring/instrumented_mutex.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
+#include "rocksdb/iostats_context.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/system_clock.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/testharness.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
+
+#if defined(USE_COROUTINES)
+#include "folly/Executor.h"
+#include "folly/coro/BlockingWait.h"
+#include "folly/coro/Collect.h"
+#include "folly/coro/CurrentExecutor.h"
+#include "folly/coro/Task.h"
+#include "folly/executors/IOThreadPoolExecutor.h"
+#include "folly/executors/ManualExecutor.h"
+#include "folly/io/async/EventBase.h"
+#include "folly/io/async/Request.h"
+#include "rocksdb/coro_db.h"
+#include "util/coro_stats_util.h"
+#endif
 
 bool FLAGS_random_key = false;
 bool FLAGS_use_set_based_memetable = false;
@@ -38,8 +60,8 @@ const std::string kDbName =
 
 namespace ROCKSDB_NAMESPACE {
 
-std::shared_ptr<DB> OpenDb(bool read_only = false) {
-  DB* db;
+std::unique_ptr<DB> OpenDb(bool read_only = false) {
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = true;
   options.max_open_files = -1;
@@ -61,10 +83,459 @@ std::shared_ptr<DB> OpenDb(bool read_only = false) {
     s = DB::OpenForReadOnly(options, kDbName, &db);
   }
   EXPECT_OK(s);
-  return std::shared_ptr<DB>(db);
+  return db;
 }
 
-class PerfContextTest : public testing::Test {};
+class NoReadExecutorFileSystem final : public FileSystemWrapper {
+ public:
+  explicit NoReadExecutorFileSystem(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  const char* Name() const override { return "NoReadExecutorFileSystem"; }
+  folly::IOExecutor* GetReadExecutor() override { return nullptr; }
+};
+
+class PerfContextTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    SetPerfLevel(PerfLevel::kEnableCount);
+    SetAsyncReadCPUTimeEnabled(false);
+    get_perf_context()->ClearPerLevelPerfContext();
+    get_perf_context()->Reset();
+    get_iostats_context()->Reset();
+    get_iostats_context()->disable_iostats = false;
+  }
+};
+
+#if defined(USE_COROUTINES)
+TEST_F(PerfContextTest, CoroutineStatsContextScopeCollectsStats) {
+  SetPerfLevel(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex);
+  get_perf_context()->EnablePerLevelPerfContext();
+
+  folly::IOThreadPoolExecutor executor(1);
+  folly::EventBase* event_base = executor.getEventBase();
+  ASSERT_NE(nullptr, event_base);
+
+  auto clock = std::make_shared<MockSystemClock>(SystemClock::Default());
+  clock->SetCurrentTime(1);
+  CoroutineStatsConfig stats_config = CaptureCoroutineStatsConfig();
+  folly::coro::blockingWait(folly::coro::co_withExecutor(
+      folly::Executor::getKeepAliveToken(event_base),
+      [event_base, clock = clock.get(),
+       stats_config =
+           std::move(stats_config)]() mutable -> folly::coro::Task<void> {
+        EXPECT_TRUE(event_base->isInEventBaseThread());
+
+        {
+          CoroutineStatsContextScope scope(std::move(stats_config),
+                                           Env::Default());
+
+          EXPECT_EQ(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex,
+                    GetPerfLevel());
+          EXPECT_EQ(0, get_perf_context()->block_read_count);
+          EXPECT_TRUE(get_perf_context()->per_level_perf_context_enabled);
+
+          get_perf_context()->block_read_count += 3;
+          (*get_perf_context()->level_to_perf_context)[2]
+              .block_cache_hit_count += 5;
+          EXPECT_EQ(0, get_iostats_context()->bytes_read);
+          get_iostats_context()->bytes_read += 7;
+          get_iostats_context()->cpu_read_nanos += 11;
+          get_iostats_context()
+              ->file_io_stats_by_temperature.hot_file_read_count += 1;
+
+          {
+            PERF_TIMER_GUARD_WITH_CLOCK(block_read_time, clock);
+            clock->SleepForMicroseconds(7);
+          }
+
+          co_await folly::coro::co_reschedule_on_current_executor;
+
+          EXPECT_TRUE(event_base->isInEventBaseThread());
+          EXPECT_EQ(3, get_perf_context()->block_read_count);
+          EXPECT_TRUE(get_perf_context()->per_level_perf_context_enabled);
+
+          get_perf_context()->block_read_count += 5;
+          (*get_perf_context()->level_to_perf_context)[2]
+              .block_cache_hit_count += 2;
+          EXPECT_EQ(7, get_iostats_context()->bytes_read);
+          get_iostats_context()->bytes_read += 11;
+          get_iostats_context()->cpu_read_nanos += 13;
+          get_iostats_context()
+              ->file_io_stats_by_temperature.hot_file_read_count += 2;
+        }
+
+        auto verify_stats = [] {
+          const PerfContext* captured_perf_context = get_perf_context();
+          ASSERT_NE(nullptr, captured_perf_context);
+          EXPECT_EQ(8, captured_perf_context->block_read_count);
+          EXPECT_EQ(7000, captured_perf_context->block_read_time);
+          ASSERT_NE(nullptr, captured_perf_context->level_to_perf_context);
+          EXPECT_EQ(7, (*captured_perf_context->level_to_perf_context)[2]
+                           .block_cache_hit_count);
+
+          const IOStatsContext* iostats_context = get_iostats_context();
+          ASSERT_NE(nullptr, iostats_context);
+          EXPECT_EQ(18, iostats_context->bytes_read);
+          EXPECT_EQ(24, iostats_context->cpu_read_nanos);
+          EXPECT_EQ(3, iostats_context->file_io_stats_by_temperature
+                           .hot_file_read_count);
+        };
+        verify_stats();
+      }()));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsContextsRemainIsolatedWhenInterleaved) {
+  CoroutineStatsConfig first_stats_config = CaptureCoroutineStatsConfig();
+
+  SetPerfLevel(PerfLevel::kEnableTimeExceptForMutex);
+  get_perf_context()->EnablePerLevelPerfContext();
+  get_iostats_context()->disable_iostats = true;
+  CoroutineStatsConfig second_stats_config = CaptureCoroutineStatsConfig();
+  CoroutineStatsConfig disabled_stats_config;
+  disabled_stats_config.perf_level = PerfLevel::kDisable;
+  disabled_stats_config.iostats_disabled = true;
+
+  folly::ManualExecutor executor;
+  folly::coro::blockingWait(
+      [first_stats_config = std::move(first_stats_config),
+       second_stats_config = std::move(second_stats_config),
+       disabled_stats_config = std::move(
+           disabled_stats_config)]() mutable -> folly::coro::Task<void> {
+        get_perf_context()->Reset();
+        get_perf_context()->ClearPerLevelPerfContext();
+        get_perf_context()->block_read_count = 100;
+        get_iostats_context()->Reset();
+        get_iostats_context()->bytes_read = 200;
+
+        auto make_task = [](CoroutineStatsConfig stats_config, uint64_t first,
+                            uint64_t second) -> folly::coro::Task<uint64_t> {
+          const PerfLevel expected_perf_level = stats_config.perf_level;
+          const bool expected_per_level_perf_context_enabled =
+              stats_config.per_level_perf_context_enabled;
+          const bool expected_iostats_disabled = stats_config.iostats_disabled;
+          const bool stats_enabled = IsCoroutineStatsEnabled(stats_config);
+          {
+            CoroutineStatsContextScope scope(std::move(stats_config),
+                                             Env::Default());
+
+            EXPECT_EQ(expected_perf_level, GetPerfLevel());
+            EXPECT_EQ(expected_per_level_perf_context_enabled,
+                      get_perf_context()->per_level_perf_context_enabled);
+            EXPECT_EQ(expected_iostats_disabled,
+                      get_iostats_context()->disable_iostats);
+            if (stats_enabled) {
+              EXPECT_EQ(0, get_perf_context()->block_read_count);
+              EXPECT_EQ(0, get_iostats_context()->bytes_read);
+              get_perf_context()->block_read_count += first;
+              get_iostats_context()->bytes_read += first;
+            }
+            co_await folly::coro::co_reschedule_on_current_executor;
+
+            EXPECT_EQ(expected_perf_level, GetPerfLevel());
+            EXPECT_EQ(expected_per_level_perf_context_enabled,
+                      get_perf_context()->per_level_perf_context_enabled);
+            EXPECT_EQ(expected_iostats_disabled,
+                      get_iostats_context()->disable_iostats);
+            if (!stats_enabled) {
+              co_return 0;
+            }
+            EXPECT_EQ(first, get_perf_context()->block_read_count);
+            EXPECT_EQ(first, get_iostats_context()->bytes_read);
+            get_perf_context()->block_read_count += second;
+            get_iostats_context()->bytes_read += second;
+          }
+
+          EXPECT_EQ(first + second, get_iostats_context()->bytes_read);
+          co_return get_perf_context()->block_read_count;
+        };
+
+        auto [disabled_result, first_result, second_result] =
+            co_await folly::coro::collectAll(
+                make_task(std::move(disabled_stats_config), 0, 0),
+                make_task(std::move(first_stats_config), 1, 10),
+                make_task(std::move(second_stats_config), 2, 20));
+        EXPECT_EQ(0, disabled_result);
+        EXPECT_EQ(11, first_result);
+        EXPECT_EQ(22, second_result);
+
+        get_perf_context()->Reset();
+        get_iostats_context()->Reset();
+        co_return;
+      }(),
+      &executor);
+  EXPECT_EQ(PerfLevel::kDisable, GetPerfLevel());
+  EXPECT_TRUE(get_iostats_context()->disable_iostats);
+}
+
+TEST_F(PerfContextTest, CoroutineStatsContextScopeCollectsGetCpuNanos) {
+  SetPerfLevel(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex);
+
+  auto clock = std::make_shared<MockSystemClock>(SystemClock::Default());
+  CompositeEnvWrapper env(Env::Default(), clock);
+  clock->SetCurrentCPUTimeNanos(0);
+  {
+    {
+      CoroutineStatsContextScope scope(CaptureCoroutineStatsConfig(), &env);
+
+      clock->MockSleepForCPUNanos(17);
+      clock->MockSleepForCPUNanos(5);
+      // Time while the request context is unset is not charged to the request.
+      {
+        folly::RequestContextScopeGuard context_scope;
+        clock->MockSleepForCPUNanos(13);
+      }
+      clock->MockSleepForCPUNanos(7);
+    }
+    EXPECT_EQ(29, get_perf_context()->get_cpu_nanos);
+  }
+}
+
+// Runs a stats scope that spends 17 + 7 CPU nanos while active and 13 while its
+// request context is unset, and returns the get_cpu_nanos it recorded.
+static uint64_t GetCpuNanosRecordedByScope(CoroutineStatsConfig stats_config) {
+  auto clock = std::make_shared<MockSystemClock>(SystemClock::Default());
+  CompositeEnvWrapper env(Env::Default(), clock);
+  clock->SetCurrentCPUTimeNanos(0);
+  get_perf_context()->Reset();
+  {
+    CoroutineStatsContextScope scope(std::move(stats_config), &env);
+    clock->MockSleepForCPUNanos(17);
+    {
+      folly::RequestContextScopeGuard context_scope;
+      clock->MockSleepForCPUNanos(13);
+    }
+    clock->MockSleepForCPUNanos(7);
+  }
+  return get_perf_context()->get_cpu_nanos;
+}
+
+TEST_F(PerfContextTest, CoroutineStatsCollectGetCpuNanosWhenOptedIn) {
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(true);
+
+  CoroutineStatsConfig stats_config = CaptureAndDisableCoroutineStatsConfig();
+
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+  EXPECT_EQ(24, GetCpuNanosRecordedByScope(std::move(stats_config)));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsSkipGetCpuNanosWithoutOptIn) {
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(false);
+
+  EXPECT_EQ(0, GetCpuNanosRecordedByScope(CaptureCoroutineStatsConfig()));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsIgnoreCpuOptInWhilePerfDisabled) {
+  // IO stats stay enabled, so the scope still collects a request context.
+  SetPerfLevel(PerfLevel::kDisable);
+  SetAsyncReadCPUTimeEnabled(true);
+
+  EXPECT_EQ(0, GetCpuNanosRecordedByScope(CaptureCoroutineStatsConfig()));
+}
+
+TEST_F(PerfContextTest, CoroutineMultiGetAsyncRecordsCpuTimeOnlyWhenOptedIn) {
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+  auto db = OpenDb();
+  if (db->GetCoroDB() == nullptr ||
+      db->GetFileSystem()->GetReadExecutor() == nullptr) {
+    ROCKSDB_GTEST_BYPASS("Needs coroutine reads and a read executor");
+    return;
+  }
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  class PerfContextCallback final : public DB::AsyncCallback {
+   public:
+    void OnComplete() override { perf_context.set_value(*get_perf_context()); }
+
+    std::promise<PerfContext> perf_context;
+  };
+
+  auto read_perf_context = [&db](bool opt_in) {
+    SetPerfLevel(PerfLevel::kEnableCount);
+    SetAsyncReadCPUTimeEnabled(opt_in);
+    ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
+                                             db->DefaultColumnFamily()};
+    const Slice keys[] = {"key", "key2"};
+    PinnableSlice values[2];
+    Status statuses[2];
+    PerfContextCallback callback;
+    db->MultiGetAsync(ReadOptions(), 2, column_families, keys, values, statuses,
+                      /*sorted_input=*/false, callback);
+    PerfContext request_perf_context = callback.perf_context.get_future().get();
+
+    EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+    EXPECT_OK(statuses[0]);
+    EXPECT_OK(statuses[1]);
+    EXPECT_EQ("value", values[0].ToString());
+    EXPECT_EQ("value2", values[1].ToString());
+    return request_perf_context;
+  };
+
+  // The first read loads a data block from the SST file.
+  const PerfContext opted_in = read_perf_context(/*opt_in=*/true);
+  EXPECT_GT(opted_in.get_cpu_nanos, 0);
+  ASSERT_GT(opted_in.block_read_count, 0);
+  EXPECT_EQ(0, opted_in.block_read_time);
+
+  EXPECT_EQ(0, read_perf_context(/*opt_in=*/false).get_cpu_nanos);
+
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+}
+
+TEST_F(PerfContextTest, CoroutineSyncFallbackRecordsNoCpuTimeWhenOptedIn) {
+  auto file_system =
+      std::make_shared<NoReadExecutorFileSystem>(FileSystem::Default());
+  std::unique_ptr<Env> env = NewCompositeEnv(file_system);
+  Options options;
+  options.create_if_missing = true;
+  options.env = env.get();
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, kDbName, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+
+  SetPerfLevel(PerfLevel::kEnableCount);
+  SetAsyncReadCPUTimeEnabled(true);
+  ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily()};
+  const Slice keys[] = {"key"};
+  PinnableSlice values[1];
+  Status statuses[1];
+  folly::coro::blockingWait(CoroDB::CoMultiGet(
+      db.get(), ReadOptions(), 1, column_families, keys, values,
+      /*timestamps=*/nullptr, statuses, /*sorted_input=*/false));
+
+  ASSERT_OK(statuses[0]);
+  EXPECT_EQ(values[0].size(), get_perf_context()->multiget_read_bytes);
+  EXPECT_EQ(0, get_perf_context()->get_cpu_nanos);
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, options));
+}
+
+TEST_F(PerfContextTest, CoroutineStatsContextRestoredOnForeignThread) {
+  SetPerfLevel(PerfLevel::kEnableTimeAndCPUTimeExceptForMutex);
+
+  folly::IOThreadPoolExecutor executor(1);
+  folly::EventBase* event_base = executor.getEventBase();
+  ASSERT_NE(nullptr, event_base);
+
+  uint64_t foreign_block_read_count = 0;
+  uint64_t foreign_bytes_read = 0;
+  folly::coro::blockingWait(folly::coro::co_withExecutor(
+      folly::Executor::getKeepAliveToken(event_base),
+      [&foreign_block_read_count, &foreign_bytes_read,
+       stats_config =
+           CaptureCoroutineStatsConfig()]() mutable -> folly::coro::Task<void> {
+        CoroutineStatsContextScope scope(std::move(stats_config),
+                                         Env::Default());
+        get_perf_context()->block_read_count += 3;
+        get_iostats_context()->bytes_read += 5;
+
+        std::shared_ptr<folly::RequestContext> captured_context =
+            folly::RequestContext::saveContext();
+
+        std::thread foreign_thread([&] {
+          get_perf_context()->Reset();
+          get_iostats_context()->Reset();
+          get_perf_context()->block_read_count = 41;
+          get_iostats_context()->bytes_read = 43;
+          {
+            folly::RequestContextScopeGuard guard(captured_context);
+          }
+          foreign_block_read_count = get_perf_context()->block_read_count;
+          foreign_bytes_read = get_iostats_context()->bytes_read;
+        });
+        foreign_thread.join();
+
+        EXPECT_EQ(3, get_perf_context()->block_read_count);
+        EXPECT_EQ(5, get_iostats_context()->bytes_read);
+        co_return;
+      }()));
+
+  EXPECT_EQ(41, foreign_block_read_count);
+  EXPECT_EQ(43, foreign_bytes_read);
+}
+
+#endif
+
+TEST_F(PerfContextTest, AsyncCallbackStatsStartEmptyOnSyncFallback) {
+  class StatsCallback final : public DB::AsyncCallback {
+   public:
+    void OnComplete() override {
+      const PerfContext* callback_perf_context = get_perf_context();
+      const IOStatsContext* callback_iostats_context = get_iostats_context();
+      ASSERT_NE(nullptr, callback_perf_context);
+      ASSERT_NE(nullptr, callback_iostats_context);
+      called = true;
+      get_read_bytes = callback_perf_context->get_read_bytes;
+      multiget_read_bytes = callback_perf_context->multiget_read_bytes;
+      get_cpu_nanos = callback_perf_context->get_cpu_nanos;
+    }
+
+    bool called = false;
+    uint64_t get_read_bytes = 0;
+    uint64_t multiget_read_bytes = 0;
+    uint64_t get_cpu_nanos = 0;
+  };
+
+  auto file_system =
+      std::make_shared<NoReadExecutorFileSystem>(FileSystem::Default());
+  std::unique_ptr<Env> env = NewCompositeEnv(file_system);
+  Options options;
+  options.create_if_missing = true;
+  options.env = env.get();
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, kDbName, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "key", "value"));
+  ASSERT_OK(db->Put(WriteOptions(), "key2", "value2"));
+
+  get_perf_context()->get_read_bytes = 13;
+
+  StatsCallback callback;
+  Status status;
+  std::string value;
+  db->GetAsync(ReadOptions(), "key", &value, status, callback);
+
+  EXPECT_TRUE(callback.called);
+  ASSERT_OK(status);
+  EXPECT_EQ("value", value);
+  EXPECT_EQ(value.size(), callback.get_read_bytes);
+
+  get_perf_context()->Reset();
+  get_perf_context()->multiget_read_bytes = 29;
+  SetPerfLevel(PerfLevel::kEnableCount);
+  get_iostats_context()->disable_iostats = false;
+  SetAsyncReadCPUTimeEnabled(true);
+
+  StatsCallback multiget_callback;
+  ColumnFamilyHandle* column_families[] = {db->DefaultColumnFamily(),
+                                           db->DefaultColumnFamily()};
+  const std::string key_strings[] = {"key", "key2"};
+  const Slice keys[] = {key_strings[0], key_strings[1]};
+  PinnableSlice values[2];
+  Status statuses[2];
+  db->MultiGetAsync(ReadOptions(), 2, column_families, keys, values, statuses,
+                    /*sorted_input=*/false, multiget_callback);
+
+  EXPECT_TRUE(multiget_callback.called);
+  EXPECT_OK(statuses[0]);
+  EXPECT_OK(statuses[1]);
+  EXPECT_EQ("value", values[0].ToString());
+  EXPECT_EQ("value2", values[1].ToString());
+  EXPECT_EQ(values[0].size() + values[1].size(),
+            multiget_callback.multiget_read_bytes);
+  EXPECT_EQ(0, multiget_callback.get_cpu_nanos);
+  EXPECT_FALSE(GetAsyncReadCPUTimeEnabled());
+
+  db.reset();
+  ASSERT_OK(DestroyDB(kDbName, options));
+}
 
 TEST_F(PerfContextTest, SeekIntoDeletion) {
   ASSERT_OK(DestroyDB(kDbName, Options()));
@@ -149,6 +620,7 @@ TEST_F(PerfContextTest, SeekIntoDeletion) {
     ASSERT_TRUE(iter->Valid());
     StopWatchNano timer2(SystemClock::Default().get(), true);
     iter->Next();
+    ASSERT_OK(iter->status());
     auto elapsed_nanos2 = timer2.ElapsedNanos();
     if (FLAGS_verbose) {
       std::cout << "next cmp: " << get_perf_context()->user_key_comparison_count
@@ -187,7 +659,8 @@ TEST_F(PerfContextTest, StopWatchOverhead) {
   uint64_t elapsed = 0;
   std::vector<uint64_t> timings(kTotalIterations);
 
-  StopWatch timer(SystemClock::Default().get(), nullptr, 0, &elapsed);
+  StopWatch timer(SystemClock::Default().get(), nullptr, 0,
+                  Histograms::HISTOGRAM_ENUM_MAX, &elapsed);
   for (auto& timing : timings) {
     timing = elapsed;
   }
@@ -261,7 +734,7 @@ void ProfileQueries(bool enabled_time = false) {
   for (const int i : keys) {
     if (i == kFlushFlag) {
       FlushOptions fo;
-      db->Flush(fo);
+      ASSERT_OK(db->Flush(fo));
       continue;
     }
 
@@ -622,6 +1095,31 @@ TEST_F(PerfContextTest, DBMutexLockCounter) {
   }
 }
 
+TEST_F(PerfContextTest, CountersArePerThread) {
+  constexpr int kNumThreads = 4;
+  std::atomic<int> num_added{0};
+  std::vector<uint64_t> seen(kNumThreads, 0);
+  std::vector<port::Thread> threads;
+  threads.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; ++i) {
+    threads.emplace_back([&, i] {
+      SetPerfLevel(PerfLevel::kEnableCount);
+      PERF_COUNTER_ADD(user_key_comparison_count, i + 1);
+      num_added.fetch_add(1);
+      while (num_added.load() < kNumThreads) {
+        std::this_thread::yield();
+      }
+      seen[i] = get_perf_context()->user_key_comparison_count;
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  const std::vector<uint64_t> expected{1, 2, 3, 4};
+  ASSERT_EQ(expected, seen);
+}
+
 TEST_F(PerfContextTest, FalseDBMutexWait) {
   SetPerfLevel(kEnableTime);
   int stats_code[] = {0, static_cast<int>(DB_MUTEX_WAIT_MICROS)};
@@ -657,12 +1155,11 @@ TEST_F(PerfContextTest, ToString) {
 
 TEST_F(PerfContextTest, MergeOperatorTime) {
   ASSERT_OK(DestroyDB(kDbName, Options()));
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = true;
   options.merge_operator = MergeOperators::CreateStringAppendOperator();
-  Status s = DB::Open(options, kDbName, &db);
-  EXPECT_OK(s);
+  EXPECT_OK(DB::Open(options, kDbName, &db));
 
   std::string val;
   ASSERT_OK(db->Merge(WriteOptions(), "k1", "val1"));
@@ -673,36 +1170,21 @@ TEST_F(PerfContextTest, MergeOperatorTime) {
   SetPerfLevel(kEnableTime);
   get_perf_context()->Reset();
   ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-#ifdef OS_SOLARIS
-  for (int i = 0; i < 100; i++) {
-    ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-  }
-#endif
   EXPECT_GT(get_perf_context()->merge_operator_time_nanos, 0);
 
   ASSERT_OK(db->Flush(FlushOptions()));
 
   get_perf_context()->Reset();
   ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-#ifdef OS_SOLARIS
-  for (int i = 0; i < 100; i++) {
-    ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-  }
-#endif
   EXPECT_GT(get_perf_context()->merge_operator_time_nanos, 0);
 
   ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, nullptr));
 
   get_perf_context()->Reset();
   ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-#ifdef OS_SOLARIS
-  for (int i = 0; i < 100; i++) {
-    ASSERT_OK(db->Get(ReadOptions(), "k1", &val));
-  }
-#endif
   EXPECT_GT(get_perf_context()->merge_operator_time_nanos, 0);
 
-  delete db;
+  db.reset();
 }
 
 TEST_F(PerfContextTest, CopyAndMove) {
@@ -941,15 +1423,17 @@ TEST_F(PerfContextTest, CPUTimer) {
 
     // monotonically increasing
     get_perf_context()->Reset();
-    auto count = get_perf_context()->iter_seek_cpu_nanos;
+    uint64_t count = get_perf_context()->iter_seek_cpu_nanos;
+    uint64_t before_count = count;
     for (int i = 0; i < FLAGS_total_keys; ++i) {
       iter->Seek("k" + std::to_string(i));
       ASSERT_TRUE(iter->Valid());
       ASSERT_EQ("v" + std::to_string(i), iter->value().ToString());
       auto next_count = get_perf_context()->iter_seek_cpu_nanos;
-      ASSERT_GT(next_count, count);
+      ASSERT_GE(next_count, count);
       count = next_count;
     }
+    ASSERT_GT(count, before_count);
 
     // iterator creation/destruction; multiple iterators
     {
@@ -964,6 +1448,175 @@ TEST_F(PerfContextTest, CPUTimer) {
     ASSERT_EQ(count, get_perf_context()->iter_seek_cpu_nanos);
   }
 }
+
+TEST_F(PerfContextTest, MergeOperandCount) {
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+
+  Options options;
+  options.create_if_missing = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+
+  std::unique_ptr<DB> db;
+  ASSERT_OK(DB::Open(options, kDbName, &db));
+
+  constexpr size_t num_keys = 3;
+  const std::string key_prefix("key");
+  const std::string value_prefix("value");
+
+  std::vector<std::string> keys;
+  keys.reserve(num_keys);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    keys.emplace_back(key_prefix + std::to_string(i));
+  }
+
+  // Write three keys with one Put each followed by 1, 2, and 3
+  // Merge operations respectively.
+  constexpr size_t total_merges = num_keys * (num_keys + 1) / 2;
+
+  std::vector<ManagedSnapshot> snapshots;
+  snapshots.reserve(total_merges);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    const std::string suffix = std::to_string(i);
+    const std::string value = value_prefix + suffix;
+
+    ASSERT_OK(db->Put(WriteOptions(), keys[i], value));
+
+    for (size_t j = 0; j <= i; ++j) {
+      // Take a snapshot before each Merge so they are preserved and not
+      // collapsed during flush.
+      snapshots.emplace_back(db.get());
+
+      ASSERT_OK(db->Merge(WriteOptions(), keys[i], value + std::to_string(j)));
+    }
+  }
+
+  auto verify = [&]() {
+    get_perf_context()->Reset();
+
+    for (size_t i = 0; i < num_keys; ++i) {
+      // Get
+      {
+        PinnableSlice result;
+        ASSERT_OK(db->Get(ReadOptions(), db->DefaultColumnFamily(), keys[i],
+                          &result));
+        ASSERT_EQ(get_perf_context()->internal_merge_point_lookup_count, i + 1);
+
+        get_perf_context()->Reset();
+      }
+
+      // GetEntity
+      {
+        PinnableWideColumns result;
+        ASSERT_OK(db->GetEntity(ReadOptions(), db->DefaultColumnFamily(),
+                                keys[i], &result));
+        ASSERT_EQ(get_perf_context()->internal_merge_point_lookup_count, i + 1);
+
+        get_perf_context()->Reset();
+      }
+    }
+
+    {
+      std::vector<Slice> key_slices;
+      key_slices.reserve(num_keys);
+
+      for (size_t i = 0; i < num_keys; ++i) {
+        key_slices.emplace_back(keys[i]);
+      }
+
+      // MultiGet
+      {
+        std::vector<PinnableSlice> results(num_keys);
+        std::vector<Status> statuses(num_keys);
+
+        db->MultiGet(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                     key_slices.data(), results.data(), statuses.data());
+
+        for (size_t i = 0; i < num_keys; ++i) {
+          ASSERT_OK(statuses[i]);
+        }
+
+        ASSERT_EQ(get_perf_context()->internal_merge_point_lookup_count,
+                  total_merges);
+
+        get_perf_context()->Reset();
+      }
+
+      // MultiGetEntity
+      {
+        std::vector<PinnableWideColumns> results(num_keys);
+        std::vector<Status> statuses(num_keys);
+
+        db->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                           key_slices.data(), results.data(), statuses.data());
+
+        for (size_t i = 0; i < num_keys; ++i) {
+          ASSERT_OK(statuses[i]);
+        }
+
+        ASSERT_EQ(get_perf_context()->internal_merge_point_lookup_count,
+                  total_merges);
+
+        get_perf_context()->Reset();
+      }
+    }
+
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+
+    // Forward iteration
+    {
+      size_t i = 0;
+
+      for (it->SeekToFirst(); it->Valid(); it->Next(), ++i) {
+        ASSERT_EQ(it->key(), keys[i]);
+        ASSERT_EQ(get_perf_context()->internal_merge_count, i + 1);
+
+        get_perf_context()->Reset();
+      }
+      ASSERT_OK(it->status());
+    }
+
+    // Backward iteration
+    {
+      size_t i = num_keys - 1;
+
+      for (it->SeekToLast(); it->Valid(); it->Prev(), --i) {
+        ASSERT_EQ(it->key(), keys[i]);
+        ASSERT_EQ(get_perf_context()->internal_merge_count, i + 1);
+
+        get_perf_context()->Reset();
+      }
+      ASSERT_OK(it->status());
+    }
+  };
+
+  // Verify counters when reading from memtable
+  verify();
+
+  // Verify counters when reading from table files
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  verify();
+}
+
+TEST_F(PerfContextTest, WriteMemtableTimePerfLevel) {
+  // Write and check time
+  ASSERT_OK(DestroyDB(kDbName, Options()));
+  auto db = OpenDb();
+
+  SetPerfLevel(PerfLevel::kEnableWait);
+  PerfContext* perf_ctx = get_perf_context();
+  perf_ctx->Reset();
+  ASSERT_OK(db->Put(WriteOptions(), "foo1", "bar"));
+  ASSERT_GT(perf_context.write_memtable_time, 0);
+
+  SetPerfLevel(PerfLevel::kEnableCount);
+  perf_ctx->Reset();
+  ASSERT_OK(db->Put(WriteOptions(), "foo0", "bar"));
+  ASSERT_EQ(perf_context.write_memtable_time, 0);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

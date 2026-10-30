@@ -55,7 +55,8 @@ TEST_P(MemoryAllocatorTest, CreateAllocator) {
   ConfigOptions config_options;
   config_options.ignore_unknown_options = false;
   config_options.ignore_unsupported_options = false;
-  std::shared_ptr<MemoryAllocator> orig, copy;
+  std::shared_ptr<MemoryAllocator> orig;
+  std::shared_ptr<MemoryAllocator> copy;
   Status s = MemoryAllocator::CreateFromString(config_options, id_, &orig);
   if (!IsSupported()) {
     ASSERT_TRUE(s.IsNotSupported());
@@ -83,7 +84,7 @@ TEST_P(MemoryAllocatorTest, DatabaseBlockCache) {
   auto cache = NewLRUCache(1024 * 1024, 6, false, 0.0, allocator_);
   table_options.block_cache = cache;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   Status s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_NE(db, nullptr);
@@ -115,7 +116,7 @@ TEST_P(MemoryAllocatorTest, DatabaseBlockCache) {
   // Close database
   s = db->Close();
   ASSERT_OK(s);
-  delete db;
+  db.reset();
   ASSERT_OK(DestroyDB(dbname, options));
 }
 
@@ -225,7 +226,6 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::Values(std::make_tuple(JemallocNodumpAllocator::kClassName(),
                                       JemallocNodumpAllocator::IsSupported())));
 #endif  // ROCKSDB_JEMALLOC
-
 
 }  // namespace ROCKSDB_NAMESPACE
 

@@ -12,7 +12,9 @@
 namespace ROCKSDB_NAMESPACE {
 
 RangeLockList *RangeTreeLockTracker::getOrCreateList() {
-  if (range_list_) return range_list_.get();
+  if (range_list_) {
+    return range_list_.get();
+  }
 
   // Doesn't exist, create
   range_list_.reset(new RangeLockList());
@@ -29,8 +31,10 @@ void RangeTreeLockTracker::Track(const PointLockRequest &lock_req) {
 }
 
 void RangeTreeLockTracker::Track(const RangeLockRequest &lock_req) {
-  DBT start_dbt, end_dbt;
-  std::string start_key, end_key;
+  DBT start_dbt;
+  DBT end_dbt;
+  std::string start_key;
+  std::string end_key;
 
   serialize_endpoint(lock_req.start_endp, &start_key);
   serialize_endpoint(lock_req.end_endp, &end_key);
@@ -103,7 +107,7 @@ void RangeLockList::ReleaseLocks(RangeTreeLockManager *mgr,
     releasing_locks_.store(true);
   }
 
-  for (auto it : buffers_) {
+  for (const auto &it : buffers_) {
     // Don't try to call release_locks() if the buffer is empty! if we are
     //  not holding any locks, the lock tree might be in the STO-mode with
     //  another transaction, and our attempt to release an empty set of locks

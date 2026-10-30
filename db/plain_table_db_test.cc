@@ -7,7 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-
 #include <algorithm>
 #include <set>
 
@@ -99,7 +98,7 @@ class PlainTableDBTest : public testing::Test,
  private:
   std::string dbname_;
   Env* env_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
 
   bool mmap_mode_;
   Options last_options_;
@@ -108,7 +107,7 @@ class PlainTableDBTest : public testing::Test,
   PlainTableDBTest() : env_(Env::Default()) {}
 
   ~PlainTableDBTest() override {
-    delete db_;
+    db_.reset();
     EXPECT_OK(DestroyDB(dbname_, Options()));
   }
 
@@ -116,13 +115,14 @@ class PlainTableDBTest : public testing::Test,
     mmap_mode_ = GetParam();
     dbname_ = test::PerThreadDBPath("plain_table_db_test");
     EXPECT_OK(DestroyDB(dbname_, Options()));
-    db_ = nullptr;
+    db_.reset();
     Reopen();
   }
 
   // Return the current option configuration.
   Options CurrentOptions() {
     Options options;
+    options.level_compaction_dynamic_level_bytes = false;
 
     PlainTableOptions plain_table_options;
     plain_table_options.user_key_len = 0;
@@ -144,14 +144,11 @@ class PlainTableDBTest : public testing::Test,
     return options;
   }
 
-  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
   void Reopen(Options* options = nullptr) { ASSERT_OK(TryReopen(options)); }
 
-  void Close() {
-    delete db_;
-    db_ = nullptr;
-  }
+  void Close() { db_.reset(); }
 
   bool mmap_mode() const { return mmap_mode_; }
 
@@ -162,24 +159,21 @@ class PlainTableDBTest : public testing::Test,
   }
 
   void Destroy(Options* options) {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     ASSERT_OK(DestroyDB(dbname_, *options));
   }
 
-  Status PureReopen(Options* options, DB** db) {
+  Status PureReopen(Options* options, std::unique_ptr<DB>* db) {
     return DB::Open(*options, dbname_, db);
   }
 
   Status ReopenForReadOnly(Options* options) {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     return DB::OpenForReadOnly(*options, dbname_, &db_);
   }
 
   Status TryReopen(Options* options = nullptr) {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     Options opts;
     if (options != nullptr) {
       opts = *options;
@@ -251,8 +245,6 @@ TEST_P(PlainTableDBTest, Empty) {
   ASSERT_EQ("NOT_FOUND", Get("0000000000000foo"));
 }
 
-extern const uint64_t kPlainTableMagicNumber;
-
 class TestPlainTableReader : public PlainTableReader {
  public:
   TestPlainTableReader(
@@ -291,7 +283,7 @@ class TestPlainTableReader : public PlainTableReader {
     table_properties_ = std::move(props);
   }
 
-  ~TestPlainTableReader() override {}
+  ~TestPlainTableReader() override = default;
 
  private:
   bool MatchBloom(uint32_t hash) const override {
@@ -306,7 +298,6 @@ class TestPlainTableReader : public PlainTableReader {
   bool* expect_bloom_not_match_;
 };
 
-extern const uint64_t kPlainTableMagicNumber;
 class TestPlainTableFactory : public PlainTableFactory {
  public:
   explicit TestPlainTableFactory(bool* expect_bloom_not_match,
@@ -329,21 +320,23 @@ class TestPlainTableFactory : public PlainTableFactory {
       std::unique_ptr<TableReader>* table,
       bool /*prefetch_index_and_filter_in_cache*/) const override {
     std::unique_ptr<TableProperties> props;
+    const ReadOptions read_options;
     auto s = ReadTableProperties(file.get(), file_size, kPlainTableMagicNumber,
-                                 table_reader_options.ioptions, &props);
+                                 table_reader_options.ioptions, read_options,
+                                 &props);
     EXPECT_TRUE(s.ok());
 
     if (store_index_in_file_) {
       BlockHandle bloom_block_handle;
       s = FindMetaBlockInFile(file.get(), file_size, kPlainTableMagicNumber,
-                              table_reader_options.ioptions,
+                              table_reader_options.ioptions, read_options,
                               BloomBlockBuilder::kBloomBlock,
                               &bloom_block_handle);
       EXPECT_TRUE(s.ok());
 
       BlockHandle index_block_handle;
       s = FindMetaBlockInFile(file.get(), file_size, kPlainTableMagicNumber,
-                              table_reader_options.ioptions,
+                              table_reader_options.ioptions, read_options,
                               PlainTableIndexBuilder::kPlainTableIndexBlock,
                               &index_block_handle);
       EXPECT_TRUE(s.ok());
@@ -496,8 +489,7 @@ TEST_P(PlainTableDBTest, Flush) {
             ASSERT_GT(int_num, 0U);
 
             TablePropertiesCollection ptc;
-            ASSERT_OK(reinterpret_cast<DB*>(dbfull())->GetPropertiesOfAllTables(
-                &ptc));
+            ASSERT_OK(dbfull()->GetPropertiesOfAllTables(&ptc));
             ASSERT_EQ(1U, ptc.size());
             auto row = ptc.begin();
             auto tp = row->second;
@@ -894,6 +886,7 @@ TEST_P(PlainTableDBTest, IteratorLargeKeys) {
   }
 
   ASSERT_TRUE(!iter->Valid());
+  ASSERT_OK(iter->status());
 
   delete iter;
 }
@@ -942,6 +935,7 @@ TEST_P(PlainTableDBTest, IteratorLargeKeysWithPrefix) {
   }
 
   ASSERT_TRUE(!iter->Valid());
+  ASSERT_OK(iter->status());
 
   delete iter;
 }
@@ -1337,6 +1331,47 @@ TEST_P(PlainTableDBTest, AdaptiveTable) {
 
 INSTANTIATE_TEST_CASE_P(PlainTableDBTest, PlainTableDBTest, ::testing::Bool());
 
+TEST_P(PlainTableDBTest, DeleteRangeNotSupported) {
+  for (bool use_write_batch : {false, true}) {
+    DestroyAndReopen();
+
+    ASSERT_OK(Put("a0001111", "1"));
+    ASSERT_OK(Put("b0001111", "2"));
+    ASSERT_OK(Put("c0001111", "3"));
+    if (use_write_batch) {
+      WriteBatch wb;
+      ASSERT_OK(wb.Put("d0001111", "4"));
+      ASSERT_OK(wb.DeleteRange("a", "b"));
+      ASSERT_OK(wb.Put("e0001111", "5"));
+      ASSERT_EQ(dbfull()->Write({}, &wb).code(), Status::Code::kNotSupported);
+    } else {
+      ASSERT_EQ(dbfull()->DeleteRange({}, "az", "bz").code(),
+                Status::Code::kNotSupported);
+    }
+    ASSERT_EQ(Get("a0001111"), "1");
+    ASSERT_EQ(Get("b0001111"), "2");
+    ASSERT_EQ(Get("c0001111"), "3");
+    ASSERT_EQ(Get("d0001111"), "NOT_FOUND");  // expect WriteBatch atomicity
+    ASSERT_EQ(Get("e0001111"), "NOT_FOUND");
+
+    ASSERT_EQ(Put("e0001111", "5").code(), Status::Code::kNotSupported);
+    ASSERT_EQ(Get("e0001111"), "NOT_FOUND");
+
+    // Even trying to flush
+    ASSERT_EQ(dbfull()->TEST_FlushMemTable().code(),
+              Status::Code::kNotSupported);
+
+    // WAL is recoverable (at least in standard configurations)
+    ASSERT_OK(TryReopen());
+
+    ASSERT_EQ(Get("a0001111"), "1");
+    ASSERT_EQ(Get("b0001111"), "2");
+    ASSERT_EQ(Get("c0001111"), "3");
+    ASSERT_EQ(Get("d0001111"), "NOT_FOUND");
+    ASSERT_EQ(Get("e0001111"), "NOT_FOUND");
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -1344,4 +1379,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

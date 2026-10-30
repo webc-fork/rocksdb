@@ -1,7 +1,7 @@
 ---
 title: RocksDB 4.2 Release!
 layout: post
-author: sdong
+author: siying
 category: blog
 redirect_from:
   - /blog/3017/rocksdb-4-2-release/
@@ -38,4 +38,4 @@ New RocksDB release - 4.2!
   4. Remove DefaultCompactionFilterFactory.
 
 
-[https://github.com/facebook/rocksdb/releases/tag/v4.2](https://github.com/facebook/rocksdb/releases/tag/v4.2)
+[https://github.com/meta/rocksdb/releases/tag/v4.2](https://github.com/meta/rocksdb/releases/tag/v4.2)

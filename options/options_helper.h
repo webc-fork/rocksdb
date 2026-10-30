@@ -25,11 +25,11 @@ struct MutableDBOptions;
 struct MutableCFOptions;
 struct Options;
 
-std::vector<CompressionType> GetSupportedCompressions();
+const std::vector<CompressionType>& GetSupportedCompressions();
 
-std::vector<CompressionType> GetSupportedDictCompressions();
+const std::vector<CompressionType>& GetSupportedDictCompressions();
 
-std::vector<ChecksumType> GetSupportedChecksums();
+const std::vector<ChecksumType>& GetSupportedChecksums();
 
 inline bool IsSupportedChecksumType(ChecksumType type) {
   // Avoid annoying compiler warning-as-error (-Werror=type-limits)
@@ -38,12 +38,23 @@ inline bool IsSupportedChecksumType(ChecksumType type) {
   return type >= min && type <= max;
 }
 
+// Returns true if read_options has an active table filter, i.e. a non-null
+// pointer to a non-empty std::function. A null pointer, or a pointer to an
+// empty std::function, means no filtering.
+inline bool HasTableFilter(const ReadOptions& read_options) {
+  return read_options.table_filter != nullptr && *read_options.table_filter;
+}
+
 // Checks that the combination of DBOptions and ColumnFamilyOptions are valid
 Status ValidateOptions(const DBOptions& db_opts,
                        const ColumnFamilyOptions& cf_opts);
 
 DBOptions BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
                          const MutableDBOptions& mutable_db_options);
+// Overwrites `options`
+void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
+                    const MutableDBOptions& mutable_db_options,
+                    DBOptions& options);
 
 ColumnFamilyOptions BuildColumnFamilyOptions(
     const ColumnFamilyOptions& ioptions,
@@ -65,9 +76,11 @@ std::unique_ptr<Configurable> CFOptionsAsConfigurable(
     const ColumnFamilyOptions& opts,
     const std::unordered_map<std::string, std::string>* opt_map = nullptr);
 
-extern Status StringToMap(
-    const std::string& opts_str,
-    std::unordered_map<std::string, std::string>* opts_map);
+Status StringToMap(const std::string& opts_str,
+                   std::unordered_map<std::string, std::string>* opts_map);
+
+Status GetStringFromCompressionType(std::string* compression_str,
+                                    CompressionType compression_type);
 
 struct OptionsHelper {
   static const std::string kCFOptionsName /*= "ColumnFamilyOptions"*/;

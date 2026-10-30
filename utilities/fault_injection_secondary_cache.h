@@ -27,17 +27,23 @@ class FaultInjectionSecondaryCache : public SecondaryCache {
     }
   }
 
-  virtual ~FaultInjectionSecondaryCache() override {}
+  ~FaultInjectionSecondaryCache() override = default;
 
   const char* Name() const override { return "FaultInjectionSecondaryCache"; }
 
   Status Insert(const Slice& key, Cache::ObjectPtr value,
-                const Cache::CacheItemHelper* helper) override;
+                const Cache::CacheItemHelper* helper,
+                bool force_insert) override;
+
+  Status InsertSaved(const Slice& /*key*/, const Slice& /*saved*/,
+                     CompressionType /*type*/, CacheTier /*source*/) override {
+    return Status::OK();
+  }
 
   std::unique_ptr<SecondaryCacheResultHandle> Lookup(
       const Slice& key, const Cache::CacheItemHelper* helper,
       Cache::CreateContext* create_context, bool wait, bool advise_erase,
-      bool& is_in_sec_cache) override;
+      Statistics* stats, bool& kept_in_sec_cache) override;
 
   bool SupportForceErase() const override { return base_->SupportForceErase(); }
 
@@ -64,7 +70,7 @@ class FaultInjectionSecondaryCache : public SecondaryCache {
                  std::unique_ptr<SecondaryCacheResultHandle>&& base)
         : cache_(cache), base_(std::move(base)), value_(nullptr), size_(0) {}
 
-    ~ResultHandle() override {}
+    ~ResultHandle() override = default;
 
     bool IsReady() override;
 

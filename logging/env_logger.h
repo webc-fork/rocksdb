@@ -39,8 +39,13 @@ class EnvLogger : public Logger {
         file_(std::move(writable_file), fname, options, clock_),
         last_flush_micros_(0),
         flush_pending_(false) {}
+  // No copying allowed
+  EnvLogger(const EnvLogger&) = delete;
+  EnvLogger& operator=(const EnvLogger&) = delete;
+  EnvLogger(EnvLogger&&) = delete;
+  EnvLogger& operator=(EnvLogger&&) = delete;
 
-  ~EnvLogger() {
+  ~EnvLogger() override {
     if (!closed_) {
       closed_ = true;
       CloseHelper().PermitUncheckedError();
@@ -60,6 +65,12 @@ class EnvLogger : public Logger {
       IOSTATS_SET_DISABLE(true);
       logger.mutex_.Lock();
     }
+    // No copying allowed
+    FileOpGuard(const FileOpGuard&) = delete;
+    FileOpGuard& operator=(const FileOpGuard&) = delete;
+    FileOpGuard(FileOpGuard&&) = delete;
+    FileOpGuard& operator=(FileOpGuard&&) = delete;
+
     ~FileOpGuard() {
       logger_.mutex_.Unlock();
       IOSTATS_SET_DISABLE(false);
@@ -75,7 +86,8 @@ class EnvLogger : public Logger {
     mutex_.AssertHeld();
     if (flush_pending_) {
       flush_pending_ = false;
-      file_.Flush().PermitUncheckedError();
+      file_.Flush(IOOptions()).PermitUncheckedError();
+      file_.reset_seen_error();
     }
     last_flush_micros_ = clock_->NowMicros();
   }
@@ -92,7 +104,7 @@ class EnvLogger : public Logger {
 
   Status CloseHelper() {
     FileOpGuard guard(*this);
-    const auto close_status = file_.Close();
+    const auto close_status = file_.Close(IOOptions());
 
     if (close_status.ok()) {
       return close_status;
@@ -161,7 +173,8 @@ class EnvLogger : public Logger {
       {
         FileOpGuard guard(*this);
         // We will ignore any error returned by Append().
-        file_.Append(Slice(base, p - base)).PermitUncheckedError();
+        file_.Append(Slice(base, p - base), IOOptions()).PermitUncheckedError();
+        file_.reset_seen_error();
         flush_pending_ = true;
         const uint64_t now_micros = clock_->NowMicros();
         if (now_micros - last_flush_micros_ >= flush_every_seconds_ * 1000000) {

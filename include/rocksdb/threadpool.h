@@ -21,7 +21,7 @@ namespace ROCKSDB_NAMESPACE {
  * */
 class ThreadPool {
  public:
-  virtual ~ThreadPool() {}
+  virtual ~ThreadPool() = default;
 
   // Wait for all threads to finish.
   // Discard those threads that did not start
@@ -62,6 +62,6 @@ class ThreadPool {
 
 // NewThreadPool() is a function that could be used to create a ThreadPool
 // with `num_threads` background threads.
-extern ThreadPool* NewThreadPool(int num_threads);
+ThreadPool* NewThreadPool(int num_threads);
 
 }  // namespace ROCKSDB_NAMESPACE

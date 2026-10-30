@@ -51,6 +51,8 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.Options\
 	org.rocksdb.OptionsUtil\
 	org.rocksdb.PersistentCache\
+	org.rocksdb.PerfContext\
+	org.rocksdb.PerfLevel\
 	org.rocksdb.PlainTableConfig\
 	org.rocksdb.RateLimiter\
 	org.rocksdb.ReadOptions\
@@ -76,7 +78,7 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.TransactionDB\
 	org.rocksdb.TransactionDBOptions\
 	org.rocksdb.TransactionOptions\
-	org.rocksdb.TransactionLogIterator\
+	org.rocksdb.WalIterator\
 	org.rocksdb.TtlDB\
 	org.rocksdb.VectorMemTableConfig\
 	org.rocksdb.Snapshot\
@@ -87,7 +89,8 @@ NATIVE_JAVA_CLASSES = \
 	org.rocksdb.WriteOptions\
 	org.rocksdb.WriteBatchWithIndex\
 	org.rocksdb.WriteBufferManager\
-	org.rocksdb.WBWIRocksIterator
+	org.rocksdb.WBWIRocksIterator\
+	org.rocksdb.util.StdErrLogger
 
 NATIVE_JAVA_TEST_CLASSES = \
     org.rocksdb.RocksDBExceptionTest\
@@ -110,6 +113,7 @@ JAVA_TESTS = \
 	org.rocksdb.BlobOptionsTest\
 	org.rocksdb.BlockBasedTableConfigTest\
 	org.rocksdb.BuiltinComparatorTest\
+	org.rocksdb.ByteBufferUnsupportedOperationTest\
 	org.rocksdb.BytewiseComparatorRegressionTest\
 	org.rocksdb.util.BytewiseComparatorTest\
 	org.rocksdb.util.BytewiseComparatorIntTest\
@@ -138,14 +142,18 @@ JAVA_TESTS = \
 	org.rocksdb.util.JNIComparatorTest\
 	org.rocksdb.FilterTest\
 	org.rocksdb.FlushTest\
+	org.rocksdb.ImportColumnFamilyTest\
 	org.rocksdb.InfoLogLevelTest\
+	org.rocksdb.KeyExistsTest \
 	org.rocksdb.KeyMayExistTest\
 	org.rocksdb.ConcurrentTaskLimiterTest\
 	org.rocksdb.LoggerTest\
 	org.rocksdb.LRUCacheTest\
 	org.rocksdb.MemoryUtilTest\
 	org.rocksdb.MemTableTest\
+	org.rocksdb.MergeCFVariantsTest\
 	org.rocksdb.MergeTest\
+	org.rocksdb.MergeVariantsTest\
 	org.rocksdb.MultiColumnRegressionTest \
 	org.rocksdb.MultiGetManyKeysTest\
 	org.rocksdb.MultiGetTest\
@@ -160,6 +168,10 @@ JAVA_TESTS = \
 	org.rocksdb.OptimisticTransactionOptionsTest\
 	org.rocksdb.OptionsUtilTest\
 	org.rocksdb.OptionsTest\
+	org.rocksdb.PerfLevelTest \
+	org.rocksdb.PerfContextTest \
+	org.rocksdb.PutCFVariantsTest\
+	org.rocksdb.PutVariantsTest\
 	org.rocksdb.PlainTableConfigTest\
 	org.rocksdb.RateLimiterTest\
 	org.rocksdb.ReadOnlyTest\
@@ -184,7 +196,7 @@ JAVA_TESTS = \
 	org.rocksdb.TransactionDBTest\
 	org.rocksdb.TransactionOptionsTest\
 	org.rocksdb.TransactionDBOptionsTest\
-	org.rocksdb.TransactionLogIteratorTest\
+	org.rocksdb.WalIteratorTest\
 	org.rocksdb.TtlDBTest\
 	org.rocksdb.StatisticsTest\
 	org.rocksdb.StatisticsCollectorTest\
@@ -195,7 +207,8 @@ JAVA_TESTS = \
 	org.rocksdb.WriteBatchTest\
 	org.rocksdb.WriteBatchThreadedTest\
 	org.rocksdb.WriteOptionsTest\
-	org.rocksdb.WriteBatchWithIndexTest
+	org.rocksdb.WriteBatchWithIndexTest\
+	org.rocksdb.util.StdErrLoggerTest
 
 MAIN_SRC = src/main/java
 TEST_SRC = src/test/java
@@ -262,6 +275,8 @@ JAVADOC_CMD := javadoc
 endif
 endif
 
+MAVEN_CMD := mvn
+
 # Look for the Java version (1.6->6, 1.7->7, 1.8->8, 11.0->11, 13.0->13, 15.0->15 etc..)
 JAVAC_VERSION := $(shell $(JAVAC_CMD) -version 2>&1)
 JAVAC_MAJOR_VERSION := $(word 2,$(subst ., ,$(JAVAC_VERSION)))
@@ -304,9 +319,12 @@ ifneq ($(DEBUG_LEVEL),0)
 	JAVAC_ARGS += -Xlint:deprecation -Xlint:unchecked
 endif
 
-# Using a Facebook AWS account for S3 storage. (maven.org has a history
-# of failing in Travis builds.)
-DEPS_URL?=https://rocksdb-deps.s3-us-west-2.amazonaws.com/jars
+# Hosted as assets on the "third-party-deps" GitHub release. (maven.org has a
+# history of failing in CI builds.) To add or update a jar, upload it here
+# (intentionally unlisted): https://github.com/meta/rocksdb/releases/edit/third-party-deps
+DEPS_URL?=https://github.com/meta/rocksdb/releases/download/third-party-deps
+# curl with the common options used to fetch the jars below
+CURL_DOWNLOAD = curl --fail --insecure --location --retry 3 --retry-all-errors
 
 java-version:
 ifneq ($(JAVAC_VERSION_GE_MIN),true)
@@ -317,10 +335,7 @@ endif
 clean: clean-not-downloaded clean-downloaded
 
 clean-not-downloaded:
-	$(AM_V_at)rm -rf $(NATIVE_INCLUDE)
-	$(AM_V_at)rm -rf $(OUTPUT)
-	$(AM_V_at)rm -rf $(BENCHMARK_OUTPUT)
-	$(AM_V_at)rm -rf $(SAMPLES_OUTPUT)
+	$(AM_V_at)rm -rf $(NATIVE_INCLUDE) $(OUTPUT) $(BENCHMARK_OUTPUT) $(SAMPLES_OUTPUT)
 
 clean-downloaded:
 	$(AM_V_at)rm -rf $(JAVA_TEST_LIBDIR)
@@ -375,7 +390,7 @@ $(JAVA_JUNIT_JAR_PATH): $(JAVA_TEST_LIBDIR)
 ifneq (,$(wildcard $(MVN_LOCAL)/junit/junit/$(JAVA_JUNIT_VER)/$(JAVA_JUNIT_JAR)))
 	cp -v $(MVN_LOCAL)/junit/junit/$(JAVA_JUNIT_VER)/$(JAVA_JUNIT_JAR) $(JAVA_TEST_LIBDIR)
 else
-	curl --fail --insecure --output $(JAVA_JUNIT_JAR_PATH) --location $(DEPS_URL)/$(JAVA_JUNIT_JAR)
+	$(CURL_DOWNLOAD) --output $(JAVA_JUNIT_JAR_PATH) $(DEPS_URL)/$(JAVA_JUNIT_JAR)
 	JAVA_JUNIT_SHA256_ACTUAL=`$(SHA256_CMD) $(JAVA_JUNIT_JAR_PATH) | cut -d ' ' -f 1`; \
 	if [ "$(JAVA_JUNIT_SHA256)" != "$$JAVA_JUNIT_SHA256_ACTUAL" ]; then \
 		echo $(JAVA_JUNIT_JAR_PATH) checksum mismatch, expected=\"$(JAVA_JUNIT_SHA256)\" actual=\"$$JAVA_JUNIT_SHA256_ACTUAL\"; \
@@ -387,7 +402,7 @@ $(JAVA_HAMCREST_JAR_PATH): $(JAVA_TEST_LIBDIR)
 ifneq (,$(wildcard $(MVN_LOCAL)/org/hamcrest/hamcrest/$(JAVA_HAMCREST_VER)/$(JAVA_HAMCREST_JAR)))
 	cp -v $(MVN_LOCAL)/org/hamcrest/hamcrest/$(JAVA_HAMCREST_VER)/$(JAVA_HAMCREST_JAR) $(JAVA_TEST_LIBDIR)
 else
-	curl --fail --insecure --output $(JAVA_HAMCREST_JAR_PATH) --location $(DEPS_URL)/$(JAVA_HAMCREST_JAR)
+	$(CURL_DOWNLOAD) --output $(JAVA_HAMCREST_JAR_PATH) $(DEPS_URL)/$(JAVA_HAMCREST_JAR)
 	JAVA_HAMCREST_SHA256_ACTUAL=`$(SHA256_CMD) $(JAVA_HAMCREST_JAR_PATH) | cut -d ' ' -f 1`; \
 	if [ "$(JAVA_HAMCREST_SHA256)" != "$$JAVA_HAMCREST_SHA256_ACTUAL" ]; then \
 		echo $(JAVA_HAMCREST_JAR_PATH) checksum mismatch, expected=\"$(JAVA_HAMCREST_SHA256)\" actual=\"$$JAVA_HAMCREST_SHA256_ACTUAL\"; \
@@ -399,7 +414,7 @@ $(JAVA_MOCKITO_JAR_PATH): $(JAVA_TEST_LIBDIR)
 ifneq (,$(wildcard $(MVN_LOCAL)/org/mockito/mockito-all/$(JAVA_MOCKITO_VER)/$(JAVA_MOCKITO_JAR)))
 	cp -v $(MVN_LOCAL)/org/mockito/mockito-all/$(JAVA_MOCKITO_VER)/$(JAVA_MOCKITO_JAR) $(JAVA_TEST_LIBDIR)
 else
-	curl --fail --insecure --output "$(JAVA_MOCKITO_JAR_PATH)" --location $(DEPS_URL)/$(JAVA_MOCKITO_JAR)
+	$(CURL_DOWNLOAD) --output "$(JAVA_MOCKITO_JAR_PATH)" $(DEPS_URL)/$(JAVA_MOCKITO_JAR)
 	JAVA_MOCKITO_SHA256_ACTUAL=`$(SHA256_CMD) $(JAVA_MOCKITO_JAR_PATH) | cut -d ' ' -f 1`; \
 	if [ "$(JAVA_MOCKITO_SHA256)" != "$$JAVA_MOCKITO_SHA256_ACTUAL" ]; then \
 		echo $(JAVA_MOCKITO_JAR_PATH) checksum mismatch, expected=\"$(JAVA_MOCKITO_SHA256)\" actual=\"$$JAVA_MOCKITO_SHA256_ACTUAL\"; \
@@ -411,7 +426,7 @@ $(JAVA_CGLIB_JAR_PATH): $(JAVA_TEST_LIBDIR)
 ifneq (,$(wildcard $(MVN_LOCAL)/cglib/cglib/$(JAVA_CGLIB_VER)/$(JAVA_CGLIB_JAR)))
 	cp -v $(MVN_LOCAL)/cglib/cglib/$(JAVA_CGLIB_VER)/$(JAVA_CGLIB_JAR) $(JAVA_TEST_LIBDIR)
 else
-	curl --fail --insecure --output "$(JAVA_CGLIB_JAR_PATH)" --location $(DEPS_URL)/$(JAVA_CGLIB_JAR)
+	$(CURL_DOWNLOAD) --output "$(JAVA_CGLIB_JAR_PATH)" $(DEPS_URL)/$(JAVA_CGLIB_JAR)
 	JAVA_CGLIB_SHA256_ACTUAL=`$(SHA256_CMD) $(JAVA_CGLIB_JAR_PATH) | cut -d ' ' -f 1`; \
 	if [ "$(JAVA_CGLIB_SHA256)" != "$$JAVA_CGLIB_SHA256_ACTUAL" ]; then \
 		echo $(JAVA_CGLIB_JAR_PATH) checksum mismatch, expected=\"$(JAVA_CGLIB_SHA256)\" actual=\"$$JAVA_CGLIB_SHA256_ACTUAL\"; \
@@ -423,7 +438,7 @@ $(JAVA_ASSERTJ_JAR_PATH): $(JAVA_TEST_LIBDIR)
 ifneq (,$(wildcard $(MVN_LOCAL)/org/assertj/assertj-core/$(JAVA_ASSERTJ_VER)/$(JAVA_ASSERTJ_JAR)))
 	cp -v $(MVN_LOCAL)/org/assertj/assertj-core/$(JAVA_ASSERTJ_VER)/$(JAVA_ASSERTJ_JAR) $(JAVA_TEST_LIBDIR)
 else
-	curl --fail --insecure --output "$(JAVA_ASSERTJ_JAR_PATH)" --location $(DEPS_URL)/$(JAVA_ASSERTJ_JAR)
+	$(CURL_DOWNLOAD) --output "$(JAVA_ASSERTJ_JAR_PATH)" $(DEPS_URL)/$(JAVA_ASSERTJ_JAR)
 	JAVA_ASSERTJ_SHA256_ACTUAL=`$(SHA256_CMD) $(JAVA_ASSERTJ_JAR_PATH) | cut -d ' ' -f 1`; \
 	if [ "$(JAVA_ASSERTJ_SHA256)" != "$$JAVA_ASSERTJ_SHA256_ACTUAL" ]; then \
 		echo $(JAVA_ASSERTJ_JAR_PATH) checksum mismatch, expected=\"$(JAVA_ASSERTJ_SHA256)\" actual=\"$$JAVA_ASSERTJ_SHA256_ACTUAL\"; \
@@ -443,6 +458,7 @@ test: java java_test
 
 run_test:
 	$(JAVA_CMD) $(JAVA_ARGS) -Djava.library.path=target -cp "$(MAIN_CLASSES):$(TEST_CLASSES):$(JAVA_TESTCLASSPATH):target/*" org.rocksdb.test.RocksJunitRunner $(ALL_JAVA_TESTS)
+	$(JAVA_CMD) $(JAVA_ARGS) -Djava.library.path=target -cp "$(MAIN_CLASSES):$(TEST_CLASSES):$(JAVA_TESTCLASSPATH):target/*" org.rocksdb.test.RocksJunitRunner org.rocksdb.StatisticsTest
 
 run_plugin_test:
 	$(JAVA_CMD) $(JAVA_ARGS) -Djava.library.path=target -cp "$(MAIN_CLASSES):$(TEST_CLASSES):$(JAVA_TESTCLASSPATH):target/*" org.rocksdb.test.RocksJunitRunner $(ROCKSDB_PLUGIN_JAVA_TESTS)
@@ -450,3 +466,6 @@ run_plugin_test:
 db_bench: java
 	$(AM_V_GEN)mkdir -p $(BENCHMARK_MAIN_CLASSES)
 	$(AM_V_at)$(JAVAC_CMD) $(JAVAC_ARGS) -cp $(MAIN_CLASSES) -d $(BENCHMARK_MAIN_CLASSES) $(BENCHMARK_MAIN_SRC)/org/rocksdb/benchmark/*.java
+
+pmd:
+	$(MAVEN_CMD) pmd:pmd pmd:cpd pmd:check

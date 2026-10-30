@@ -18,7 +18,6 @@
 
 #pragma once
 
-
 #include <algorithm>
 #include <iostream>
 #include <vector>
@@ -38,9 +37,18 @@ class EnvMirror : public EnvWrapper {
  public:
   EnvMirror(Env* a, Env* b, bool free_a = false, bool free_b = false)
       : EnvWrapper(a), a_(a), b_(b), free_a_(free_a), free_b_(free_b) {}
-  ~EnvMirror() {
-    if (free_a_) delete a_;
-    if (free_b_) delete b_;
+  // No copying allowed
+  EnvMirror(const EnvMirror&) = delete;
+  EnvMirror& operator=(const EnvMirror&) = delete;
+  EnvMirror(EnvMirror&&) = delete;
+  EnvMirror& operator=(EnvMirror&&) = delete;
+  ~EnvMirror() override {
+    if (free_a_) {
+      delete a_;
+    }
+    if (free_b_) {
+      delete b_;
+    }
   }
 
   Status NewSequentialFile(const std::string& f,
@@ -55,8 +63,8 @@ class EnvMirror : public EnvWrapper {
                            const std::string& old_fname,
                            std::unique_ptr<WritableFile>* r,
                            const EnvOptions& options) override;
-  virtual Status NewDirectory(const std::string& name,
-                              std::unique_ptr<Directory>* result) override {
+  Status NewDirectory(const std::string& name,
+                      std::unique_ptr<Directory>* result) override {
     std::unique_ptr<Directory> br;
     Status as = a_->NewDirectory(name, result);
     Status bs = b_->NewDirectory(name, &br);
@@ -69,26 +77,27 @@ class EnvMirror : public EnvWrapper {
     assert(as == bs);
     return as;
   }
-#if defined(_MSC_VER)
+#if defined(_MSC_VER)  // ODR-SAFE
 #pragma warning(push)
 // logical operation on address of string constant
 #pragma warning(disable : 4130)
 #endif
   Status GetChildren(const std::string& dir,
                      std::vector<std::string>* r) override {
-    std::vector<std::string> ar, br;
+    std::vector<std::string> ar;
+    std::vector<std::string> br;
     Status as = a_->GetChildren(dir, &ar);
     Status bs = b_->GetChildren(dir, &br);
     assert(as == bs);
     std::sort(ar.begin(), ar.end());
     std::sort(br.begin(), br.end());
     if (!as.ok() || ar != br) {
-      assert(0 == "getchildren results don't match");
+      assert(nullptr == "getchildren results don't match");
     }
     *r = ar;
     return as;
   }
-#if defined(_MSC_VER)
+#if defined(_MSC_VER)  // ODR-SAFE
 #pragma warning(pop)
 #endif
   Status DeleteFile(const std::string& f) override {
@@ -116,7 +125,8 @@ class EnvMirror : public EnvWrapper {
     return as;
   }
   Status GetFileSize(const std::string& f, uint64_t* s) override {
-    uint64_t asize, bsize;
+    uint64_t asize;
+    uint64_t bsize;
     Status as = a_->GetFileSize(f, &asize);
     Status bs = b_->GetFileSize(f, &bsize);
     assert(as == bs);
@@ -127,7 +137,8 @@ class EnvMirror : public EnvWrapper {
 
   Status GetFileModificationTime(const std::string& fname,
                                  uint64_t* file_mtime) override {
-    uint64_t amtime, bmtime;
+    uint64_t amtime;
+    uint64_t bmtime;
     Status as = a_->GetFileModificationTime(fname, &amtime);
     Status bs = b_->GetFileModificationTime(fname, &bmtime);
     assert(as == bs);
@@ -157,11 +168,14 @@ class EnvMirror : public EnvWrapper {
   };
 
   Status LockFile(const std::string& f, FileLock** l) override {
-    FileLock *al, *bl;
+    FileLock* al;
+    FileLock* bl;
     Status as = a_->LockFile(f, &al);
     Status bs = b_->LockFile(f, &bl);
     assert(as == bs);
-    if (as.ok()) *l = new FileLockMirror(al, bl);
+    if (as.ok()) {
+      *l = new FileLockMirror(al, bl);
+    }
     return as;
   }
 
@@ -176,4 +190,3 @@ class EnvMirror : public EnvWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

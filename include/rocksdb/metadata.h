@@ -81,7 +81,7 @@ struct SstFileMetaData : public FileStorageInfo {
                   const std::string& _largestkey, uint64_t _num_reads_sampled,
                   bool _being_compacted, Temperature _temperature,
                   uint64_t _oldest_blob_file_number,
-                  uint64_t _oldest_ancester_time, uint64_t _file_creation_time,
+                  uint64_t _oldest_ancestor_time, uint64_t _file_creation_time,
                   uint64_t _epoch_number, std::string& _file_checksum,
                   std::string& _file_checksum_func_name)
       : smallest_seqno(_smallest_seqno),
@@ -93,7 +93,7 @@ struct SstFileMetaData : public FileStorageInfo {
         num_entries(0),
         num_deletions(0),
         oldest_blob_file_number(_oldest_blob_file_number),
-        oldest_ancester_time(_oldest_ancester_time),
+        oldest_ancestor_time(_oldest_ancestor_time),
         file_creation_time(_file_creation_time),
         epoch_number(_epoch_number) {
     if (!_file_name.empty()) {
@@ -138,7 +138,12 @@ struct SstFileMetaData : public FileStorageInfo {
   // 0 if the information is not available.
   //
   // Note: for TTL blob files, it contains the start of the expiration range.
-  uint64_t oldest_ancester_time = 0;
+  union {
+    uint64_t oldest_ancestor_time = 0;
+    // DEPRECATED: misspelled old name for oldest_ancestor_time. Will be
+    // removed in a future release.
+    uint64_t oldest_ancester_time;
+  };
   // Timestamp when the SST file is created, provided by
   // SystemClock::GetCurrentTime(). 0 if the information is not available.
   uint64_t file_creation_time = 0;
@@ -148,6 +153,13 @@ struct SstFileMetaData : public FileStorageInfo {
   // For L0, larger `epoch_number` indicates newer L0 file.
   // 0 if the information is not available.
   uint64_t epoch_number = 0;
+
+  // These bounds define the effective key range for range tombstones
+  // in this file.
+  // Currently only used by CreateColumnFamilyWithImport().
+  std::string smallest{};  // Smallest internal key served by table
+  std::string largest{};   // Largest internal key served by table
+
   // DEPRECATED: The name of the file within its directory with a
   // leading slash (e.g. "/123456.sst"). Use relative_filename from base struct
   // instead.
@@ -217,9 +229,23 @@ struct LevelMetaData {
   const std::vector<SstFileMetaData> files;
 };
 
+// Options for filtering column family metadata by key range.
+struct GetColumnFamilyMetaDataOptions {
+  RangeOpt range;
+
+  // The level to filter on. If -1, all levels are included.
+  int level = -1;
+
+  GetColumnFamilyMetaDataOptions() = default;
+
+  GetColumnFamilyMetaDataOptions(const OptSlice& _start_key,
+                                 const OptSlice& _end_key, int _level = -1)
+      : range(_start_key, _end_key), level(_level) {}
+};
+
 // The metadata that describes a column family.
 struct ColumnFamilyMetaData {
-  ColumnFamilyMetaData() : size(0), file_count(0), name("") {}
+  ColumnFamilyMetaData() : size(0), file_count(0) {}
   ColumnFamilyMetaData(const std::string& _name, uint64_t _size,
                        const std::vector<LevelMetaData>&& _levels)
       : size(_size), name(_name), levels(_levels) {}
@@ -232,6 +258,9 @@ struct ColumnFamilyMetaData {
   // The name of the column family.
   std::string name;
   // The metadata of all levels in this column family.
+  // levels[i] contains files in level i.
+  // For level 0, files with recent updates are ordered first.
+  // For level 1+, files are ordered by increasing key range.
   std::vector<LevelMetaData> levels;
 
   // The total size of all blob files

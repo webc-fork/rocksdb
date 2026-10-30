@@ -15,17 +15,22 @@ namespace ROCKSDB_NAMESPACE {
 // of all the key and value.
 class OutputValidator {
  public:
-  explicit OutputValidator(const InternalKeyComparator& icmp,
-                           bool enable_order_check, bool enable_hash,
+  explicit OutputValidator(const InternalKeyComparator& icmp, bool enable_hash,
                            uint64_t precalculated_hash = 0)
       : icmp_(icmp),
         paranoid_hash_(precalculated_hash),
-        enable_order_check_(enable_order_check),
         enable_hash_(enable_hash) {}
 
   // Add a key to the KV sequence, and return whether the key follows
   // criteria, e.g. key is ordered.
   Status Add(const Slice& key, const Slice& value);
+
+  // Add a key that has already been checked with CanAdd().
+  void AddValidated(const Slice& key, const Slice& value);
+
+  // Validate whether Add() would accept this key without updating the
+  // validator state.
+  Status CanAdd(const Slice& key) const;
 
   // Compare result of two key orders are the same. It can be used
   // to compare the keys inserted into a file, and what is read back.
@@ -42,7 +47,6 @@ class OutputValidator {
   const InternalKeyComparator& icmp_;
   std::string prev_key_;
   uint64_t paranoid_hash_ = 0;
-  bool enable_order_check_;
   bool enable_hash_;
 };
 }  // namespace ROCKSDB_NAMESPACE

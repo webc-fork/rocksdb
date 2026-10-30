@@ -17,7 +17,7 @@ class PessimisticTransactionDB;
 
 class LockManager {
  public:
-  virtual ~LockManager() {}
+  virtual ~LockManager() = default;
 
   // Whether supports locking a specific key.
   virtual bool IsPointLockSupported() const = 0;
@@ -77,4 +77,3 @@ std::shared_ptr<LockManager> NewLockManager(PessimisticTransactionDB* db,
                                             const TransactionDBOptions& opt);
 
 }  // namespace ROCKSDB_NAMESPACE
-

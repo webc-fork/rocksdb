@@ -9,6 +9,7 @@
 
 #include "rocksdb/env.h"
 
+#include <sstream>
 #include <thread>
 
 #include "env/composite_env_wrapper.h"
@@ -20,12 +21,15 @@
 #include "options/db_options.h"
 #include "port/port.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/options.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
+#include "test_util/sync_point.h"
 #include "util/autovector.h"
+#include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
@@ -159,8 +163,7 @@ class LegacyRandomAccessFileWrapper : public FSRandomAccessFile {
       req.len = fs_reqs[i].len;
       req.scratch = fs_reqs[i].scratch;
       req.status = Status::OK();
-
-      reqs.emplace_back(req);
+      reqs.emplace_back(std::move(req));
     }
     status = target_->MultiRead(reqs.data(), num_reqs);
     for (size_t i = 0; i < num_reqs; ++i) {
@@ -186,6 +189,10 @@ class LegacyRandomAccessFileWrapper : public FSRandomAccessFile {
   }
   IOStatus InvalidateCache(size_t offset, size_t length) override {
     return status_to_io_status(target_->InvalidateCache(offset, length));
+  }
+  IOStatus GetFileSize(uint64_t* result) override {
+    auto status = target_->GetFileSize(result);
+    return status_to_io_status(std::move(status));
   }
 
  private:
@@ -356,11 +363,17 @@ class LegacyDirectoryWrapper : public FSDirectory {
   std::unique_ptr<Directory> target_;
 };
 
+// A helper class to make legacy `Env` implementations be backward compatible
+// now that all `Env` implementations are expected to have a `FileSystem` type
+// member `file_system_` and a `SystemClock` type member `clock_`.
+// This class wraps a legacy `Env` object and expose its file system related
+// APIs as a `FileSystem` interface. Also check `LegacySystemClock` that does
+// the same thing for the clock related APIs.
 class LegacyFileSystemWrapper : public FileSystem {
  public:
   // Initialize an EnvWrapper that delegates all calls to *t
   explicit LegacyFileSystemWrapper(Env* t) : target_(t) {}
-  ~LegacyFileSystemWrapper() override {}
+  ~LegacyFileSystemWrapper() override = default;
 
   static const char* kClassName() { return "LegacyFileSystem"; }
   const char* Name() const override { return kClassName(); }
@@ -519,6 +532,13 @@ class LegacyFileSystemWrapper : public FileSystem {
     return status_to_io_status(target_->LinkFile(s, t));
   }
 
+  IOStatus SyncFile(const std::string& fname, const FileOptions& file_options,
+                    const IOOptions& /*io_options*/, bool use_fsync,
+                    IODebugContext* /*dbg*/) override {
+    return status_to_io_status(
+        target_->SyncFile(fname, file_options, use_fsync));
+  }
+
   IOStatus NumFileLinks(const std::string& fname, const IOOptions& /*options*/,
                         uint64_t* count, IODebugContext* /*dbg*/) override {
     return status_to_io_status(target_->NumFileLinks(fname, count));
@@ -606,6 +626,7 @@ class LegacyFileSystemWrapper : public FileSystem {
     // would be part of the Env.  As such, do not serialize it here.
     return "";
   }
+
  private:
   Env* target_;
 };
@@ -625,7 +646,7 @@ Env::Env(const std::shared_ptr<FileSystem>& fs,
          const std::shared_ptr<SystemClock>& clock)
     : thread_status_updater_(nullptr), file_system_(fs), system_clock_(clock) {}
 
-Env::~Env() {}
+Env::~Env() = default;
 
 Status Env::NewLogger(const std::string& fname,
                       std::shared_ptr<Logger>* result) {
@@ -641,7 +662,7 @@ Status Env::CreateFromString(const ConfigOptions& config_options,
   } else {
     RegisterSystemEnvs();
     Env* env = *result;
-    Status s = LoadStaticObject<Env>(config_options, value, nullptr, &env);
+    Status s = LoadStaticObject<Env>(config_options, value, &env);
     if (s.ok()) {
       *result = env;
     }
@@ -726,6 +747,50 @@ std::string Env::PriorityToString(Env::Priority priority) {
   return "Invalid";
 }
 
+std::string Env::IOActivityToString(IOActivity activity) {
+  switch (activity) {
+    case Env::IOActivity::kFlush:
+      return "Flush";
+    case Env::IOActivity::kCompaction:
+      return "Compaction";
+    case Env::IOActivity::kDBOpen:
+      return "DBOpen";
+    case Env::IOActivity::kGet:
+      return "Get";
+    case Env::IOActivity::kMultiGet:
+      return "MultiGet";
+    case Env::IOActivity::kDBIterator:
+      return "DBIterator";
+    case Env::IOActivity::kVerifyDBChecksum:
+      return "VerifyDBChecksum";
+    case Env::IOActivity::kVerifyFileChecksums:
+      return "VerifyFileChecksums";
+    case Env::IOActivity::kGetEntity:
+      return "GetEntity";
+    case Env::IOActivity::kMultiGetEntity:
+      return "MultiGetEntity";
+    case Env::IOActivity::kGetFileChecksumsFromCurrentManifest:
+      return "GetFileChecksumsFromCurrentManifest";
+    case Env::IOActivity::kLazyResolve:
+      return "LazyResolve";
+    case Env::IOActivity::kUnknown:
+      return "Unknown";
+    default:
+      int activityIndex = static_cast<int>(activity);
+      if (activityIndex >=
+              static_cast<int>(Env::IOActivity::kFirstCustomIOActivity) &&
+          activityIndex <=
+              static_cast<int>(Env::IOActivity::kLastCustomIOActivity)) {
+        std::stringstream ss;
+        ss << std::hex << std::uppercase << activityIndex;
+        return "CustomIOActivity" + ss.str();
+      }
+      return "Invalid";
+  };
+  assert(false);
+  return "Invalid";
+}
+
 uint64_t Env::GetThreadID() const {
   std::hash<std::thread::id> hasher;
   return hasher(std::this_thread::get_id());
@@ -740,6 +805,23 @@ Status Env::ReuseWritableFile(const std::string& fname,
     return s;
   }
   return NewWritableFile(fname, result, options);
+}
+
+Status Env::SyncFile(const std::string& fname, const EnvOptions& options,
+                     bool use_fsync) {
+  std::unique_ptr<WritableFile> file_to_sync;
+  Status status = ReopenWritableFile(fname, &file_to_sync, options);
+  TEST_SYNC_POINT_CALLBACK("Env::SyncFile:Open", &status);
+  if (status.ok()) {
+    status = use_fsync ? file_to_sync->Fsync() : file_to_sync->Sync();
+    Status close_status = file_to_sync->Close();
+    if (status.ok()) {
+      status = close_status;
+    } else {
+      close_status.PermitUncheckedError();
+    }
+  }
+  return status;
 }
 
 Status Env::GetChildrenFileAttributes(const std::string& dir,
@@ -788,7 +870,8 @@ std::string Env::GenerateUniqueId() {
     // We already tried GenerateRfcUuid so no need to try it again in
     // GenerateRawUniqueId
     constexpr bool exclude_port_uuid = true;
-    uint64_t upper, lower;
+    uint64_t upper;
+    uint64_t lower;
     GenerateRawUniqueId(&upper, &lower, exclude_port_uuid);
 
     // Set 4-bit version to 4
@@ -798,7 +881,7 @@ std::string Env::GenerateUniqueId() {
 
     // Use 36 character format of RFC 4122
     result.resize(36U);
-    char* buf = &result[0];
+    char* buf = result.data();
     PutBaseChars<16>(&buf, 8, upper >> 32, /*!uppercase*/ false);
     *(buf++) = '-';
     PutBaseChars<16>(&buf, 4, upper >> 16, /*!uppercase*/ false);
@@ -818,15 +901,24 @@ std::string Env::GenerateUniqueId() {
   return result;
 }
 
-SequentialFile::~SequentialFile() {}
+SequentialFile::~SequentialFile() = default;
 
-RandomAccessFile::~RandomAccessFile() {}
+RandomAccessFile::~RandomAccessFile() = default;
 
-WritableFile::~WritableFile() {}
+WritableFile::~WritableFile() = default;
 
-MemoryMappedFileBuffer::~MemoryMappedFileBuffer() {}
+MemoryMappedFileBuffer::~MemoryMappedFileBuffer() = default;
 
-Logger::~Logger() {}
+// This const variable can be used in public headers without introducing the
+// possibility of ODR violations due to varying macro definitions.
+const InfoLogLevel Logger::kDefaultLogLevel =
+#ifdef NDEBUG
+    INFO_LEVEL;
+#else
+    DEBUG_LEVEL;
+#endif  // NDEBUG
+
+Logger::~Logger() = default;
 
 Status Logger::Close() {
   if (!closed_) {
@@ -839,7 +931,7 @@ Status Logger::Close() {
 
 Status Logger::CloseImpl() { return Status::NotSupported(); }
 
-FileLock::~FileLock() {}
+FileLock::~FileLock() = default;
 
 void LogFlush(Logger* info_log) {
   if (info_log) {
@@ -1052,9 +1144,10 @@ void Log(const std::shared_ptr<Logger>& info_log, const char* format, ...) {
 }
 
 Status WriteStringToFile(Env* env, const Slice& data, const std::string& fname,
-                         bool should_sync) {
+                         bool should_sync, const IOOptions* io_options) {
   const auto& fs = env->GetFileSystem();
-  return WriteStringToFile(fs.get(), data, fname, should_sync);
+  return WriteStringToFile(fs.get(), data, fname, should_sync,
+                           io_options ? *io_options : IOOptions());
 }
 
 Status ReadFileToString(Env* env, const std::string& fname, std::string* data) {
@@ -1071,8 +1164,6 @@ void AssignEnvOptions(EnvOptions* env_options, const DBOptions& options) {
   env_options->set_fd_cloexec = options.is_fd_close_on_exec;
   env_options->bytes_per_sync = options.bytes_per_sync;
   env_options->compaction_readahead_size = options.compaction_readahead_size;
-  env_options->random_access_max_buffer_size =
-      options.random_access_max_buffer_size;
   env_options->rate_limiter = options.rate_limiter.get();
   env_options->writable_file_max_buffer_size =
       options.writable_file_max_buffer_size;
@@ -1227,8 +1318,12 @@ Status SystemClock::CreateFromString(const ConfigOptions& config_options,
     std::call_once(once, [&]() {
       RegisterBuiltinSystemClocks(*(ObjectLibrary::Default().get()), "");
     });
-    return LoadSharedObject<SystemClock>(config_options, value, nullptr,
-                                         result);
+    return LoadSharedObject<SystemClock>(config_options, value, result);
   }
+}
+
+bool SystemClock::TimedWait(port::CondVar* cv,
+                            std::chrono::microseconds deadline) {
+  return cv->TimedWait(deadline.count());
 }
 }  // namespace ROCKSDB_NAMESPACE

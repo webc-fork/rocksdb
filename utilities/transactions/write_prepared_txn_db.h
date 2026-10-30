@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "db/attribute_group_iterator_impl.h"
 #include "db/db_iter.h"
 #include "db/pre_release_callback.h"
 #include "db/read_callback.h"
@@ -22,23 +23,34 @@
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "util/cast_util.h"
+#include "util/coro_utils.h"
 #include "util/set_comparator.h"
 #include "util/string_util.h"
 #include "utilities/transactions/pessimistic_transaction.h"
 #include "utilities/transactions/pessimistic_transaction_db.h"
 #include "utilities/transactions/write_prepared_txn.h"
 
+#if USE_COROUTINES
+#include "rocksdb/utilities/coro_stackable_db.h"
+#endif
+
 namespace ROCKSDB_NAMESPACE {
 enum SnapshotBackup : bool { kUnbackedByDBSnapshot, kBackedByDBSnapshot };
+
+#if USE_COROUTINES
+using WritePreparedTxnDBBase = CoroStackableDBBase<PessimisticTransactionDB>;
+#else
+using WritePreparedTxnDBBase = PessimisticTransactionDB;
+#endif
 
 // A PessimisticTransactionDB that writes data to DB after prepare phase of 2PC.
 // In this way some data in the DB might not be committed. The DB provides
 // mechanisms to tell such data apart from committed data.
-class WritePreparedTxnDB : public PessimisticTransactionDB {
+class WritePreparedTxnDB : public WritePreparedTxnDBBase {
  public:
   explicit WritePreparedTxnDB(DB* db,
                               const TransactionDBOptions& txn_db_options)
-      : PessimisticTransactionDB(db, txn_db_options),
+      : WritePreparedTxnDBBase(db, txn_db_options),
         SNAPSHOT_CACHE_BITS(txn_db_options.wp_snapshot_cache_bits),
         SNAPSHOT_CACHE_SIZE(static_cast<size_t>(1ull << SNAPSHOT_CACHE_BITS)),
         COMMIT_CACHE_BITS(txn_db_options.wp_commit_cache_bits),
@@ -49,7 +61,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
   explicit WritePreparedTxnDB(StackableDB* db,
                               const TransactionDBOptions& txn_db_options)
-      : PessimisticTransactionDB(db, txn_db_options),
+      : WritePreparedTxnDBBase(db, txn_db_options),
         SNAPSHOT_CACHE_BITS(txn_db_options.wp_snapshot_cache_bits),
         SNAPSHOT_CACHE_SIZE(static_cast<size_t>(1ull << SNAPSHOT_CACHE_BITS)),
         COMMIT_CACHE_BITS(txn_db_options.wp_commit_cache_bits),
@@ -58,11 +70,10 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     Init(txn_db_options);
   }
 
-  virtual ~WritePreparedTxnDB();
+  ~WritePreparedTxnDB() override;
 
-  virtual Status Initialize(
-      const std::vector<size_t>& compaction_enabled_cf_indices,
-      const std::vector<ColumnFamilyHandle*>& handles) override;
+  Status Initialize(const std::vector<size_t>& compaction_enabled_cf_indices,
+                    const std::vector<ColumnFamilyHandle*>& handles) override;
 
   Transaction* BeginTransaction(const WriteOptions& write_options,
                                 const TransactionOptions& txn_options,
@@ -83,26 +94,91 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
                        size_t batch_cnt, WritePreparedTxn* txn);
 
   using DB::Get;
-  virtual Status Get(const ReadOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     PinnableSlice* value) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, Get, const ReadOptions& _read_options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key, PinnableSlice* value,
+                                  std::string* timestamp);
+  using DB::GetAsync;
+
+  using DB::GetEntity;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, GetEntity, const ReadOptions& options,
+                                  ColumnFamilyHandle* column_family,
+                                  const Slice& key,
+                                  PinnableWideColumns* columns);
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(Status, GetEntity, const ReadOptions& options,
+                                  const Slice& key,
+                                  PinnableAttributeGroups* result);
+
+  using DB::GetWithMetadata;
+  Status GetWithMetadata(const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value,
+                         OutputMetadata* output_metadata) override;
+
+  using DB::GetEntityWithMetadata;
+  Status GetEntityWithMetadata(const ReadOptions& options,
+                               ColumnFamilyHandle* column_family,
+                               const Slice& key, PinnableWideColumns* columns,
+                               OutputMetadata* output_metadata) override;
 
   using DB::MultiGet;
-  virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
-      const std::vector<ColumnFamilyHandle*>& column_family,
-      const std::vector<Slice>& keys,
-      std::vector<std::string>* values) override;
+  DECLARE_SYNC_AND_ASYNC_OVERRIDE(void, MultiGet,
+                                  const ReadOptions& _read_options,
+                                  const size_t num_keys,
+                                  ColumnFamilyHandle** column_families,
+                                  const Slice* keys, PinnableSlice* values,
+                                  std::string* timestamps, Status* statuses,
+                                  const bool sorted_input);
+  using DB::MultiGetAsync;
+
+  using DB::MultiGetWithMetadata;
+  void MultiGetWithMetadata(const ReadOptions& options, const size_t num_keys,
+                            ColumnFamilyHandle* const* column_families,
+                            const Slice* keys, PinnableSlice* values,
+                            Status* statuses,
+                            MultiGetOutputMetadata* output_metadata,
+                            const bool sorted_input) override;
+
+  using DB::MultiGetEntityWithMetadata;
+  void MultiGetEntityWithMetadata(const ReadOptions& options, size_t num_keys,
+                                  ColumnFamilyHandle* const* column_families,
+                                  const Slice* keys,
+                                  PinnableWideColumns* results,
+                                  Status* statuses,
+                                  MultiGetOutputMetadata* output_metadata,
+                                  bool sorted_input) override;
+  void MultiGetEntityWithMetadata(
+      const ReadOptions& options, size_t num_keys, const Slice* keys,
+      PinnableAttributeGroups* results,
+      MultiGetOutputMetadata* output_metadata) override;
 
   using DB::NewIterator;
-  virtual Iterator* NewIterator(const ReadOptions& options,
-                                ColumnFamilyHandle* column_family) override;
+  Iterator* NewIterator(const ReadOptions& _read_options,
+                        ColumnFamilyHandle* column_family) override;
 
   using DB::NewIterators;
-  virtual Status NewIterators(
-      const ReadOptions& options,
-      const std::vector<ColumnFamilyHandle*>& column_families,
-      std::vector<Iterator*>* iterators) override;
+  Status NewIterators(const ReadOptions& _read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
+  Status NewIterators(const std::vector<ReadOptions>& read_options,
+                      const std::vector<ColumnFamilyHandle*>& column_families,
+                      std::vector<Iterator*>* iterators) override;
+
+  using DB::NewCoalescingIterator;
+  std::unique_ptr<Iterator> NewCoalescingIterator(
+      const ReadOptions& /*options*/,
+      const std::vector<ColumnFamilyHandle*>& /*column_families*/) override {
+    return std::unique_ptr<Iterator>(
+        NewErrorIterator(Status::NotSupported("Not supported yet")));
+  }
+
+  using DB::NewAttributeGroupIterator;
+  std::unique_ptr<AttributeGroupIterator> NewAttributeGroupIterator(
+      const ReadOptions& /*options*/,
+      const std::vector<ColumnFamilyHandle*>& /*column_families*/) override {
+    return NewAttributeGroupErrorIterator(
+        Status::NotSupported("Not supported yet"));
+  }
 
   // Check whether the transaction that wrote the value with sequence number seq
   // is visible to the snapshot with sequence number snapshot_seq.
@@ -155,7 +231,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     // commit cache, ii) delayed prepared, commit cache again. In this way if
     // the first query to commit cache missed the commit, the 2nd will catch it.
     bool was_empty;
-    SequenceNumber max_evicted_seq_lb, max_evicted_seq_ub;
+    SequenceNumber max_evicted_seq_lb;
+    SequenceNumber max_evicted_seq_ub;
     CommitEntry64b dont_care;
     auto indexed_seq = prep_seq % COMMIT_CACHE_SIZE;
     size_t repeats = 0;
@@ -440,12 +517,11 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
       const std::vector<ColumnFamilyHandle*>& handles) override;
   void UpdateCFComparatorMap(ColumnFamilyHandle* handle) override;
 
-  virtual const Snapshot* GetSnapshot() override;
+  const Snapshot* GetSnapshot() override;
   SnapshotImpl* GetSnapshotInternal(bool for_ww_conflict_check);
 
  protected:
-  virtual Status VerifyCFOptions(
-      const ColumnFamilyOptions& cf_options) override;
+  Status VerifyCFOptions(const ColumnFamilyOptions& cf_options) override;
   // Assign the min and max sequence numbers for reading from the db. A seq >
   // max is not valid, and a seq < min is valid, and a min <= seq < max requires
   // further checking. Normally max is defined by the snapshot and min is by
@@ -520,6 +596,22 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     RecordTick(db_impl_->immutable_db_options_.statistics.get(), ticker_type);
   }
 
+  Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
+                 const Slice& key, std::string* value) {
+    assert(value != nullptr);
+    PinnableSlice pinnable_val(value);
+    assert(!pinnable_val.IsPinned());
+    auto s = GetImpl(options, column_family, key, &pinnable_val);
+    if (s.ok() && pinnable_val.IsPinned()) {
+      value->assign(pinnable_val.data(), pinnable_val.size());
+    }  // else value is already assigned
+    return s;
+  }
+
+  DECLARE_SYNC_AND_ASYNC(Status, GetImpl, const ReadOptions& options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableSlice* value);
+
   // A heap with the amortized O(1) complexity for erase. It uses one extra heap
   // to keep track of erased entries that are not yet on top of the main heap.
   class PreparedHeap {
@@ -535,6 +627,13 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
     friend class WritePreparedTxnDB;
 
    public:
+    PreparedHeap() = default;
+    // No copying allowed
+    PreparedHeap(const PreparedHeap&) = delete;
+    PreparedHeap& operator=(const PreparedHeap&) = delete;
+    PreparedHeap(PreparedHeap&&) = delete;
+    PreparedHeap& operator=(PreparedHeap&&) = delete;
+
     ~PreparedHeap() {
       if (!TEST_CRASH_) {
         assert(heap_.empty());
@@ -823,14 +922,22 @@ class WritePreparedTxnReadCallback : public ReadCallback {
     (void)backed_by_snapshot_;  // to silence unused private field warning
   }
 
-  virtual ~WritePreparedTxnReadCallback() {
+  // No copying allowed
+  WritePreparedTxnReadCallback(const WritePreparedTxnReadCallback&) = delete;
+  WritePreparedTxnReadCallback& operator=(const WritePreparedTxnReadCallback&) =
+      delete;
+  WritePreparedTxnReadCallback(WritePreparedTxnReadCallback&&) = delete;
+  WritePreparedTxnReadCallback& operator=(WritePreparedTxnReadCallback&&) =
+      delete;
+
+  ~WritePreparedTxnReadCallback() override {
     // If it is not backed by snapshot, the caller must check validity
     assert(valid_checked_ || backed_by_snapshot_ == kBackedByDBSnapshot);
   }
 
   // Will be called to see if the seq number visible; if not it moves on to
   // the next seq number.
-  inline virtual bool IsVisibleFullCheck(SequenceNumber seq) override {
+  inline bool IsVisibleFullCheck(SequenceNumber seq) override {
     auto snapshot = max_visible_seq_;
     bool snap_released = false;
     auto ret =
@@ -867,10 +974,9 @@ class AddPreparedCallback : public PreReleaseCallback {
         first_prepare_batch_(first_prepare_batch) {
     (void)two_write_queues_;  // to silence unused private field warning
   }
-  virtual Status Callback(SequenceNumber prepare_seq,
-                          bool is_mem_disabled __attribute__((__unused__)),
-                          uint64_t log_number, size_t index,
-                          size_t total) override {
+  Status Callback(SequenceNumber prepare_seq,
+                  bool is_mem_disabled __attribute__((__unused__)),
+                  uint64_t log_number, size_t index, size_t total) override {
     assert(index < total);
     // To reduce the cost of lock acquisition competing with the concurrent
     // prepare requests, lock on the first callback and unlock on the last.
@@ -931,10 +1037,9 @@ class WritePreparedCommitEntryPreReleaseCallback : public PreReleaseCallback {
     assert((aux_batch_cnt_ > 0) != (aux_seq == kMaxSequenceNumber));  // xor
   }
 
-  virtual Status Callback(SequenceNumber commit_seq,
-                          bool is_mem_disabled __attribute__((__unused__)),
-                          uint64_t, size_t /*index*/,
-                          size_t /*total*/) override {
+  Status Callback(SequenceNumber commit_seq,
+                  bool is_mem_disabled __attribute__((__unused__)), uint64_t,
+                  size_t /*index*/, size_t /*total*/) override {
     // Always commit from the 2nd queue
     assert(!db_impl_->immutable_db_options().two_write_queues ||
            is_mem_disabled);

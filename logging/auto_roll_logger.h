@@ -30,25 +30,29 @@ class AutoRollLogger : public Logger {
                  size_t log_max_size, size_t log_file_time_to_roll,
                  size_t keep_log_file_num,
                  const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL);
+  // No copying allowed
+  AutoRollLogger(const AutoRollLogger&) = delete;
+  AutoRollLogger& operator=(const AutoRollLogger&) = delete;
+  AutoRollLogger(AutoRollLogger&&) = delete;
+  AutoRollLogger& operator=(AutoRollLogger&&) = delete;
 
   using Logger::Logv;
   void Logv(const char* format, va_list ap) override;
 
   // Write a header entry to the log. All header information will be written
   // again every time the log rolls over.
-  virtual void LogHeader(const char* format, va_list ap) override;
+  void LogHeader(const char* format, va_list ap) override;
 
   // check if the logger has encountered any problem.
   Status GetStatus() { return status_; }
 
   size_t GetLogFileSize() const override {
-    if (!logger_) {
-      return 0;
-    }
-
     std::shared_ptr<Logger> logger;
     {
       MutexLock l(&mutex_);
+      if (!logger_) {
+        return 0;
+      }
       // pin down the current logger_ instance before releasing the mutex.
       logger = logger_;
     }
@@ -68,7 +72,7 @@ class AutoRollLogger : public Logger {
     }
   }
 
-  virtual ~AutoRollLogger() {
+  ~AutoRollLogger() override {
     if (logger_ && !closed_) {
       logger_->Close().PermitUncheckedError();
     }
@@ -106,7 +110,7 @@ class AutoRollLogger : public Logger {
 
  protected:
   // Implementation of Close()
-  virtual Status CloseImpl() override {
+  Status CloseImpl() override {
     if (logger_) {
       return logger_->Close();
     } else {

@@ -51,9 +51,6 @@ class BlobFile {
   // Column family id.
   uint32_t column_family_id_{std::numeric_limits<uint32_t>::max()};
 
-  // Compression type of blobs in the file
-  CompressionType compression_{kNoCompression};
-
   // If true, the keys in this file all has TTL. Otherwise all keys don't
   // have TTL.
   bool has_ttl_{false};
@@ -108,13 +105,10 @@ class BlobFile {
            Logger* info_log);
 
   BlobFile(const BlobDBImpl* parent, const std::string& bdir, uint64_t fnum,
-           Logger* info_log, uint32_t column_family_id,
-           CompressionType compression, bool has_ttl,
+           Logger* info_log, uint32_t column_family_id, bool has_ttl,
            const ExpirationRange& expiration_range);
 
   ~BlobFile();
-
-  uint32_t GetColumnFamilyId() const;
 
   // Returns log file's absolute pathname.
   std::string PathName() const;
@@ -180,7 +174,7 @@ class BlobFile {
     return obsolete_sequence_;
   }
 
-  Status Fsync();
+  Status Fsync(const WriteOptions& write_options);
 
   uint64_t GetFileSize() const {
     return file_size_.load(std::memory_order_acquire);
@@ -201,8 +195,6 @@ class BlobFile {
 
   void SetHasTTL(bool has_ttl) { has_ttl_ = has_ttl; }
 
-  CompressionType GetCompressionType() const { return compression_; }
-
   std::shared_ptr<BlobLogWriter> GetWriter() const { return log_writer_; }
 
   // Read blob file header and footer. Return corruption if file header is
@@ -218,7 +210,8 @@ class BlobFile {
  private:
   Status ReadFooter(BlobLogFooter* footer);
 
-  Status WriteFooterAndCloseLocked(SequenceNumber sequence);
+  Status WriteFooterAndCloseLocked(const WriteOptions& write_options,
+                                   SequenceNumber sequence);
 
   void CloseRandomAccessLocked();
 

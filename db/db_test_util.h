@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -24,6 +26,7 @@
 
 #include "db/db_impl/db_impl.h"
 #include "file/filename.h"
+#include "options/options_helper.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
@@ -40,7 +43,6 @@
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "table/mock_table.h"
-#include "table/scoped_arena_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/cast_util.h"
@@ -114,6 +116,12 @@ struct OptionsOverride {
 
   // Used as a bit mask of individual enums in which to skip an XF test point
   int skip_policy = 0;
+
+  // The default value for this option is changed from false to true.
+  // Keeping the default to false for unit tests as old unit tests assume
+  // this behavior. Tests for level_compaction_dynamic_level_bytes
+  // will set the option to true explicitly.
+  bool level_compaction_dynamic_level_bytes = false;
 };
 
 }  // namespace anon
@@ -227,6 +235,7 @@ class SpecialEnv : public EnvWrapper {
       size_t GetUniqueId(char* id, size_t max_size) const override {
         return base_->GetUniqueId(id, max_size);
       }
+      uint64_t GetFileSize() final { return base_->GetFileSize(); }
     };
     class ManifestFile : public WritableFile {
      public:
@@ -269,16 +278,16 @@ class SpecialEnv : public EnvWrapper {
       SpecialEnv* env_;
       std::unique_ptr<WritableFile> base_;
     };
-    class WalFile : public WritableFile {
+    class SpecialWalFile : public WritableFile {
      public:
-      WalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
+      SpecialWalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {
         env_->num_open_wal_file_.fetch_add(1);
       }
-      virtual ~WalFile() { env_->num_open_wal_file_.fetch_add(-1); }
+      ~SpecialWalFile() override { env_->num_open_wal_file_.fetch_add(-1); }
       Status Append(const Slice& data) override {
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:1");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:1");
 #endif
         Status s;
         if (env_->log_write_error_.load(std::memory_order_acquire)) {
@@ -292,7 +301,7 @@ class SpecialEnv : public EnvWrapper {
           s = base_->Append(data);
         }
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:2");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:2");
 #endif
         return s;
       }
@@ -312,7 +321,8 @@ class SpecialEnv : public EnvWrapper {
 // SyncPoint is not supported in Released Windows Mode.
 #if !(defined NDEBUG) || !defined(OS_WIN)
         // Check preallocation size
-        size_t block_size, last_allocated_block;
+        size_t block_size;
+        size_t last_allocated_block;
         base_->GetPreallocationStatus(&block_size, &last_allocated_block);
         TEST_SYNC_POINT_CALLBACK("DBTestWalFile.GetPreallocationStatus",
                                  &block_size);
@@ -339,6 +349,7 @@ class SpecialEnv : public EnvWrapper {
       Status Allocate(uint64_t offset, uint64_t len) override {
         return base_->Allocate(offset, len);
       }
+      uint64_t GetFileSize() final { return base_->GetFileSize(); }
 
      private:
       SpecialEnv* env_;
@@ -411,7 +422,7 @@ class SpecialEnv : public EnvWrapper {
       } else if (strstr(f.c_str(), "MANIFEST") != nullptr) {
         r->reset(new ManifestFile(this, std::move(*r)));
       } else if (strstr(f.c_str(), "log") != nullptr) {
-        r->reset(new WalFile(this, std::move(*r)));
+        r->reset(new SpecialWalFile(this, std::move(*r)));
       } else {
         r->reset(new OtherFile(this, std::move(*r)));
       }
@@ -430,18 +441,22 @@ class SpecialEnv : public EnvWrapper {
           : target_(std::move(target)),
             counter_(counter),
             bytes_read_(bytes_read) {}
-      virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                          char* scratch) const override {
+      Status Read(uint64_t offset, size_t n, Slice* result,
+                  char* scratch) const override {
         counter_->Increment();
         Status s = target_->Read(offset, n, result, scratch);
         *bytes_read_ += result->size();
         return s;
       }
 
-      virtual Status Prefetch(uint64_t offset, size_t n) override {
+      Status Prefetch(uint64_t offset, size_t n) override {
         Status s = target_->Prefetch(offset, n);
         *bytes_read_ += n;
         return s;
+      }
+
+      Status GetFileSize(uint64_t* s) override {
+        return target_->GetFileSize(s);
       }
 
      private:
@@ -457,8 +472,8 @@ class SpecialEnv : public EnvWrapper {
           : target_(std::move(target)),
             fail_cnt_(failure_cnt),
             fail_odd_(fail_odd) {}
-      virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                          char* scratch) const override {
+      Status Read(uint64_t offset, size_t n, Slice* result,
+                  char* scratch) const override {
         if (Random::GetTLSInstance()->OneIn(fail_odd_)) {
           fail_cnt_->fetch_add(1);
           return Status::IOError("random error");
@@ -466,8 +481,12 @@ class SpecialEnv : public EnvWrapper {
         return target_->Read(offset, n, result, scratch);
       }
 
-      virtual Status Prefetch(uint64_t offset, size_t n) override {
+      Status Prefetch(uint64_t offset, size_t n) override {
         return target_->Prefetch(offset, n);
+      }
+
+      Status GetFileSize(uint64_t* s) override {
+        return target_->GetFileSize(s);
       }
 
      private:
@@ -494,19 +513,19 @@ class SpecialEnv : public EnvWrapper {
     return s;
   }
 
-  virtual Status NewSequentialFile(const std::string& f,
-                                   std::unique_ptr<SequentialFile>* r,
-                                   const EnvOptions& soptions) override {
+  Status NewSequentialFile(const std::string& f,
+                           std::unique_ptr<SequentialFile>* r,
+                           const EnvOptions& soptions) override {
     class CountingFile : public SequentialFile {
      public:
       CountingFile(std::unique_ptr<SequentialFile>&& target,
                    anon::AtomicCounter* counter)
           : target_(std::move(target)), counter_(counter) {}
-      virtual Status Read(size_t n, Slice* result, char* scratch) override {
+      Status Read(size_t n, Slice* result, char* scratch) override {
         counter_->Increment();
         return target_->Read(n, result, scratch);
       }
-      virtual Status Skip(uint64_t n) override { return target_->Skip(n); }
+      Status Skip(uint64_t n) override { return target_->Skip(n); }
 
      private:
       std::unique_ptr<SequentialFile> target_;
@@ -520,7 +539,7 @@ class SpecialEnv : public EnvWrapper {
     return s;
   }
 
-  virtual void SleepForMicroseconds(int micros) override {
+  void SleepForMicroseconds(int micros) override {
     sleep_counter_.Increment();
     if (no_slowdown_ || time_elapse_only_sleep_) {
       addon_microseconds_.fetch_add(micros);
@@ -542,7 +561,7 @@ class SpecialEnv : public EnvWrapper {
     addon_microseconds_.fetch_add(seconds * 1000000);
   }
 
-  virtual Status GetCurrentTime(int64_t* unix_time) override {
+  Status GetCurrentTime(int64_t* unix_time) override {
     Status s;
     if (time_elapse_only_sleep_) {
       *unix_time = maybe_starting_time_;
@@ -556,22 +575,22 @@ class SpecialEnv : public EnvWrapper {
     return s;
   }
 
-  virtual uint64_t NowCPUNanos() override {
+  uint64_t NowCPUNanos() override {
     now_cpu_count_.fetch_add(1);
     return target()->NowCPUNanos();
   }
 
-  virtual uint64_t NowNanos() override {
+  uint64_t NowNanos() override {
     return (time_elapse_only_sleep_ ? 0 : target()->NowNanos()) +
            addon_microseconds_.load() * 1000;
   }
 
-  virtual uint64_t NowMicros() override {
+  uint64_t NowMicros() override {
     return (time_elapse_only_sleep_ ? 0 : target()->NowMicros()) +
            addon_microseconds_.load();
   }
 
-  virtual Status DeleteFile(const std::string& fname) override {
+  Status DeleteFile(const std::string& fname) override {
     delete_count_.fetch_add(1);
     return target()->DeleteFile(fname);
   }
@@ -586,7 +605,7 @@ class SpecialEnv : public EnvWrapper {
       class NoopDirectory : public Directory {
        public:
         NoopDirectory() {}
-        ~NoopDirectory() {}
+        ~NoopDirectory() override {}
 
         Status Fsync() override { return Status::OK(); }
         Status Close() override { return Status::OK(); }
@@ -721,7 +740,11 @@ class FileTemperatureTestFS : public FileSystemWrapper {
           if (e != current_sst_file_temperatures_.end() &&
               e->second != opts.temperature) {
             result->reset();
-            return IOStatus::PathNotFound("Temperature mismatch on " + fname);
+            return IOStatus::PathNotFound(
+                "Read requested temperature " +
+                temperature_to_string[opts.temperature] +
+                " but stored with temperature " +
+                temperature_to_string[e->second] + " for " + fname);
           }
         }
         *result = WrapWithTemperature<FSSequentialFileOwnerWrapper>(
@@ -750,7 +773,11 @@ class FileTemperatureTestFS : public FileSystemWrapper {
           if (e != current_sst_file_temperatures_.end() &&
               e->second != opts.temperature) {
             result->reset();
-            return IOStatus::PathNotFound("Temperature mismatch on " + fname);
+            return IOStatus::PathNotFound(
+                "Read requested temperature " +
+                temperature_to_string[opts.temperature] +
+                " but stored with temperature " +
+                temperature_to_string[e->second] + " for " + fname);
           }
         }
         *result = WrapWithTemperature<FSRandomAccessFileOwnerWrapper>(
@@ -784,9 +811,44 @@ class FileTemperatureTestFS : public FileSystemWrapper {
     return target()->NewWritableFile(fname, opts, result, dbg);
   }
 
+  IOStatus DeleteFile(const std::string& fname, const IOOptions& options,
+                      IODebugContext* dbg) override {
+    IOStatus ios = target()->DeleteFile(fname, options, dbg);
+    if (ios.ok()) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(GetFileName(fname), &number, &type) &&
+          type == kTableFile) {
+        MutexLock lock(&mu_);
+        current_sst_file_temperatures_.erase(number);
+      }
+    }
+    return ios;
+  }
+
   void CopyCurrentSstFileTemperatures(std::map<uint64_t, Temperature>* out) {
     MutexLock lock(&mu_);
     *out = current_sst_file_temperatures_;
+  }
+
+  size_t CountCurrentSstFilesWithTemperature(Temperature temp) {
+    MutexLock lock(&mu_);
+    size_t count = 0;
+    for (const auto& e : current_sst_file_temperatures_) {
+      if (e.second == temp) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  std::map<Temperature, size_t> CountCurrentSstFilesByTemp() {
+    MutexLock lock(&mu_);
+    std::map<Temperature, size_t> ret;
+    for (const auto& e : current_sst_file_temperatures_) {
+      ret[e.second]++;
+    }
+    return ret;
   }
 
   void OverrideSstFileTemperature(uint64_t number, Temperature temp) {
@@ -800,7 +862,7 @@ class FileTemperatureTestFS : public FileSystemWrapper {
       requested_sst_file_temperatures_;
   std::map<uint64_t, Temperature> current_sst_file_temperatures_;
 
-  std::string GetFileName(const std::string& fname) {
+  static std::string GetFileName(const std::string& fname) {
     auto filename = fname.substr(fname.find_last_of(kFilePathSeparator) + 1);
     // workaround only for Windows that the file path could contain both Windows
     // FilePathSeparator and '/'
@@ -832,7 +894,7 @@ class FileTemperatureTestFS : public FileSystemWrapper {
 
 class OnFileDeletionListener : public EventListener {
  public:
-  OnFileDeletionListener() : matched_count_(0), expected_file_name_("") {}
+  OnFileDeletionListener() : matched_count_(0) {}
   const char* Name() const override { return kClassName(); }
   static const char* kClassName() { return "OnFileDeletionListener"; }
 
@@ -874,8 +936,8 @@ class FlushCounterListener : public EventListener {
 // "corrupted", "corrupted_try_merge", or "corrupted_must_merge".
 class TestPutOperator : public MergeOperator {
  public:
-  virtual bool FullMergeV2(const MergeOperationInput& merge_in,
-                           MergeOperationOutput* merge_out) const override {
+  bool FullMergeV2(const MergeOperationInput& merge_in,
+                   MergeOperationOutput* merge_out) const override {
     static const std::map<std::string, MergeOperator::OpFailureScope>
         bad_operand_to_op_failure_scope = {
             {"corrupted", MergeOperator::OpFailureScope::kDefault},
@@ -906,83 +968,7 @@ class TestPutOperator : public MergeOperator {
     return true;
   }
 
-  virtual const char* Name() const override { return "TestPutOperator"; }
-};
-
-// A wrapper around Cache that can easily be extended with instrumentation,
-// etc.
-class CacheWrapper : public Cache {
- public:
-  explicit CacheWrapper(std::shared_ptr<Cache> target)
-      : target_(std::move(target)) {}
-
-  const char* Name() const override { return target_->Name(); }
-
-  Status Insert(const Slice& key, ObjectPtr value,
-                const CacheItemHelper* helper, size_t charge,
-                Handle** handle = nullptr,
-                Priority priority = Priority::LOW) override {
-    return target_->Insert(key, value, helper, charge, handle, priority);
-  }
-
-  Handle* Lookup(const Slice& key, const CacheItemHelper* helper,
-                 CreateContext* create_context,
-                 Priority priority = Priority::LOW, bool wait = true,
-                 Statistics* stats = nullptr) override {
-    return target_->Lookup(key, helper, create_context, priority, wait, stats);
-  }
-
-  bool Ref(Handle* handle) override { return target_->Ref(handle); }
-
-  using Cache::Release;
-  bool Release(Handle* handle, bool erase_if_last_ref = false) override {
-    return target_->Release(handle, erase_if_last_ref);
-  }
-
-  ObjectPtr Value(Handle* handle) override { return target_->Value(handle); }
-
-  void Erase(const Slice& key) override { target_->Erase(key); }
-  uint64_t NewId() override { return target_->NewId(); }
-
-  void SetCapacity(size_t capacity) override { target_->SetCapacity(capacity); }
-
-  void SetStrictCapacityLimit(bool strict_capacity_limit) override {
-    target_->SetStrictCapacityLimit(strict_capacity_limit);
-  }
-
-  bool HasStrictCapacityLimit() const override {
-    return target_->HasStrictCapacityLimit();
-  }
-
-  size_t GetCapacity() const override { return target_->GetCapacity(); }
-
-  size_t GetUsage() const override { return target_->GetUsage(); }
-
-  size_t GetUsage(Handle* handle) const override {
-    return target_->GetUsage(handle);
-  }
-
-  size_t GetPinnedUsage() const override { return target_->GetPinnedUsage(); }
-
-  size_t GetCharge(Handle* handle) const override {
-    return target_->GetCharge(handle);
-  }
-
-  const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override {
-    return target_->GetCacheItemHelper(handle);
-  }
-
-  void ApplyToAllEntries(
-      const std::function<void(const Slice& key, ObjectPtr value, size_t charge,
-                               const CacheItemHelper* helper)>& callback,
-      const ApplyToAllEntriesOptions& opts) override {
-    target_->ApplyToAllEntries(callback, opts);
-  }
-
-  void EraseUnRefEntries() override { target_->EraseUnRefEntries(); }
-
- protected:
-  std::shared_ptr<Cache> target_;
+  const char* Name() const override { return "TestPutOperator"; }
 };
 
 /*
@@ -1002,10 +988,13 @@ class TargetCacheChargeTrackingCache : public CacheWrapper {
  public:
   explicit TargetCacheChargeTrackingCache(std::shared_ptr<Cache> target);
 
+  const char* Name() const override { return "TargetCacheChargeTrackingCache"; }
+
   Status Insert(const Slice& key, ObjectPtr value,
                 const CacheItemHelper* helper, size_t charge,
-                Handle** handle = nullptr,
-                Priority priority = Priority::LOW) override;
+                Handle** handle = nullptr, Priority priority = Priority::LOW,
+                const Slice& compressed = Slice(),
+                CompressionType type = kNoCompression) override;
 
   using Cache::Release;
   bool Release(Handle* handle, bool erase_if_last_ref = false) override;
@@ -1072,6 +1061,7 @@ class DBTestBase : public testing::Test {
     kPartitionedFilterWithNewTableReaderForCompactions,
     kUniversalSubcompactions,
     kUnorderedWrite,
+    kBlockBasedTableWithBinarySearchWithFirstKeyIndex,
     // This must be the last line
     kEnd,
   };
@@ -1083,8 +1073,9 @@ class DBTestBase : public testing::Test {
   MockEnv* mem_env_;
   Env* encrypted_env_;
   SpecialEnv* env_;
+  std::shared_ptr<Env> env_read_only_;
   std::shared_ptr<Env> env_guard_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   std::vector<ColumnFamilyHandle*> handles_;
 
   int option_config_;
@@ -1102,6 +1093,7 @@ class DBTestBase : public testing::Test {
     kSkipNoSeekToLast = 32,
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
+    kSkipRowCache = 512,
   };
 
   const int kRangeDelSkipConfigs =
@@ -1109,19 +1101,26 @@ class DBTestBase : public testing::Test {
       kSkipPlainTable |
       // MmapReads disables the iterator pinning that RangeDelAggregator
       // requires.
-      kSkipMmapReads;
+      kSkipMmapReads |
+      // Not compatible yet.
+      kSkipRowCache;
 
   // `env_do_fsync` decides whether the special Env would do real
   // fsync for files and directories. Skipping fsync can speed up
   // tests, but won't cover the exact fsync logic.
   DBTestBase(const std::string path, bool env_do_fsync);
 
-  ~DBTestBase();
+  ~DBTestBase() override;
 
   static std::string Key(int i) {
     char buf[100];
     snprintf(buf, sizeof(buf), "key%06d", i);
     return std::string(buf);
+  }
+
+  // Expects valid key created by Key().
+  static int IdFromKey(const std::string& key) {
+    return std::stoi(key.substr(3));
   }
 
   static bool ShouldSkipOptions(int option_config, int skip_mask = kNoSkip);
@@ -1161,7 +1160,7 @@ class DBTestBase : public testing::Test {
                      const anon::OptionsOverride& options_override =
                          anon::OptionsOverride()) const;
 
-  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
   void CreateColumnFamilies(const std::vector<std::string>& cfs,
                             const Options& options);
@@ -1181,6 +1180,12 @@ class DBTestBase : public testing::Test {
   Status TryReopenWithColumnFamilies(const std::vector<std::string>& cfs,
                                      const Options& options);
 
+  Status TryReopenReadOnlyWithColumnFamilies(
+      const std::vector<std::string>& cfs, const std::vector<Options>& options);
+
+  Status TryReopenReadOnlyWithColumnFamilies(
+      const std::vector<std::string>& cfs, const Options& options);
+
   void Reopen(const Options& options);
 
   void Close();
@@ -1190,6 +1195,9 @@ class DBTestBase : public testing::Test {
   void Destroy(const Options& options, bool delete_cf_paths = false);
 
   Status ReadOnlyReopen(const Options& options);
+
+  // With a filesystem wrapper that fails on attempted write
+  Status EnforcedReadOnlyReopen(const Options& options);
 
   Status TryReopen(const Options& options);
 
@@ -1206,6 +1214,12 @@ class DBTestBase : public testing::Test {
   Status Put(int cf, const Slice& k, const Slice& v,
              WriteOptions wo = WriteOptions());
 
+  Status TimedPut(const Slice& k, const Slice& v, uint64_t write_unix_time,
+                  WriteOptions wo = WriteOptions());
+
+  Status TimedPut(int cf, const Slice& k, const Slice& v,
+                  uint64_t write_unix_time, WriteOptions wo = WriteOptions());
+
   Status Merge(const Slice& k, const Slice& v,
                WriteOptions wo = WriteOptions());
 
@@ -1220,22 +1234,35 @@ class DBTestBase : public testing::Test {
 
   Status SingleDelete(int cf, const std::string& k);
 
-  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr);
+  std::string Get(const std::string& k, const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
   std::string Get(int cf, const std::string& k,
-                  const Snapshot* snapshot = nullptr);
+                  const Snapshot* snapshot = nullptr,
+                  bool use_coroutine = false);
 
-  Status Get(const std::string& k, PinnableSlice* v);
+  Status Get(const std::string& k, PinnableSlice* v,
+             bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(std::vector<int> cfs,
                                     const std::vector<std::string>& k,
-                                    const Snapshot* snapshot,
-                                    const bool batched,
-                                    const bool async = false);
+                                    const Snapshot* snapshot, bool batched,
+                                    bool async = false,
+                                    bool use_coroutine = false);
 
   std::vector<std::string> MultiGet(const std::vector<std::string>& k,
                                     const Snapshot* snapshot = nullptr,
-                                    const bool async = false);
+                                    bool async = false,
+                                    bool optimize_multiget_for_io = true,
+                                    bool use_coroutine = false);
+
+  void MultiGet(const std::vector<std::string>& k, const Snapshot* snapshot,
+                bool async, bool optimize_multiget_for_io, bool use_coroutine,
+                std::vector<PinnableSlice>& values,
+                std::vector<Status>& statuses);
+
+  Status CompactRange(const CompactRangeOptions& options,
+                      std::optional<Slice> begin, std::optional<Slice> end);
 
   uint64_t GetNumSnapshots();
 
@@ -1266,9 +1293,14 @@ class DBTestBase : public testing::Test {
 
   size_t TotalLiveFiles(int cf = 0);
 
+  size_t TotalLiveFilesAtPath(int cf, const std::string& path);
+
   size_t CountLiveFiles();
 
   int NumTableFilesAtLevel(int level, int cf = 0);
+
+  int NumTableFilesAtLevel(int level, ColumnFamilyHandle* column_family,
+                           DB* db = nullptr);
 
   double CompressionRatioAtLevel(int level, int cf = 0);
 
@@ -1279,9 +1311,13 @@ class DBTestBase : public testing::Test {
   // Return spread of files per level
   std::string FilesPerLevel(int cf = 0);
 
+  std::string FilesPerLevel(ColumnFamilyHandle* cfh, DB* db = nullptr);
+
   size_t CountFiles();
 
   Status CountFiles(size_t* count);
+
+  std::vector<FileMetaData*> GetLevelFileMetadatas(int level, int cf = 0);
 
   Status Size(const Slice& start, const Slice& limit, uint64_t* size) {
     return Size(start, limit, 0, size);
@@ -1307,6 +1343,9 @@ class DBTestBase : public testing::Test {
                   int cf);
 
   void MoveFilesToLevel(int level, int cf = 0);
+
+  void MoveFilesToLevel(int level, ColumnFamilyHandle* column_family,
+                        DB* db = nullptr);
 
   void DumpFileCounts(const char* label);
 
@@ -1372,7 +1411,8 @@ class DBTestBase : public testing::Test {
   void VerifyDBFromMap(
       std::map<std::string, std::string> true_data,
       size_t* total_reads_res = nullptr, bool tailing_iter = false,
-      std::map<std::string, Status> status = std::map<std::string, Status>());
+      ReadOptions* ro = nullptr, ColumnFamilyHandle* cf = nullptr,
+      std::unordered_set<std::string>* not_found = nullptr) const;
 
   void VerifyDBInternal(
       std::vector<std::pair<std::string, std::string>> true_data);
@@ -1390,10 +1430,67 @@ class DBTestBase : public testing::Test {
                                       Tickers ticker_type) {
     return options.statistics->getAndResetTickerCount(ticker_type);
   }
+  // Short name for TestGetAndResetTickerCount
+  uint64_t PopTicker(const Options& options, Tickers ticker_type) {
+    return options.statistics->getAndResetTickerCount(ticker_type);
+  }
 
   // Note: reverting this setting within the same test run is not yet
   // supported
   void SetTimeElapseOnlySleepOnReopen(DBOptions* options);
+
+  void ResetTableProperties(TableProperties* tp) {
+    tp->data_size = 0;
+    tp->index_size = 0;
+    tp->filter_size = 0;
+    tp->raw_key_size = 0;
+    tp->raw_value_size = 0;
+    tp->num_data_blocks = 0;
+    tp->num_data_blocks_compression_rejected = 0;
+    tp->num_data_blocks_compression_bypassed = 0;
+    tp->num_entries = 0;
+    tp->num_deletions = 0;
+    tp->num_merge_operands = 0;
+    tp->num_range_deletions = 0;
+    tp->standard_index_is_stub = 0;
+  }
+
+  void ParseTablePropertiesString(std::string tp_string, TableProperties* tp) {
+    double dummy_double;
+    std::replace(tp_string.begin(), tp_string.end(), ';', ' ');
+    std::replace(tp_string.begin(), tp_string.end(), '=', ' ');
+    ResetTableProperties(tp);
+    int count = sscanf(
+        tp_string.c_str(),
+        "# data blocks %" SCNu64 " # data blocks compression rejected %" SCNu64
+        " # data blocks compression bypassed %" SCNu64
+        " # uniform blocks %" SCNu64 " # entries %" SCNu64
+        " # deletions %" SCNu64 " # merge operands %" SCNu64
+        " # range deletions %" SCNu64 " raw key size %" SCNu64
+        " raw average key size %lf "
+        " raw value size %" SCNu64
+        " raw average value size %lf "
+        " data block size %" SCNu64 " data uncompressed size %" SCNu64
+        " index block size (user-key? %" SCNu64 ", delta-value? %" SCNu64
+        ") %" SCNu64 " filter block size %" SCNu64,
+        &tp->num_data_blocks, &tp->num_data_blocks_compression_rejected,
+        &tp->num_data_blocks_compression_bypassed, &tp->num_uniform_blocks,
+        &tp->num_entries, &tp->num_deletions, &tp->num_merge_operands,
+        &tp->num_range_deletions, &tp->raw_key_size, &dummy_double,
+        &tp->raw_value_size, &dummy_double, &tp->data_size,
+        &tp->uncompressed_data_size, &tp->index_key_is_user_key,
+        &tp->index_value_is_delta_encoded, &tp->index_size, &tp->filter_size);
+    ASSERT_EQ(count, 18);
+
+    const char* standard_index_is_stub =
+        std::strstr(tp_string.c_str(), "standard index is stub ");
+    if (standard_index_is_stub != nullptr) {
+      ASSERT_EQ(
+          std::sscanf(standard_index_is_stub, "standard index is stub %" SCNu64,
+                      &tp->standard_index_is_stub),
+          1);
+    }
+  }
 
  private:  // Prone to error on direct use
   void MaybeInstallTimeElapseOnlySleep(const DBOptions& options);
@@ -1404,5 +1501,9 @@ class DBTestBase : public testing::Test {
 // For verifying that all files generated by current version have SST
 // unique ids.
 void VerifySstUniqueIds(const TablePropertiesCollection& props);
+
+// Excludes kUnknown
+extern const std::vector<Temperature> kKnownTemperatures;
+Temperature RandomKnownTemperature();
 
 }  // namespace ROCKSDB_NAMESPACE

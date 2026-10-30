@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <string>
 
 #include "rocksdb/options.h"
@@ -23,8 +22,6 @@ class TableBuilder;
 
 class AdaptiveTableFactory : public TableFactory {
  public:
-  ~AdaptiveTableFactory() {}
-
   explicit AdaptiveTableFactory(
       std::shared_ptr<TableFactory> table_factory_to_write,
       std::shared_ptr<TableFactory> block_based_table_factory,
@@ -45,6 +42,10 @@ class AdaptiveTableFactory : public TableFactory {
       WritableFileWriter* file) const override;
 
   std::string GetPrintableOptions() const override;
+
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<AdaptiveTableFactory>(*this);
+  }
 
  private:
   std::shared_ptr<TableFactory> table_factory_to_write_;

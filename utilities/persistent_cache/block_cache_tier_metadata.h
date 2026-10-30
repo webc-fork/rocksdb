@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 #pragma once
 
-
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -49,7 +48,7 @@ class BlockCacheTierMetadata {
                                   const uint32_t cachefile_capacity = 10 * 1024)
       : cache_file_index_(cachefile_capacity), block_index_(blocks_capacity) {}
 
-  virtual ~BlockCacheTierMetadata() {}
+  virtual ~BlockCacheTierMetadata() = default;
 
   // Insert a given cache file
   bool Insert(BlockCacheFile* file);
@@ -119,4 +118,3 @@ class BlockCacheTierMetadata {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

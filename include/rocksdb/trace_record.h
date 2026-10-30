@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,6 +49,8 @@ class IteratorSeekQueryTraceRecord;
 class MultiGetQueryTraceRecord;
 class TraceRecordResult;
 class WriteQueryTraceRecord;
+struct ReadOptions;
+struct WriteOptions;
 
 // Base class for all types of trace records.
 class TraceRecord {
@@ -83,7 +86,9 @@ class TraceRecord {
   virtual Status Accept(Handler* handler,
                         std::unique_ptr<TraceRecordResult>* result) = 0;
 
-  // Create a handler for the exeution of TraceRecord.
+  // Create a handler for the execution of TraceRecord. `handles` are the column
+  // families that read records may refer to. The default column family of
+  // `db` is always included, so `handles` may be empty.
   static Handler* NewExecutionHandler(
       DB* db, const std::vector<ColumnFamilyHandle*>& handles);
 
@@ -104,18 +109,31 @@ class WriteQueryTraceRecord : public QueryTraceRecord {
 
   WriteQueryTraceRecord(const std::string& write_batch_rep, uint64_t timestamp);
 
-  virtual ~WriteQueryTraceRecord() override;
+  // No copying allowed
+  WriteQueryTraceRecord(const WriteQueryTraceRecord&) = delete;
+  WriteQueryTraceRecord& operator=(const WriteQueryTraceRecord&) = delete;
+  WriteQueryTraceRecord(WriteQueryTraceRecord&&) = delete;
+  WriteQueryTraceRecord& operator=(WriteQueryTraceRecord&&) = delete;
+
+  ~WriteQueryTraceRecord() override;
 
   TraceType GetTraceType() const override { return kTraceWrite; }
 
   // rep string for the WriteBatch.
   virtual Slice GetWriteBatchRep() const;
 
+  // The options the write was made with, if the trace recorded them
+  // (TraceOptions::include_read_write_options); nullptr otherwise. Fields
+  // that are not recorded have their default values.
+  virtual const WriteOptions* GetWriteOptions() const;
+  void SetWriteOptions(const WriteOptions& write_options);
+
   Status Accept(Handler* handler,
                 std::unique_ptr<TraceRecordResult>* result) override;
 
  private:
   PinnableSlice rep_;
+  std::unique_ptr<WriteOptions> write_options_;
 };
 
 // Trace record for DB::Get() operation
@@ -127,7 +145,13 @@ class GetQueryTraceRecord : public QueryTraceRecord {
   GetQueryTraceRecord(uint32_t column_family_id, const std::string& key,
                       uint64_t timestamp);
 
-  virtual ~GetQueryTraceRecord() override;
+  // No copying allowed
+  GetQueryTraceRecord(const GetQueryTraceRecord&) = delete;
+  GetQueryTraceRecord& operator=(const GetQueryTraceRecord&) = delete;
+  GetQueryTraceRecord(GetQueryTraceRecord&&) = delete;
+  GetQueryTraceRecord& operator=(GetQueryTraceRecord&&) = delete;
+
+  ~GetQueryTraceRecord() override;
 
   TraceType GetTraceType() const override { return kTraceGet; }
 
@@ -137,12 +161,19 @@ class GetQueryTraceRecord : public QueryTraceRecord {
   // Key to get.
   virtual Slice GetKey() const;
 
+  // The options the read was made with, if the trace recorded them
+  // (TraceOptions::include_read_write_options); nullptr otherwise. Fields
+  // that are not recorded have their default values.
+  virtual const ReadOptions* GetReadOptions() const;
+  void SetReadOptions(const ReadOptions& read_options);
+
   Status Accept(Handler* handler,
                 std::unique_ptr<TraceRecordResult>* result) override;
 
  private:
   uint32_t cf_id_;
   PinnableSlice key_;
+  std::unique_ptr<ReadOptions> read_options_;
 };
 
 // Base class for all Iterator related operations.
@@ -156,16 +187,23 @@ class IteratorQueryTraceRecord : public QueryTraceRecord {
   IteratorQueryTraceRecord(const std::string& lower_bound,
                            const std::string& upper_bound, uint64_t timestamp);
 
-  virtual ~IteratorQueryTraceRecord() override;
+  ~IteratorQueryTraceRecord() override;
 
   // Get the iterator's lower/upper bound. They may be used in ReadOptions to
   // create an Iterator instance.
   virtual Slice GetLowerBound() const;
   virtual Slice GetUpperBound() const;
 
+  // The options the iterator was created with, if the trace recorded them
+  // (TraceOptions::include_read_write_options); nullptr otherwise. Fields
+  // that are not recorded have their default values.
+  virtual const ReadOptions* GetReadOptions() const;
+  void SetReadOptions(const ReadOptions& read_options);
+
  private:
   PinnableSlice lower_;
   PinnableSlice upper_;
+  std::unique_ptr<ReadOptions> read_options_;
 };
 
 // Trace record for Iterator::Seek() and Iterator::SeekForPrev() operation.
@@ -193,7 +231,15 @@ class IteratorSeekQueryTraceRecord : public IteratorQueryTraceRecord {
                                const std::string& upper_bound,
                                uint64_t timestamp);
 
-  virtual ~IteratorSeekQueryTraceRecord() override;
+  // No copying allowed
+  IteratorSeekQueryTraceRecord(const IteratorSeekQueryTraceRecord&) = delete;
+  IteratorSeekQueryTraceRecord& operator=(const IteratorSeekQueryTraceRecord&) =
+      delete;
+  IteratorSeekQueryTraceRecord(IteratorSeekQueryTraceRecord&&) = delete;
+  IteratorSeekQueryTraceRecord& operator=(IteratorSeekQueryTraceRecord&&) =
+      delete;
+
+  ~IteratorSeekQueryTraceRecord() override;
 
   // Trace type matches the seek type.
   TraceType GetTraceType() const override;
@@ -227,7 +273,13 @@ class MultiGetQueryTraceRecord : public QueryTraceRecord {
                            const std::vector<std::string>& keys,
                            uint64_t timestamp);
 
-  virtual ~MultiGetQueryTraceRecord() override;
+  // No copying allowed
+  MultiGetQueryTraceRecord(const MultiGetQueryTraceRecord&) = delete;
+  MultiGetQueryTraceRecord& operator=(const MultiGetQueryTraceRecord&) = delete;
+  MultiGetQueryTraceRecord(MultiGetQueryTraceRecord&&) = delete;
+  MultiGetQueryTraceRecord& operator=(MultiGetQueryTraceRecord&&) = delete;
+
+  ~MultiGetQueryTraceRecord() override;
 
   TraceType GetTraceType() const override { return kTraceMultiGet; }
 
@@ -237,12 +289,19 @@ class MultiGetQueryTraceRecord : public QueryTraceRecord {
   // Keys to get.
   virtual std::vector<Slice> GetKeys() const;
 
+  // The options the read was made with, if the trace recorded them
+  // (TraceOptions::include_read_write_options); nullptr otherwise. Fields
+  // that are not recorded have their default values.
+  virtual const ReadOptions* GetReadOptions() const;
+  void SetReadOptions(const ReadOptions& read_options);
+
   Status Accept(Handler* handler,
                 std::unique_ptr<TraceRecordResult>* result) override;
 
  private:
   std::vector<uint32_t> cf_ids_;
   std::vector<PinnableSlice> keys_;
+  std::unique_ptr<ReadOptions> read_options_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

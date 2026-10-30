@@ -24,7 +24,8 @@ Status DBImpl::SuggestCompactRange(ColumnFamilyHandle* column_family,
                                    const Slice* begin, const Slice* end) {
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
   auto cfd = cfh->cfd();
-  InternalKey start_key, end_key;
+  InternalKey start_key;
+  InternalKey end_key;
   if (begin != nullptr) {
     start_key.SetMinPossibleForUserKey(*begin);
   }
@@ -45,9 +46,10 @@ Status DBImpl::SuggestCompactRange(ColumnFamilyHandle* column_family,
     }
     // Since we have some more files to compact, we should also recompute
     // compaction score
-    vstorage->ComputeCompactionScore(*cfd->ioptions(),
-                                     *cfd->GetLatestMutableCFOptions());
-    SchedulePendingCompaction(cfd);
+    vstorage->ComputeCompactionScore(cfd->ioptions(),
+                                     cfd->GetLatestMutableCFOptions(),
+                                     cfd->GetFullHistoryTsLow());
+    EnqueuePendingCompaction(cfd);
     MaybeScheduleFlushOrCompaction();
   }
   return Status::OK();
@@ -61,6 +63,9 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
                    "PromoteL0 FAILED. Invalid target level %d\n", target_level);
     return Status::InvalidArgument("Invalid target level");
   }
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  const ReadOptions read_options;
+  const WriteOptions write_options;
 
   Status status;
   VersionEdit edit;
@@ -101,7 +106,9 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
         return status;
       }
 
-      if (i == 0) continue;
+      if (i == 0) {
+        continue;
+      }
       auto prev_f = l0_files[i - 1];
       if (icmp->Compare(prev_f->largest, f->smallest) >= 0) {
         ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -134,18 +141,20 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
                    f->fd.GetFileSize(), f->smallest, f->largest,
                    f->fd.smallest_seqno, f->fd.largest_seqno,
                    f->marked_for_compaction, f->temperature,
-                   f->oldest_blob_file_number, f->oldest_ancester_time,
+                   f->oldest_blob_file_number, f->oldest_ancestor_time,
                    f->file_creation_time, f->epoch_number, f->file_checksum,
                    f->file_checksum_func_name, f->unique_id,
-                   f->compensated_range_deletion_size);
+                   f->compensated_range_deletion_size, f->tail_size,
+                   f->user_defined_timestamps_persisted, f->min_timestamp,
+                   f->max_timestamp, f->file_open_metadata);
     }
 
-    status = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(),
-                                    &edit, &mutex_, directories_.GetDbDir());
+    status = versions_->LogAndApply(cfd, read_options, write_options, &edit,
+                                    &mutex_, directories_.GetDbDir());
     if (status.ok()) {
-      InstallSuperVersionAndScheduleWork(cfd,
-                                         &job_context.superversion_contexts[0],
-                                         *cfd->GetLatestMutableCFOptions());
+      InstallSuperVersionAndScheduleWork(
+          cfd, job_context.superversion_contexts.data(),
+          /*defer_snapshot_refresh=*/false);
     }
   }  // lock released here
   LogFlush(immutable_db_options_.info_log);

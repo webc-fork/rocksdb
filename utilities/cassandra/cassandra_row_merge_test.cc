@@ -9,8 +9,7 @@
 #include "utilities/cassandra/format.h"
 #include "utilities/cassandra/test_utils.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace cassandra {
+namespace ROCKSDB_NAMESPACE::cassandra {
 
 class RowValueMergeTest : public testing::Test {};
 
@@ -79,6 +78,12 @@ TEST(RowValueMergeTest, MergeWithRowTombstone) {
 
   // If the tombstone's timestamp is the latest, then it returns a
   // row tombstone.
+  row_values.clear();
+  row_values.push_back(CreateTestRowValue({
+      CreateTestColumnSpec(kColumn, 4, 13),
+      CreateTestColumnSpec(kColumn, 5, 14),
+  }));
+
   row_values.push_back(CreateRowTombstone(15));
 
   row_values.push_back(CreateRowTombstone(17));
@@ -88,8 +93,7 @@ TEST(RowValueMergeTest, MergeWithRowTombstone) {
   EXPECT_EQ(merged.LastModifiedTime(), 17);
 }
 
-}  // namespace cassandra
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::cassandra
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

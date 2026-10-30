@@ -14,7 +14,7 @@ namespace ROCKSDB_NAMESPACE {
 
 std::string EncodeSessionId(uint64_t upper, uint64_t lower) {
   std::string db_session_id(20U, '\0');
-  char *buf = &db_session_id[0];
+  char* buf = db_session_id.data();
   // Preserving `lower` is slightly tricky. 36^12 is slightly more than
   // 62 bits, so we use 12 chars plus the bottom two bits of one more.
   // (A tiny fraction of 20 digit strings go unused.)
@@ -26,8 +26,8 @@ std::string EncodeSessionId(uint64_t upper, uint64_t lower) {
   return db_session_id;
 }
 
-Status DecodeSessionId(const std::string &db_session_id, uint64_t *upper,
-                       uint64_t *lower) {
+Status DecodeSessionId(const std::string& db_session_id, uint64_t* upper,
+                       uint64_t* lower) {
   const size_t len = db_session_id.size();
   if (len == 0) {
     return Status::NotSupported("Missing db_session_id");
@@ -40,8 +40,9 @@ Status DecodeSessionId(const std::string &db_session_id, uint64_t *upper,
   if (len > 24) {
     return Status::NotSupported("Too long db_session_id");
   }
-  uint64_t a = 0, b = 0;
-  const char *buf = &db_session_id.front();
+  uint64_t a = 0;
+  uint64_t b = 0;
+  const char* buf = &db_session_id.front();
   bool success = ParseBaseChars<36>(&buf, len - 12U, &a);
   if (!success) {
     return Status::NotSupported("Bad digit in db_session_id");
@@ -56,8 +57,8 @@ Status DecodeSessionId(const std::string &db_session_id, uint64_t *upper,
   return Status::OK();
 }
 
-Status GetSstInternalUniqueId(const std::string &db_id,
-                              const std::string &db_session_id,
+Status GetSstInternalUniqueId(const std::string& db_id,
+                              const std::string& db_session_id,
                               uint64_t file_number, UniqueIdPtr out,
                               bool force) {
   if (!force) {
@@ -103,7 +104,8 @@ Status GetSstInternalUniqueId(const std::string &db_id,
   // (It is possible that many DBs descended from one common DB id are copied
   // around and proliferate, in which case session id is critical, but it is
   // more common for different DBs to have different DB ids.)
-  uint64_t db_a, db_b;
+  uint64_t db_a;
+  uint64_t db_b;
   Hash2x64(db_id.data(), db_id.size(), session_upper, &db_a, &db_b);
 
   // Xor in file number for guaranteed uniqueness by file number for a given
@@ -129,7 +131,8 @@ constexpr uint64_t kLoOffsetForZero = 6417269962128484497U;
 }  // namespace
 
 void InternalUniqueIdToExternal(UniqueIdPtr in_out) {
-  uint64_t hi, lo;
+  uint64_t hi;
+  uint64_t lo;
   BijectiveHash2x64(in_out.ptr[1] + kHiOffsetForZero,
                     in_out.ptr[0] + kLoOffsetForZero, &hi, &lo);
   in_out.ptr[0] = lo;
@@ -152,7 +155,7 @@ void ExternalUniqueIdToInternal(UniqueIdPtr in_out) {
 
 std::string EncodeUniqueIdBytes(UniqueIdPtr in) {
   std::string ret(in.extended ? 24U : 16U, '\0');
-  EncodeFixed64(&ret[0], in.ptr[0]);
+  EncodeFixed64(ret.data(), in.ptr[0]);
   EncodeFixed64(&ret[8], in.ptr[1]);
   if (in.extended) {
     EncodeFixed64(&ret[16], in.ptr[2]);
@@ -160,11 +163,11 @@ std::string EncodeUniqueIdBytes(UniqueIdPtr in) {
   return ret;
 }
 
-Status DecodeUniqueIdBytes(const std::string &unique_id, UniqueIdPtr out) {
+Status DecodeUniqueIdBytes(const std::string& unique_id, UniqueIdPtr out) {
   if (unique_id.size() != (out.extended ? 24 : 16)) {
     return Status::NotSupported("Not a valid unique_id");
   }
-  const char *buf = &unique_id.front();
+  const char* buf = &unique_id.front();
   out.ptr[0] = DecodeFixed64(&buf[0]);
   out.ptr[1] = DecodeFixed64(&buf[8]);
   if (out.extended) {
@@ -174,8 +177,8 @@ Status DecodeUniqueIdBytes(const std::string &unique_id, UniqueIdPtr out) {
 }
 
 template <typename ID>
-Status GetUniqueIdFromTablePropertiesHelper(const TableProperties &props,
-                                            std::string *out_id) {
+Status GetUniqueIdFromTablePropertiesHelper(const TableProperties& props,
+                                            std::string* out_id) {
   ID tmp{};
   Status s = GetSstInternalUniqueId(props.db_id, props.db_session_id,
                                     props.orig_file_number, &tmp);
@@ -188,23 +191,27 @@ Status GetUniqueIdFromTablePropertiesHelper(const TableProperties &props,
   return s;
 }
 
-Status GetExtendedUniqueIdFromTableProperties(const TableProperties &props,
-                                              std::string *out_id) {
+Status GetExtendedUniqueIdFromTableProperties(const TableProperties& props,
+                                              std::string* out_id) {
   return GetUniqueIdFromTablePropertiesHelper<UniqueId64x3>(props, out_id);
 }
 
-Status GetUniqueIdFromTableProperties(const TableProperties &props,
-                                      std::string *out_id) {
+Status GetUniqueIdFromTableProperties(const TableProperties& props,
+                                      std::string* out_id) {
   return GetUniqueIdFromTablePropertiesHelper<UniqueId64x2>(props, out_id);
 }
 
-std::string UniqueIdToHumanString(const std::string &id) {
-  // Not so efficient, but that's OK
-  std::string str = Slice(id).ToString(/*hex*/ true);
-  for (size_t i = 16; i < str.size(); i += 17) {
-    str.insert(i, "-");
+std::string UniqueIdToHumanString(const std::string& id) {
+  std::string hex = Slice(id).ToString(/*hex*/ true);
+  std::string result;
+  result.reserve(hex.size() + hex.size() / 16);
+  for (size_t i = 0; i < hex.size(); i++) {
+    if (i > 0 && i % 16 == 0) {
+      result.push_back('-');
+    }
+    result.push_back(hex[i]);
   }
-  return str;
+  return result;
 }
 
 std::string InternalUniqueIdToHumanString(UniqueIdPtr in) {

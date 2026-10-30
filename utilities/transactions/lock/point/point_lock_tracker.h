@@ -41,9 +41,12 @@ using TrackedKeys = std::unordered_map<ColumnFamilyId, TrackedKeyInfos>;
 class PointLockTracker : public LockTracker {
  public:
   PointLockTracker() = default;
+  ~PointLockTracker() override = default;
 
   PointLockTracker(const PointLockTracker&) = delete;
   PointLockTracker& operator=(const PointLockTracker&) = delete;
+  PointLockTracker(PointLockTracker&&) = delete;
+  PointLockTracker& operator=(PointLockTracker&&) = delete;
 
   bool IsPointLockSupported() const override { return true; }
 
@@ -65,7 +68,7 @@ class PointLockTracker : public LockTracker {
 
   void Clear() override;
 
-  virtual LockTracker* GetTrackedLocksSinceSavePoint(
+  LockTracker* GetTrackedLocksSinceSavePoint(
       const LockTracker& save_point_tracker) const override;
 
   PointLockStatus GetPointLockStatus(ColumnFamilyId column_family_id,

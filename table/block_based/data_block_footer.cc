@@ -9,51 +9,109 @@
 
 #include "table/block_based/data_block_footer.h"
 
-#include "rocksdb/table.h"
+#include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-const int kDataBlockIndexTypeBitShift = 31;
+// Hash index bit (bit 31)
+constexpr uint32_t kHashIndexBit = 1u << 31;
+// Extended metadata bit (bit 30): reserved "open up more metadata" escape.
+// When set, an additional (currently unspecified) metadata section is present.
+// No feature defines it yet, so it must be 0; a set bit is treated as an
+// unsupported/corrupt block. Reserving it in format_version 8 lets a future
+// extension add block metadata by setting this bit and writing its section,
+// handled in this one shared decoder -- without another format_version bump or
+// re-plumbing format_version into every block parser.
+constexpr uint32_t kExtendedMetadataBit = 1u << 30;
+// Uniform keys bit (bit 29) - indicates keys are uniformly distributed
+constexpr uint32_t kUniformKeysBit = 1u << 29;
+// Separated KV storage bit (bit 28)
+constexpr uint32_t kSeparatedKVBit = 1u << 28;
 
-// 0x7FFFFFFF
-const uint32_t kMaxNumRestarts = (1u << kDataBlockIndexTypeBitShift) - 1u;
+void DataBlockFooter::EncodeTo(std::string* dst) const {
+  assert(num_restarts <= kMaxNumRestarts);
 
-// 0x7FFFFFFF
-const uint32_t kNumRestartsMask = (1u << kDataBlockIndexTypeBitShift) - 1u;
-
-uint32_t PackIndexTypeAndNumRestarts(
-    BlockBasedTableOptions::DataBlockIndexType index_type,
-    uint32_t num_restarts) {
-  if (num_restarts > kMaxNumRestarts) {
-    assert(0);  // mute travis "unused" warning
+  // If separated KV, write the values_section_offset before the packed footer
+  if (separated_kv) {
+    PutFixed32(dst, values_section_offset);
   }
 
-  uint32_t block_footer = num_restarts;
+  uint32_t packed = num_restarts;
   if (index_type == BlockBasedTableOptions::kDataBlockBinaryAndHash) {
-    block_footer |= 1u << kDataBlockIndexTypeBitShift;
-  } else if (index_type != BlockBasedTableOptions::kDataBlockBinarySearch) {
-    assert(0);
+    packed |= kHashIndexBit;
+  } else {
+    assert(index_type == BlockBasedTableOptions::kDataBlockBinarySearch);
+  }
+  if (separated_kv) {
+    packed |= kSeparatedKVBit;
+  }
+  if (is_uniform) {
+    packed |= kUniformKeysBit;
   }
 
-  return block_footer;
+  PutFixed32(dst, packed);
 }
 
-void UnPackIndexTypeAndNumRestarts(
-    uint32_t block_footer,
-    BlockBasedTableOptions::DataBlockIndexType* index_type,
-    uint32_t* num_restarts) {
-  if (index_type) {
-    if (block_footer & 1u << kDataBlockIndexTypeBitShift) {
-      *index_type = BlockBasedTableOptions::kDataBlockBinaryAndHash;
-    } else {
-      *index_type = BlockBasedTableOptions::kDataBlockBinarySearch;
-    }
+Status DataBlockFooter::DecodeFrom(Slice* input) {
+  if (input->size() < kMinEncodedLength) {
+    return Status::Corruption("Block too small for footer");
   }
 
-  if (num_restarts) {
-    *num_restarts = block_footer & kNumRestartsMask;
-    assert(*num_restarts <= kMaxNumRestarts);
+  // Decode from the end of the input
+  const char* footer_ptr = input->data() + input->size() - sizeof(uint32_t);
+  uint32_t packed = DecodeFixed32(footer_ptr);
+
+  if (packed & kHashIndexBit) {
+    index_type = BlockBasedTableOptions::kDataBlockBinaryAndHash;
+    packed &= ~kHashIndexBit;
+  } else {
+    index_type = BlockBasedTableOptions::kDataBlockBinarySearch;
   }
+
+  if (packed & kSeparatedKVBit) {
+    separated_kv = true;
+    packed &= ~kSeparatedKVBit;
+  } else {
+    separated_kv = false;
+  }
+
+  if (packed & kUniformKeysBit) {
+    is_uniform = true;
+    packed &= ~kUniformKeysBit;
+  } else {
+    is_uniform = false;
+  }
+
+  // Reserved "extended metadata" escape (bit 30): no feature defines it yet, so
+  // a set bit means the block was written by a newer format we don't support.
+  if (packed & kExtendedMetadataBit) {
+    return Status::Corruption(
+        "Unsupported extended block metadata (reserved bit set)");
+  }
+
+  // Check for reserved/unrecognized feature bits (anything beyond
+  // kMaxNumRestarts)
+  if (packed > kMaxNumRestarts) {
+    return Status::Corruption(
+        "Unrecognized feature in block footer (reserved bits set)");
+  }
+
+  num_restarts = packed;
+
+  input->remove_suffix(sizeof(uint32_t));
+
+  // If separated KV, read values_section_offset from before the packed footer
+  if (separated_kv) {
+    if (input->size() < sizeof(uint32_t)) {
+      return Status::Corruption(
+          "Block too small for separated KV values section offset");
+    }
+    values_section_offset =
+        DecodeFixed32(input->data() + input->size() - sizeof(uint32_t));
+    input->remove_suffix(sizeof(uint32_t));
+  }
+
+  return Status::OK();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

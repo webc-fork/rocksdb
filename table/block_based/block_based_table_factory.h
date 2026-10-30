@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "cache/cache_reservation_manager.h"
 #include "port/port.h"
@@ -28,6 +29,9 @@ class BlockBasedTableBuilder;
 class RandomAccessFileReader;
 class WritableFileWriter;
 
+// TODO: deprecate this class as it can be replaced with
+// `FileMetaData::tail_size`
+//
 // A class used to track actual bytes written from the tail in the recent SST
 // file opens, and provide a suggestion for following open.
 class TailPrefetchStats {
@@ -44,12 +48,12 @@ class TailPrefetchStats {
   size_t num_records_ = 0;
 };
 
+Status ValidateIndexMode(BlockBasedTableOptions::IndexMode index_mode);
+
 class BlockBasedTableFactory : public TableFactory {
  public:
   explicit BlockBasedTableFactory(
       const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
-
-  ~BlockBasedTableFactory() {}
 
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return kBlockBasedTableName(); }
@@ -76,9 +80,19 @@ class BlockBasedTableFactory : public TableFactory {
 
   bool IsDeleteRangeSupported() const override { return true; }
 
-  TailPrefetchStats* tail_prefetch_stats() { return &tail_prefetch_stats_; }
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<BlockBasedTableFactory>(*this);
+  }
+
+  TailPrefetchStats* tail_prefetch_stats() {
+    return &shared_state_->tail_prefetch_stats;
+  }
 
  protected:
+  Status ConfigureOptions(
+      const ConfigOptions& config_options,
+      const std::unordered_map<std::string, std::string>& opts_map,
+      std::unordered_map<std::string, std::string>* unused) override;
   const void* GetOptionsPtr(const std::string& name) const override;
   Status ParseOption(const ConfigOptions& config_options,
                      const OptionTypeInfo& opt_info,
@@ -87,9 +101,17 @@ class BlockBasedTableFactory : public TableFactory {
   void InitializeOptions();
 
  private:
+  void UpdateIndexMode();
+
   BlockBasedTableOptions table_options_;
-  std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr_;
-  mutable TailPrefetchStats tail_prefetch_stats_;
+  bool index_mode_explicit_;
+  bool skip_standard_index_ = false;
+  // Share some state among cloned instances
+  struct SharedState {
+    std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr;
+    TailPrefetchStats tail_prefetch_stats;
+  };
+  std::shared_ptr<SharedState> shared_state_;
 };
 
 extern const std::string kHashIndexPrefixesBlock;

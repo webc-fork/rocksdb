@@ -5,8 +5,7 @@
 //
 #include "utilities/persistent_cache/hash_table.h"
 
-#include <stdlib.h>
-
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <string>
@@ -17,14 +16,13 @@
 #include "util/random.h"
 #include "utilities/persistent_cache/hash_table_evictable.h"
 
-
 namespace ROCKSDB_NAMESPACE {
 
 struct HashTableTest : public testing::Test {
   ~HashTableTest() override { map_.Clear(&HashTableTest::ClearNode); }
 
   struct Node {
-    Node() {}
+    Node() = default;
     explicit Node(const uint64_t key, const std::string& val = std::string())
         : key_(key), val_(val) {}
 
@@ -55,7 +53,7 @@ struct EvictableHashTableTest : public testing::Test {
   }
 
   struct Node : LRUElement<Node> {
-    Node() {}
+    Node() = default;
     explicit Node(const uint64_t key, const std::string& val = std::string())
         : key_(key), val_(val) {}
 
@@ -134,6 +132,7 @@ TEST_F(HashTableTest, TestErase) {
 }
 
 TEST_F(EvictableHashTableTest, TestEvict) {
+#ifndef __clang_analyzer__
   const uint64_t max_keys = 1024 * 1024;
 
   // insert
@@ -150,6 +149,7 @@ TEST_F(EvictableHashTableTest, TestEvict) {
     assert(val->val_ == std::string(1000, val->key_ % 255));
     delete val;
   }
+#endif  // __clang_analyzer__
 }
 
 }  // namespace ROCKSDB_NAMESPACE

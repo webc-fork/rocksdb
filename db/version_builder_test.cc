@@ -3,19 +3,25 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include "db/version_builder.h"
+
 #include <cstring>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string>
 
+#include "db/db_test_util.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/sst_file_writer.h"
 #include "table/unique_id_impl.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/string_util.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -37,7 +43,10 @@ class VersionBuilderTest : public testing::Test {
         ioptions_(options_),
         mutable_cf_options_(options_),
         vstorage_(&icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
-                  nullptr, false),
+                  nullptr, false, EpochNumberRequirement::kMustPresent,
+                  ioptions_.clock, options_.bottommost_file_compaction_delay,
+                  OffpeakTimeOption(options_.daily_offpeak_time_utc),
+                  PeriodicCompactionPhaseParams{}),
         file_num_(1) {
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
     size_being_compacted_.resize(options_.num_levels);
@@ -71,9 +80,11 @@ class VersionBuilderTest : public testing::Test {
         file_number, path_id, file_size, GetInternalKey(smallest, smallest_seq),
         GetInternalKey(largest, largest_seq), smallest_seqno, largest_seqno,
         /* marked_for_compact */ false, Temperature::kUnknown,
-        oldest_blob_file_number, kUnknownOldestAncesterTime,
+        oldest_blob_file_number, kUnknownOldestAncestorTime,
         kUnknownFileCreationTime, epoch_number, kUnknownFileChecksum,
-        kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+        kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+        /* user_defined_timestamps_persisted */ true, /* min timestamp */ "",
+        /* max timestamp */ "");
     f->compensated_file_size = file_size;
     f->num_entries = num_entries;
     f->num_deletions = num_deletions;
@@ -130,13 +141,13 @@ class VersionBuilderTest : public testing::Test {
     constexpr SequenceNumber largest_seqno = 300;
     constexpr bool marked_for_compaction = false;
 
-    edit->AddFile(level, table_file_number, path_id, file_size,
-                  GetInternalKey(smallest), GetInternalKey(largest),
-                  smallest_seqno, largest_seqno, marked_for_compaction,
-                  Temperature::kUnknown, blob_file_number,
-                  kUnknownOldestAncesterTime, kUnknownFileCreationTime,
-                  epoch_number, kUnknownFileChecksum,
-                  kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+    edit->AddFile(
+        level, table_file_number, path_id, file_size, GetInternalKey(smallest),
+        GetInternalKey(largest), smallest_seqno, largest_seqno,
+        marked_for_compaction, Temperature::kUnknown, blob_file_number,
+        kUnknownOldestAncestorTime, kUnknownFileCreationTime, epoch_number,
+        kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+        0, 0, /* user_defined_timestamps_persisted */ true);
   }
 
   void UpdateVersionStorageInfo(VersionStorageInfo* vstorage) {
@@ -148,6 +159,123 @@ class VersionBuilderTest : public testing::Test {
 
   void UpdateVersionStorageInfo() { UpdateVersionStorageInfo(&vstorage_); }
 };
+
+class VersionBuilderDBTest : public DBTestBase {
+ public:
+  VersionBuilderDBTest()
+      : DBTestBase("version_builder_db_test", /*env_do_fsync=*/false) {}
+};
+
+// Regression test: when LogAndApply fails after VersionBuilder pinned a
+// table reader for a newly-added file (via LoadTableHandlers), the table
+// cache entry must be evicted by VersionBuilder::UnrefFile when the
+// FileMetaData is destroyed.
+//
+// This test faithfully reproduces the crash-test failure mode
+// ("File N is not live nor quarantined" from TEST_VerifyNoObsoleteFilesCached
+// inside Close on ASAN):
+//
+//   1. IngestExternalFile submits an AddFile edit through LogAndApply.
+//   2. LoadTableHandlers inside ProcessManifestWrites pins a table reader
+//      for the new file, creating a table cache entry.
+//   3. SyncManifest fails (fault injected). The error handler adds the
+//      ingested file to its quarantine list.
+//   4. A subsequent successful LogAndApply (via manual Resume() and then
+//      Flush) clears the quarantine (version_set.cc:
+//      `ClearFilesToQuarantine`).
+//   5. Metadata read fault injection prevents FindObsoleteFiles from
+//      scanning the directory, so the on-disk orphan is not discovered.
+//   6. On DB Close, TEST_VerifyNoObsoleteFilesCached iterates the table
+//      cache and finds an entry for a file that is neither live nor
+//      quarantined -> assertion fires (without the fix).
+//
+// The IngestExternalFile path issues a few no-op manifest writes before
+// the actual AddFile edit; we arm the injection only after
+// LoadTableHandlers has actually pinned a reader for the ingested file.
+TEST_F(VersionBuilderDBTest,
+       IngestExternalFileEvictsTableCacheOnLogAndApplyFailure) {
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> fault_env(NewCompositeEnv(fault_fs));
+
+  Options options = CurrentOptions();
+  options.env = fault_env.get();
+  options.disable_auto_compactions = true;
+  // Disable auto-recovery so recovery runs synchronously via our explicit
+  // Resume() call -- no background thread to race with test teardown.
+  options.max_bgerror_resume_count = 0;
+  options.paranoid_file_checks = true;
+  DestroyAndReopen(options);
+  // RAII: ensure the DB is closed before fault_env goes out of scope,
+  // even if an ASSERT_* below early-returns.
+  Defer closer([this]() { Close(); });
+
+  // Seed the memtable with data so a subsequent Flush actually produces a
+  // successful LogAndApply (and thus clears the quarantine).
+  ASSERT_OK(Put("k1", "v1"));
+
+  // Build an external SST through the public SstFileWriter API.
+  const std::string ext_file = dbname_ + "/ingest_me.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(ext_file));
+  ASSERT_OK(writer.Put("k2", "v2"));
+  ExternalSstFileInfo file_info;
+  ASSERT_OK(writer.Finish(&file_info));
+
+  // Arm the injection only once we have observed VersionBuilder actually
+  // pin a table reader for the ingested file (i.e. after FindTable runs).
+  std::atomic<bool> injection_armed{false};
+  std::atomic<bool> injected_once{false};
+  SyncPoint::GetInstance()->SetCallBack("TableCache::FindTable:0",
+                                        [&](void*) { injection_armed = true; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+        if (!injection_armed.load()) {
+          return;
+        }
+        if (injected_once.exchange(true)) {
+          return;
+        }
+        auto* ptr = static_cast<IOStatus*>(arg);
+        assert(ptr);
+        *ptr = IOStatus::IOError("injected");
+        // Retryable IOError -> soft error, recoverable via Resume().
+        ptr->SetRetryable(true);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  IngestExternalFileOptions ifo;
+  Status s = db_->IngestExternalFile({ext_file}, ifo);
+  ASSERT_NOK(s);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  // Manual synchronous recovery: clear the soft bg error, then do a
+  // successful LogAndApply (via Flush) which triggers
+  // ClearFilesToQuarantine (version_set.cc line ~6591). This puts the
+  // ingested file into the "not live nor quarantined" state.
+  ASSERT_OK(dbfull()->Resume());
+  ASSERT_OK(Flush());
+
+  // Prevent the FindObsoleteFiles full-directory scan from finding the
+  // orphan on disk. Mirrors the crash test's open_metadata_read_fault_one_in.
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataRead, /*seed=*/0, /*one_in=*/1,
+      /*retryable=*/false, /*has_data_loss=*/false);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataRead);
+  Defer disable_fault([&] {
+    fault_fs->DisableThreadLocalErrorInjection(
+        FaultInjectionIOType::kMetadataRead);
+  });
+
+  // The RAII Defer above will run Close() on scope exit. Close's
+  // TEST_VerifyNoObsoleteFilesCached (active on ASAN) iterates the table
+  // cache. Without the D99759696 fix, an entry for the ingested file
+  // remains -- a file that is neither live nor quarantined -- and the
+  // assertion fires. With the fix, VersionBuilder::UnrefFile evicts the
+  // entry when the discarded FileMetaData is destroyed.
+}
 
 void UnrefFilesInVersion(VersionStorageInfo* new_vstorage) {
   for (int i = 0; i < new_vstorage->num_levels(); i++) {
@@ -186,8 +314,9 @@ TEST_F(VersionBuilderTest, ApplyAndSaveTo) {
   version_edit.AddFile(
       2, 666, 0, 100U, GetInternalKey("301"), GetInternalKey("350"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.DeleteFile(3, 27U);
 
   EnvOptions env_options;
@@ -197,8 +326,11 @@ TEST_F(VersionBuilderTest, ApplyAndSaveTo) {
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
 
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr, false);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_OK(version_builder.Apply(&version_edit));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
 
@@ -233,8 +365,9 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic) {
   version_edit.AddFile(
       3, 666, 0, 100U, GetInternalKey("301"), GetInternalKey("350"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   version_edit.DeleteFile(0, 1U);
   version_edit.DeleteFile(0, 88U);
@@ -246,8 +379,11 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic) {
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
 
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr, false);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_OK(version_builder.Apply(&version_edit));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
 
@@ -284,8 +420,9 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic2) {
   version_edit.AddFile(
       4, 666, 0, 100U, GetInternalKey("301"), GetInternalKey("350"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.DeleteFile(0, 1U);
   version_edit.DeleteFile(0, 88U);
   version_edit.DeleteFile(4, 6U);
@@ -299,8 +436,11 @@ TEST_F(VersionBuilderTest, ApplyAndSaveToDynamic2) {
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
 
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr, false);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_OK(version_builder.Apply(&version_edit));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
 
@@ -320,28 +460,33 @@ TEST_F(VersionBuilderTest, ApplyMultipleAndSaveTo) {
   version_edit.AddFile(
       2, 666, 0, 100U, GetInternalKey("301"), GetInternalKey("350"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 676, 0, 100U, GetInternalKey("401"), GetInternalKey("450"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 636, 0, 100U, GetInternalKey("601"), GetInternalKey("650"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 616, 0, 100U, GetInternalKey("501"), GetInternalKey("550"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 606, 0, 100U, GetInternalKey("701"), GetInternalKey("750"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   EnvOptions env_options;
   constexpr TableCache* table_cache = nullptr;
@@ -350,8 +495,11 @@ TEST_F(VersionBuilderTest, ApplyMultipleAndSaveTo) {
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
 
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr, false);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_OK(version_builder.Apply(&version_edit));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
 
@@ -372,50 +520,60 @@ TEST_F(VersionBuilderTest, ApplyDeleteAndSaveTo) {
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
 
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr, false);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr, false,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   VersionEdit version_edit;
   version_edit.AddFile(
       2, 666, 0, 100U, GetInternalKey("301"), GetInternalKey("350"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 676, 0, 100U, GetInternalKey("401"), GetInternalKey("450"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 636, 0, 100U, GetInternalKey("601"), GetInternalKey("650"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 616, 0, 100U, GetInternalKey("501"), GetInternalKey("550"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit.AddFile(
       2, 606, 0, 100U, GetInternalKey("701"), GetInternalKey("750"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   ASSERT_OK(version_builder.Apply(&version_edit));
 
   VersionEdit version_edit2;
   version_edit.AddFile(
       2, 808, 0, 100U, GetInternalKey("901"), GetInternalKey("950"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
   version_edit2.DeleteFile(2, 616);
   version_edit2.DeleteFile(2, 636);
   version_edit.AddFile(
       2, 806, 0, 100U, GetInternalKey("801"), GetInternalKey("850"), 200, 200,
       false, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   ASSERT_OK(version_builder.Apply(&version_edit2));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
@@ -525,15 +683,18 @@ TEST_F(VersionBuilderTest, ApplyFileDeletionAndAddition) {
       GetInternalKey(smallest, smallest_seq),
       GetInternalKey(largest, largest_seq), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   ASSERT_OK(builder.Apply(&addition));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -574,8 +735,9 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAlreadyInBase) {
       new_level, file_number, path_id, file_size, GetInternalKey(smallest),
       GetInternalKey(largest), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   const Status s = builder.Apply(&edit);
   ASSERT_TRUE(s.IsCorruption());
@@ -610,8 +772,9 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAlreadyApplied) {
       level, file_number, path_id, file_size, GetInternalKey(smallest),
       GetInternalKey(largest), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   ASSERT_OK(builder.Apply(&edit));
 
@@ -623,8 +786,9 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAlreadyApplied) {
       new_level, file_number, path_id, file_size, GetInternalKey(smallest),
       GetInternalKey(largest), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   const Status s = builder.Apply(&other_edit);
   ASSERT_TRUE(s.IsCorruption());
@@ -659,8 +823,9 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAndDeletion) {
       level, file_number, path_id, file_size, GetInternalKey(smallest),
       GetInternalKey(largest), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, kUnknownEpochNumber,
-      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, kUnknownEpochNumber,
+      kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0,
+      0, /* user_defined_timestamps_persisted */ true);
 
   ASSERT_OK(builder.Apply(&addition));
 
@@ -671,9 +836,11 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAndDeletion) {
   ASSERT_OK(builder.Apply(&deletion));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -715,9 +882,11 @@ TEST_F(VersionBuilderTest, ApplyBlobFileAddition) {
   ASSERT_OK(builder.Apply(&edit));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -854,9 +1023,11 @@ TEST_F(VersionBuilderTest, ApplyBlobFileGarbageFileInBase) {
   ASSERT_OK(builder.Apply(&edit));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -927,9 +1098,11 @@ TEST_F(VersionBuilderTest, ApplyBlobFileGarbageFileAdditionApplied) {
   ASSERT_OK(builder.Apply(&garbage));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -1107,9 +1280,11 @@ TEST_F(VersionBuilderTest, SaveBlobFilesTo) {
   ASSERT_OK(builder.Apply(&edit));
 
   constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -1155,23 +1330,49 @@ TEST_F(VersionBuilderTest, SaveBlobFilesTo) {
 
   ASSERT_OK(second_builder.Apply(&second_edit));
 
-  VersionStorageInfo newer_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                    kCompactionStyleLevel, &new_vstorage,
-                                    force_consistency_checks);
+  VersionStorageInfo new_vstorage_2(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &new_vstorage,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
-  ASSERT_OK(second_builder.SaveTo(&newer_vstorage));
+  ASSERT_OK(second_builder.SaveTo(&new_vstorage_2));
 
-  UpdateVersionStorageInfo(&newer_vstorage);
+  UpdateVersionStorageInfo(&new_vstorage_2);
 
-  const auto& newer_blob_files = newer_vstorage.GetBlobFiles();
+  const auto& newer_blob_files = new_vstorage_2.GetBlobFiles();
   ASSERT_EQ(newer_blob_files.size(), 2);
 
   const auto newer_meta3 =
-      newer_vstorage.GetBlobFileMetaData(/* blob_file_number */ 3);
+      new_vstorage_2.GetBlobFileMetaData(/* blob_file_number */ 3);
 
   ASSERT_EQ(newer_meta3, nullptr);
 
-  UnrefFilesInVersion(&newer_vstorage);
+  // Blob file #5 is referenced by table file #4, and blob file #9 is
+  // unreferenced. After deleting table file #4, all blob files will become
+  // unreferenced and will therefore be obsolete.
+  VersionBuilder third_builder(env_options, &ioptions_, table_cache,
+                               &new_vstorage_2, version_set);
+  VersionEdit third_edit;
+  third_edit.DeleteFile(/* level */ 0, /* file_number */ 4);
+
+  ASSERT_OK(third_builder.Apply(&third_edit));
+
+  VersionStorageInfo new_vstorage_3(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
+      &new_vstorage_2, force_consistency_checks,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
+
+  ASSERT_OK(third_builder.SaveTo(&new_vstorage_3));
+
+  UpdateVersionStorageInfo(&new_vstorage_3);
+
+  ASSERT_TRUE(new_vstorage_3.GetBlobFiles().empty());
+
+  UnrefFilesInVersion(&new_vstorage_3);
+  UnrefFilesInVersion(&new_vstorage_2);
   UnrefFilesInVersion(&new_vstorage);
 }
 
@@ -1232,17 +1433,20 @@ TEST_F(VersionBuilderTest, SaveBlobFilesToConcurrentJobs) {
       level, table_file_number, path_id, file_size, GetInternalKey(smallest),
       GetInternalKey(largest), smallest_seqno, largest_seqno,
       marked_for_compaction, Temperature::kUnknown, blob_file_number,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime, 2 /*epoch_number*/,
-      checksum_value, checksum_method, kNullUniqueId64x2, 0);
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime, 2 /*epoch_number*/,
+      checksum_value, checksum_method, kNullUniqueId64x2, 0, 0,
+      /* user_defined_timestamps_persisted */ true);
   edit.AddBlobFile(blob_file_number, total_blob_count, total_blob_bytes,
                    checksum_method, checksum_value);
 
   ASSERT_OK(builder.Apply(&edit));
 
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -1318,20 +1522,22 @@ TEST_F(VersionBuilderTest, CheckConsistencyForBlobFiles) {
                /* largest */ GetInternalKey("750"), /* smallest_seqno */ 200,
                /* largest_seqno */ 200, /* marked_for_compaction */ false,
                Temperature::kUnknown,
-               /* oldest_blob_file_number */ 16, kUnknownOldestAncesterTime,
+               /* oldest_blob_file_number */ 16, kUnknownOldestAncestorTime,
                kUnknownFileCreationTime, kUnknownEpochNumber,
                kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-               kNullUniqueId64x2, 0);
+               kNullUniqueId64x2, 0, 0,
+               /* user_defined_timestamps_persisted */ true);
 
   edit.AddFile(/* level */ 1, /* file_number */ 700, /* path_id */ 0,
                /* file_size */ 100, /* smallest */ GetInternalKey("801"),
                /* largest */ GetInternalKey("850"), /* smallest_seqno */ 200,
                /* largest_seqno */ 200, /* marked_for_compaction */ false,
                Temperature::kUnknown,
-               /* oldest_blob_file_number */ 1000, kUnknownOldestAncesterTime,
+               /* oldest_blob_file_number */ 1000, kUnknownOldestAncestorTime,
                kUnknownFileCreationTime, kUnknownEpochNumber,
                kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-               kNullUniqueId64x2, 0);
+               kNullUniqueId64x2, 0, 0,
+               /* user_defined_timestamps_persisted */ true);
   edit.AddBlobFile(/* blob_file_number */ 1000, /* total_blob_count */ 2000,
                    /* total_blob_bytes */ 200000,
                    /* checksum_method */ std::string(),
@@ -1341,9 +1547,11 @@ TEST_F(VersionBuilderTest, CheckConsistencyForBlobFiles) {
 
   // Save to a new version in order to trigger consistency checks.
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -1380,9 +1588,11 @@ TEST_F(VersionBuilderTest, CheckConsistencyForBlobFilesInconsistentLinks) {
 
   // Save to a new version in order to trigger consistency checks.
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   const Status s = builder.SaveTo(&new_vstorage);
   ASSERT_TRUE(s.IsCorruption());
@@ -1421,9 +1631,11 @@ TEST_F(VersionBuilderTest, CheckConsistencyForBlobFilesAllGarbage) {
 
   // Save to a new version in order to trigger consistency checks.
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   const Status s = builder.SaveTo(&new_vstorage);
   ASSERT_TRUE(s.IsCorruption());
@@ -1470,9 +1682,11 @@ TEST_F(VersionBuilderTest, CheckConsistencyForBlobFilesAllGarbageLinkedSsts) {
 
   // Save to a new version in order to trigger consistency checks.
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   const Status s = builder.SaveTo(&new_vstorage);
   ASSERT_TRUE(s.IsCorruption());
@@ -1550,9 +1764,10 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
       /* largest */ GetInternalKey("21", 2100), /* smallest_seqno */ 2100,
       /* largest_seqno */ 2100, /* marked_for_compaction */ false,
       Temperature::kUnknown,
-      /* oldest_blob_file_number */ 1, kUnknownOldestAncesterTime,
+      /* oldest_blob_file_number */ 1, kUnknownOldestAncestorTime,
       kUnknownFileCreationTime, kUnknownEpochNumber, kUnknownFileChecksum,
-      kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+      /* user_defined_timestamps_persisted */ true);
 
   // Add an SST that does not reference any blob files.
   edit.AddFile(
@@ -1560,9 +1775,10 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
       /* file_size */ 100, /* smallest */ GetInternalKey("22", 2200),
       /* largest */ GetInternalKey("22", 2200), /* smallest_seqno */ 2200,
       /* largest_seqno */ 2200, /* marked_for_compaction */ false,
-      Temperature::kUnknown, kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+      Temperature::kUnknown, kInvalidBlobFileNumber, kUnknownOldestAncestorTime,
       kUnknownFileCreationTime, kUnknownEpochNumber, kUnknownFileChecksum,
-      kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+      kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+      /* user_defined_timestamps_persisted */ true);
 
   // Delete a file that references a blob file.
   edit.DeleteFile(/* level */ 1, /* file_number */ 6);
@@ -1582,10 +1798,11 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
                /* smallest_seqno */ 300,
                /* largest_seqno */ 300, /* marked_for_compaction */ false,
                Temperature::kUnknown,
-               /* oldest_blob_file_number */ 3, kUnknownOldestAncesterTime,
+               /* oldest_blob_file_number */ 3, kUnknownOldestAncestorTime,
                kUnknownFileCreationTime, kUnknownEpochNumber,
                kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-               kNullUniqueId64x2, 0);
+               kNullUniqueId64x2, 0, 0,
+               /* user_defined_timestamps_persisted */ true);
 
   // Trivially move a file that does not reference any blob files.
   edit.DeleteFile(/* level */ 1, /* file_number */ 13);
@@ -1595,9 +1812,10 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
                /* smallest_seqno */ 1300,
                /* largest_seqno */ 1300, /* marked_for_compaction */ false,
                Temperature::kUnknown, kInvalidBlobFileNumber,
-               kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+               kUnknownOldestAncestorTime, kUnknownFileCreationTime,
                kUnknownEpochNumber, kUnknownFileChecksum,
-               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0);
+               kUnknownFileChecksumFuncName, kNullUniqueId64x2, 0, 0,
+               /* user_defined_timestamps_persisted */ true);
 
   // Add one more SST file that references a blob file, then promptly
   // delete it in a second version edit before the new version gets saved.
@@ -1608,10 +1826,11 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
                /* smallest_seqno */ 2300,
                /* largest_seqno */ 2300, /* marked_for_compaction */ false,
                Temperature::kUnknown,
-               /* oldest_blob_file_number */ 5, kUnknownOldestAncesterTime,
+               /* oldest_blob_file_number */ 5, kUnknownOldestAncestorTime,
                kUnknownFileCreationTime, kUnknownEpochNumber,
                kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-               kNullUniqueId64x2, 0);
+               kNullUniqueId64x2, 0, 0,
+               /* user_defined_timestamps_persisted */ true);
 
   VersionEdit edit2;
 
@@ -1628,9 +1847,11 @@ TEST_F(VersionBuilderTest, MaintainLinkedSstsForBlobFiles) {
   ASSERT_OK(builder.Apply(&edit2));
 
   constexpr bool force_consistency_checks = true;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, &vstorage_,
+      force_consistency_checks, EpochNumberRequirement::kMightMissing, nullptr,
+      0, OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(builder.SaveTo(&new_vstorage));
 
@@ -1679,9 +1900,12 @@ TEST_F(VersionBuilderTest, CheckConsistencyForFileDeletedTwice) {
 
   VersionBuilder version_builder(env_options, &ioptions_, table_cache,
                                  &vstorage_, version_set);
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, nullptr,
-                                  true /* force_consistency_checks */);
+  VersionStorageInfo new_vstorage(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr,
+      true /* force_consistency_checks */,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_OK(version_builder.Apply(&version_edit));
   ASSERT_OK(version_builder.SaveTo(&new_vstorage));
 
@@ -1689,9 +1913,12 @@ TEST_F(VersionBuilderTest, CheckConsistencyForFileDeletedTwice) {
 
   VersionBuilder version_builder2(env_options, &ioptions_, table_cache,
                                   &new_vstorage, version_set);
-  VersionStorageInfo new_vstorage2(&icmp_, ucmp_, options_.num_levels,
-                                   kCompactionStyleLevel, nullptr,
-                                   true /* force_consistency_checks */);
+  VersionStorageInfo new_vstorage2(
+      &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel, nullptr,
+      true /* force_consistency_checks */,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
   ASSERT_NOK(version_builder2.Apply(&version_edit));
 
   UnrefFilesInVersion(&new_vstorage);
@@ -1710,9 +1937,9 @@ TEST_F(VersionBuilderTest, CheckConsistencyForL0FilesSortedByEpochNumber) {
       /* largest_seqno */ 3, /* marked_for_compaction */ false,
       Temperature::kUnknown,
       /* oldest_blob_file_number */ kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
       1 /* epoch_number */, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-      kNullUniqueId64x2, 0);
+      kNullUniqueId64x2, 0, 0, /* user_defined_timestamps_persisted */ true);
   version_edit_1.AddFile(
       /* level */ 0, /* file_number */ 2U, /* path_id */ 0,
       /* file_size */ 100, /* smallest */ GetInternalKey("b", 2),
@@ -1720,16 +1947,19 @@ TEST_F(VersionBuilderTest, CheckConsistencyForL0FilesSortedByEpochNumber) {
       /* largest_seqno */ 4, /* marked_for_compaction */ false,
       Temperature::kUnknown,
       /* oldest_blob_file_number */ kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
       1 /* epoch_number */, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-      kNullUniqueId64x2, 0);
+      kNullUniqueId64x2, 0, 0, /* user_defined_timestamps_persisted */ true);
 
   VersionBuilder version_builder_1(EnvOptions(), &ioptions_,
                                    nullptr /* table_cache */, &vstorage_,
                                    nullptr /* file_metadata_cache_res_mgr */);
   VersionStorageInfo new_vstorage_1(
       &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
-      nullptr /* src_vstorage */, true /* force_consistency_checks */);
+      nullptr /* src_vstorage */, true /* force_consistency_checks */,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(version_builder_1.Apply(&version_edit_1));
   s = version_builder_1.SaveTo(&new_vstorage_1);
@@ -1747,9 +1977,9 @@ TEST_F(VersionBuilderTest, CheckConsistencyForL0FilesSortedByEpochNumber) {
       /* largest_seqno */ 1, /* marked_for_compaction */ false,
       Temperature::kUnknown,
       /* oldest_blob_file_number */ kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
       1 /* epoch_number */, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-      kNullUniqueId64x2, 0);
+      kNullUniqueId64x2, 0, 0, /* user_defined_timestamps_persisted */ true);
   version_edit_2.AddFile(
       /* level */ 0, /* file_number */ 2U, /* path_id */ 0,
       /* file_size */ 100, /* smallest */ GetInternalKey("b", 2),
@@ -1757,16 +1987,19 @@ TEST_F(VersionBuilderTest, CheckConsistencyForL0FilesSortedByEpochNumber) {
       /* largest_seqno */ 2, /* marked_for_compaction */ false,
       Temperature::kUnknown,
       /* oldest_blob_file_number */ kInvalidBlobFileNumber,
-      kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+      kUnknownOldestAncestorTime, kUnknownFileCreationTime,
       2 /* epoch_number */, kUnknownFileChecksum, kUnknownFileChecksumFuncName,
-      kNullUniqueId64x2, 0);
+      kNullUniqueId64x2, 0, 0, /* user_defined_timestamps_persisted */ true);
 
   VersionBuilder version_builder_2(EnvOptions(), &ioptions_,
                                    nullptr /* table_cache */, &vstorage_,
                                    nullptr /* file_metadata_cache_res_mgr */);
   VersionStorageInfo new_vstorage_2(
       &icmp_, ucmp_, options_.num_levels, kCompactionStyleLevel,
-      nullptr /* src_vstorage */, true /* force_consistency_checks */);
+      nullptr /* src_vstorage */, true /* force_consistency_checks */,
+      EpochNumberRequirement::kMightMissing, nullptr, 0,
+      OffpeakTimeOption(options_.daily_offpeak_time_utc),
+      PeriodicCompactionPhaseParams{});
 
   ASSERT_OK(version_builder_2.Apply(&version_edit_2));
   s = version_builder_2.SaveTo(&new_vstorage_2);

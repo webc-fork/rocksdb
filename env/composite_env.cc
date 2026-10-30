@@ -100,6 +100,10 @@ class CompositeRandomAccessFileWrapper : public RandomAccessFile {
     return target_->InvalidateCache(offset, length);
   }
 
+  Status GetFileSize(uint64_t* size) override {
+    return target_->GetFileSize(size);
+  }
+
  private:
   std::unique_ptr<FSRandomAccessFile> target_;
 };
@@ -504,7 +508,7 @@ EnvWrapper::EnvWrapper(const std::shared_ptr<Env>& t) : target_(t) {
   RegisterOptions("", &target_, &env_wrapper_type_info);
 }
 
-EnvWrapper::~EnvWrapper() {}
+EnvWrapper::~EnvWrapper() = default;
 
 Status EnvWrapper::PrepareOptions(const ConfigOptions& options) {
   target_.Prepare();

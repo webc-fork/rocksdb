@@ -8,18 +8,23 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <memory>
+#include <unordered_map>
 
+#include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/db_test_util.h"
 #include "db/memtable.h"
+#include "db/wide/wide_column_serialization.h"
+#include "db/wide/wide_columns_helper.h"
 #include "db/write_batch_internal.h"
+#include "dbformat.h"
+#include "port/mmap.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "rocksdb/write_buffer_manager.h"
-#include "table/scoped_arena_iterator.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
 #include "util/string_util.h"
@@ -38,7 +43,8 @@ static std::string PrintContents(WriteBatch* b,
   ImmutableOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);
   MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
-                               kMaxSequenceNumber, 0 /* column_family_id */);
+                               kMaxSequenceNumber, 0 /* column_family_id */,
+                               nullptr /* flush_initiator */);
   mem->Ref();
   std::string state;
   ColumnFamilyMemTablesDefault cf_mems_default(mem);
@@ -46,18 +52,21 @@ static std::string PrintContents(WriteBatch* b,
       WriteBatchInternal::InsertInto(b, &cf_mems_default, nullptr, nullptr);
   uint32_t count = 0;
   int put_count = 0;
+  int timed_put_count = 0;
   int delete_count = 0;
   int single_delete_count = 0;
   int delete_range_count = 0;
   int merge_count = 0;
   for (int i = 0; i < 2; ++i) {
     Arena arena;
-    ScopedArenaIterator arena_iter_guard;
+    ScopedArenaPtr<InternalIterator> arena_iter_guard;
     std::unique_ptr<InternalIterator> iter_guard;
     InternalIterator* iter;
     if (i == 0) {
-      iter = mem->NewIterator(ReadOptions(), &arena);
-      arena_iter_guard.set(iter);
+      iter = mem->NewIterator(ReadOptions(), /*seqno_to_time_mapping=*/nullptr,
+                              &arena, /*prefix_extractor=*/nullptr,
+                              /*for_flush=*/false);
+      arena_iter_guard.reset(iter);
     } else {
       iter = mem->NewRangeTombstoneIterator(ReadOptions(),
                                             kMaxSequenceNumber /* read_seq */,
@@ -114,6 +123,20 @@ static std::string PrintContents(WriteBatch* b,
           count++;
           merge_count++;
           break;
+        case kTypeValuePreferredSeqno: {
+          state.append("TimedPut(");
+          state.append(ikey.user_key.ToString());
+          state.append(", ");
+          auto [unpacked_value, unix_write_time] =
+              ParsePackedValueWithWriteTime(iter->value());
+          state.append(unpacked_value.ToString());
+          state.append(", ");
+          state.append(std::to_string(unix_write_time));
+          state.append(")");
+          count++;
+          timed_put_count++;
+          break;
+        }
         default:
           assert(false);
           break;
@@ -125,6 +148,7 @@ static std::string PrintContents(WriteBatch* b,
   }
   if (s.ok()) {
     EXPECT_EQ(b->HasPut(), put_count > 0);
+    EXPECT_EQ(b->HasTimedPut(), timed_put_count > 0);
     EXPECT_EQ(b->HasDelete(), delete_count > 0);
     EXPECT_EQ(b->HasSingleDelete(), single_delete_count > 0);
     EXPECT_EQ(b->HasDeleteRange(), delete_range_count > 0);
@@ -181,7 +205,8 @@ TEST_F(WriteBatchTest, Corruption) {
 }
 
 TEST_F(WriteBatchTest, Append) {
-  WriteBatch b1, b2;
+  WriteBatch b1;
+  WriteBatch b2;
   WriteBatchInternal::SetSequence(&b1, 200);
   WriteBatchInternal::SetSequence(&b2, 300);
   ASSERT_OK(WriteBatchInternal::Append(&b1, &b2));
@@ -247,6 +272,22 @@ TEST_F(WriteBatchTest, SingleDeletion) {
   ASSERT_EQ(2u, batch.Count());
 }
 
+TEST_F(WriteBatchTest, OwnershipTransfer) {
+  Random rnd(301);
+  WriteBatch put_batch;
+  ASSERT_OK(put_batch.Put(rnd.RandomString(16) /* key */,
+                          rnd.RandomString(1024) /* value */));
+
+  // (1) Verify `Release()` transfers string data ownership
+  const char* expected_data = put_batch.Data().data();
+  std::string batch_str = put_batch.Release();
+  ASSERT_EQ(expected_data, batch_str.data());
+
+  // (2) Verify constructor transfers string data ownership
+  WriteBatch move_batch(std::move(batch_str));
+  ASSERT_EQ(expected_data, move_batch.Data().data());
+}
+
 namespace {
 struct TestHandler : public WriteBatch::Handler {
   std::string seen;
@@ -257,6 +298,33 @@ struct TestHandler : public WriteBatch::Handler {
     } else {
       seen += "PutCF(" + std::to_string(column_family_id) + ", " +
               key.ToString() + ", " + value.ToString() + ")";
+    }
+    return Status::OK();
+  }
+  Status TimedPutCF(uint32_t column_family_id, const Slice& key,
+                    const Slice& value, uint64_t unix_write_time) override {
+    if (column_family_id == 0) {
+      seen += "TimedPut(" + key.ToString() + ", " + value.ToString() + ", " +
+              std::to_string(unix_write_time) + ")";
+    } else {
+      seen += "TimedPutCF(" + std::to_string(column_family_id) + ", " +
+              key.ToString() + ", " + value.ToString() + ", " +
+              std::to_string(unix_write_time) + ")";
+    }
+    return Status::OK();
+  }
+  Status PutEntityCF(uint32_t column_family_id, const Slice& key,
+                     const Slice& entity) override {
+    std::ostringstream oss;
+    Status s = WideColumnsHelper::DumpSliceAsWideColumns(entity, oss, false);
+    if (!s.ok()) {
+      return s;
+    }
+    if (column_family_id == 0) {
+      seen += "PutEntity(" + key.ToString() + ", " + oss.str() + ")";
+    } else {
+      seen += "PutEntityCF(" + std::to_string(column_family_id) + ", " +
+              key.ToString() + ", " + oss.str() + ")";
     }
     return Status::OK();
   }
@@ -329,6 +397,68 @@ struct TestHandler : public WriteBatch::Handler {
     return Status::OK();
   }
 };
+
+struct ReplayUntilCountHandler : public WriteBatch::Handler {
+  explicit ReplayUntilCountHandler(uint32_t max_write_ops)
+      : max_write_ops_(max_write_ops) {}
+
+  bool Continue() override { return num_write_ops_ < max_write_ops_; }
+
+  Status PutCF(uint32_t column_family_id, const Slice& key,
+               const Slice& value) override {
+    if (buffered_writes_) {
+      return WriteBatchInternal::Put(buffered_writes_.get(), column_family_id,
+                                     key, value);
+    }
+    seen += "Put(" + key.ToString() + ", " + value.ToString() + ")";
+    ++num_write_ops_;
+    return Status::OK();
+  }
+
+  Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
+    if (buffered_writes_) {
+      return WriteBatchInternal::Delete(buffered_writes_.get(),
+                                        column_family_id, key);
+    }
+    seen += "Delete(" + key.ToString() + ")";
+    ++num_write_ops_;
+    return Status::OK();
+  }
+
+  Status MarkBeginPrepare(bool /* unprepare */) override {
+    assert(!buffered_writes_);
+    buffered_writes_ = std::make_unique<WriteBatch>();
+    return Status::OK();
+  }
+
+  Status MarkEndPrepare(const Slice& xid) override {
+    assert(buffered_writes_);
+    prepared_writes_[xid.ToString()] = std::move(buffered_writes_);
+    return Status::OK();
+  }
+
+  Status MarkNoop(bool /* empty_batch */) override { return Status::OK(); }
+
+  Status MarkCommit(const Slice& xid) override {
+    auto it = prepared_writes_.find(xid.ToString());
+    if (it == prepared_writes_.end() || !it->second) {
+      return Status::Corruption("Missing prepared batch for commit");
+    }
+    Status s = it->second->Iterate(this);
+    prepared_writes_.erase(it);
+    return s;
+  }
+
+  uint32_t NumWriteOps() const { return num_write_ops_; }
+
+  std::string seen;
+
+ private:
+  const uint32_t max_write_ops_;
+  uint32_t num_write_ops_ = 0;
+  std::unordered_map<std::string, std::unique_ptr<WriteBatch>> prepared_writes_;
+  std::unique_ptr<WriteBatch> buffered_writes_;
+};
 }  // anonymous namespace
 
 TEST_F(WriteBatchTest, PutNotImplemented) {
@@ -339,6 +469,24 @@ TEST_F(WriteBatchTest, PutNotImplemented) {
 
   WriteBatch::Handler handler;
   ASSERT_OK(batch.Iterate(&handler));
+}
+
+TEST_F(WriteBatchTest, TimedPutNotImplemented) {
+  WriteBatch batch;
+  ASSERT_OK(
+      batch.TimedPut(0, Slice("k1"), Slice("v1"), /*write_unix_time=*/30));
+  ASSERT_EQ(1u, batch.Count());
+  ASSERT_EQ("TimedPut(k1, v1, 30)@0", PrintContents(&batch));
+
+  WriteBatch::Handler handler;
+  ASSERT_TRUE(batch.Iterate(&handler).IsInvalidArgument());
+
+  batch.Clear();
+  ASSERT_OK(
+      batch.TimedPut(0, Slice("k1"), Slice("v1"),
+                     /*write_unix_time=*/std::numeric_limits<uint64_t>::max()));
+  ASSERT_EQ(1u, batch.Count());
+  ASSERT_EQ("Put(k1, v1)@0", PrintContents(&batch));
 }
 
 TEST_F(WriteBatchTest, DeleteNotImplemented) {
@@ -438,6 +586,39 @@ TEST_F(WriteBatchTest, PrepareCommit) {
       "MarkCommit(xid1)"
       "MarkRollback(xid1)",
       handler.seen);
+}
+
+// Expected-state restore can target a sequence number in the middle of a traced
+// multi-op write batch. Verify `Continue()` stops iteration cleanly there.
+TEST_F(WriteBatchTest, ContinueStopsMidBatch) {
+  WriteBatch batch;
+  ASSERT_OK(batch.Put(Slice("k1"), Slice("v1")));
+  ASSERT_OK(batch.Delete(Slice("k2")));
+  ASSERT_OK(batch.Put(Slice("k3"), Slice("v3")));
+
+  ReplayUntilCountHandler handler(/* max_write_ops */ 2);
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(2u, handler.NumWriteOps());
+  ASSERT_EQ("Put(k1, v1)Delete(k2)", handler.seen);
+}
+
+// Regression test for restore replay stopping inside a committed prepared
+// batch. The handler buffers prepare contents and replays them on commit,
+// matching the expected-state restore logic.
+TEST_F(WriteBatchTest, ContinueStopsMidPreparedCommitReplay) {
+  WriteBatch batch;
+  ASSERT_OK(WriteBatchInternal::InsertNoop(&batch));
+  ASSERT_OK(batch.Put(Slice("k1"), Slice("v1")));
+  ASSERT_OK(batch.Put(Slice("k2"), Slice("v2")));
+  batch.SetSavePoint();
+  ASSERT_OK(WriteBatchInternal::MarkEndPrepare(&batch, Slice("xid1")));
+  ASSERT_EQ(Status::NotFound(), batch.RollbackToSavePoint());
+  ASSERT_OK(WriteBatchInternal::MarkCommit(&batch, Slice("xid1")));
+
+  ReplayUntilCountHandler handler(/* max_write_ops */ 1);
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(1u, handler.NumWriteOps());
+  ASSERT_EQ("Put(k1, v1)", handler.seen);
 }
 
 // It requires more than 30GB of memory to run the test. With single memory
@@ -554,6 +735,54 @@ TEST_F(WriteBatchTest, DISABLED_LargeKeyValue) {
   ASSERT_EQ(2, handler.num_seen);
 }
 
+// Uses anonymous mmap (lazy-zeroed) so the large data itself doesn't consume
+// physical memory -- only the destination copy does (~4GB peak during the
+// acceptance case where batch.Put copies into batch.rep_).
+TEST_F(WriteBatchTest, LargeKeyValueSizeLimit) {
+  if (!test::HasBigMem()) {
+    ROCKSDB_GTEST_BYPASS("insufficient memory for reliable continuous testing");
+    return;
+  }
+
+  constexpr size_t kMaxKeySize =
+      size_t{std::numeric_limits<uint32_t>::max()} - 8;
+  constexpr size_t kMaxValueSize = size_t{std::numeric_limits<uint32_t>::max()};
+
+  WriteBatch batch;
+
+  // --- Large key ---
+  {
+    MemMapping mm = MemMapping::AllocateLazyZeroed(kMaxKeySize + 1);
+    ASSERT_NE(nullptr, mm.Get());
+
+    // A key at the limit should be accepted
+    ASSERT_OK(batch.Put(Slice(mm.AsSlice().data(), kMaxKeySize), "val"));
+    batch.Clear();
+
+    // A key one byte over the limit should be rejected
+    ASSERT_TRUE(batch.Put(mm.AsSlice(), "val").IsInvalidArgument());
+    ASSERT_TRUE(batch.Merge(mm.AsSlice(), "val").IsInvalidArgument());
+    ASSERT_TRUE(batch.Delete(mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(batch.SingleDelete(mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(
+        batch.DeleteRange(mm.AsSlice(), mm.AsSlice()).IsInvalidArgument());
+  }
+
+  // --- Large value ---
+  {
+    MemMapping mm = MemMapping::AllocateLazyZeroed(kMaxValueSize + 1);
+    ASSERT_NE(nullptr, mm.Get());
+
+    // A value at the limit should be accepted
+    ASSERT_OK(batch.Put("key", Slice(mm.AsSlice().data(), kMaxValueSize)));
+    batch.Clear();
+
+    // A value one byte over the limit should be rejected
+    ASSERT_TRUE(batch.Put("key", mm.AsSlice()).IsInvalidArgument());
+    ASSERT_TRUE(batch.Merge("key", mm.AsSlice()).IsInvalidArgument());
+  }
+}
+
 TEST_F(WriteBatchTest, Continue) {
   WriteBatch batch;
 
@@ -649,9 +878,128 @@ class ColumnFamilyHandleImplDummy : public ColumnFamilyHandleImpl {
 };
 }  // anonymous namespace
 
+TEST_F(WriteBatchTest, AttributeGroupTest) {
+  WriteBatch batch;
+  ColumnFamilyHandleImplDummy zero(0);
+  ColumnFamilyHandleImplDummy two(2);
+  AttributeGroups foo_ags;
+  WideColumn zero_col_1{"0_c_1_n", "0_c_1_v"};
+  WideColumn zero_col_2{"0_c_2_n", "0_c_2_v"};
+  WideColumns zero_col_1_col_2{zero_col_1, zero_col_2};
+
+  WideColumn two_col_1{"2_c_1_n", "2_c_1_v"};
+  WideColumn two_col_2{"2_c_2_n", "2_c_2_v"};
+  WideColumns two_col_1_col_2{two_col_1, two_col_2};
+
+  foo_ags.emplace_back(&zero, zero_col_1_col_2);
+  foo_ags.emplace_back(&two, two_col_1_col_2);
+
+  ASSERT_OK(batch.PutEntity("foo", foo_ags));
+
+  TestHandler handler;
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(
+      "PutEntity(foo, 0_c_1_n:0_c_1_v "
+      "0_c_2_n:0_c_2_v)"
+      "PutEntityCF(2, foo, 2_c_1_n:2_c_1_v "
+      "2_c_2_n:2_c_2_v)",
+      handler.seen);
+}
+
+TEST_F(WriteBatchTest, AttributeGroupSavePointTest) {
+  WriteBatch batch;
+  batch.SetSavePoint();
+
+  ColumnFamilyHandleImplDummy zero(0);
+  ColumnFamilyHandleImplDummy two(2);
+  ColumnFamilyHandleImplDummy three(3);
+  AttributeGroups foo_ags;
+  WideColumn zero_col_1{"0_c_1_n", "0_c_1_v"};
+  WideColumn zero_col_2{"0_c_2_n", "0_c_2_v"};
+  WideColumns zero_col_1_col_2{zero_col_1, zero_col_2};
+
+  WideColumn two_col_1{"2_c_1_n", "2_c_1_v"};
+  WideColumn two_col_2{"2_c_2_n", "2_c_2_v"};
+  WideColumns two_col_1_col_2{two_col_1, two_col_2};
+
+  foo_ags.emplace_back(&zero, zero_col_1_col_2);
+  foo_ags.emplace_back(&two, two_col_1_col_2);
+
+  AttributeGroups bar_ags;
+  WideColumn three_col_1{"3_c_1_n", "3_c_1_v"};
+  WideColumn three_col_2{"3_c_2_n", "3_c_2_v"};
+  WideColumns three_col_1_col_2{three_col_1, three_col_2};
+
+  bar_ags.emplace_back(&zero, zero_col_1_col_2);
+  bar_ags.emplace_back(&three, three_col_1_col_2);
+
+  ASSERT_OK(batch.PutEntity("foo", foo_ags));
+  batch.SetSavePoint();
+
+  ASSERT_OK(batch.PutEntity("bar", bar_ags));
+
+  TestHandler handler;
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(
+      "PutEntity(foo, 0_c_1_n:0_c_1_v 0_c_2_n:0_c_2_v)"
+      "PutEntityCF(2, foo, 2_c_1_n:2_c_1_v 2_c_2_n:2_c_2_v)"
+      "PutEntity(bar, 0_c_1_n:0_c_1_v 0_c_2_n:0_c_2_v)"
+      "PutEntityCF(3, bar, 3_c_1_n:3_c_1_v 3_c_2_n:3_c_2_v)",
+      handler.seen);
+
+  ASSERT_OK(batch.RollbackToSavePoint());
+
+  handler.seen.clear();
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(
+      "PutEntity(foo, 0_c_1_n:0_c_1_v 0_c_2_n:0_c_2_v)"
+      "PutEntityCF(2, foo, 2_c_1_n:2_c_1_v 2_c_2_n:2_c_2_v)",
+      handler.seen);
+}
+
+TEST_F(WriteBatchTest, IterateCanRebuildSerializedV2Entity) {
+  WriteBatch batch;
+
+  BlobIndex blob_index;
+  std::string encoded_blob_index;
+  BlobIndex::EncodeBlob(&encoded_blob_index, 9 /* file_number */,
+                        123 /* offset */, 456 /* size */, kNoCompression);
+  ASSERT_OK(blob_index.DecodeFrom(encoded_blob_index));
+
+  const std::vector<std::pair<std::string, std::string>> columns = {
+      {"", "default_inline"},
+      {"ttl", "00000001"},
+  };
+  std::string serialized_entity;
+  ASSERT_OK(WideColumnSerialization::SerializeV2(columns, {{0, blob_index}},
+                                                 serialized_entity));
+  ASSERT_OK(WriteBatchInternal::PutEntitySerialized(&batch, 7 /* cf_id */,
+                                                    "key", serialized_entity));
+
+  struct RebuildHandler : public WriteBatch::Handler {
+    WriteBatch rebuilt;
+
+    Status PutCF(uint32_t cf, const Slice& key, const Slice& value) override {
+      return WriteBatchInternal::Put(&rebuilt, cf, key, value);
+    }
+
+    Status PutEntityCF(uint32_t cf, const Slice& key,
+                       const Slice& entity) override {
+      return WriteBatchInternal::PutEntitySerialized(&rebuilt, cf, key, entity);
+    }
+  } handler;
+
+  ASSERT_OK(batch.Iterate(&handler));
+  ASSERT_EQ(handler.rebuilt.Count(), batch.Count());
+  ASSERT_EQ(handler.rebuilt.Data(), batch.Data());
+}
+
 TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {
   WriteBatch batch;
-  ColumnFamilyHandleImplDummy zero(0), two(2), three(3), eight(8);
+  ColumnFamilyHandleImplDummy zero(0);
+  ColumnFamilyHandleImplDummy two(2);
+  ColumnFamilyHandleImplDummy three(3);
+  ColumnFamilyHandleImplDummy eight(8);
   ASSERT_OK(batch.Put(&zero, Slice("foo"), Slice("bar")));
   ASSERT_OK(batch.Put(&two, Slice("twofoo"), Slice("bar2")));
   ASSERT_OK(batch.Put(&eight, Slice("eightfoo"), Slice("bar8")));
@@ -661,6 +1009,8 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {
   ASSERT_OK(batch.Merge(&three, Slice("threethree"), Slice("3three")));
   ASSERT_OK(batch.Put(&zero, Slice("foo"), Slice("bar")));
   ASSERT_OK(batch.Merge(Slice("omom"), Slice("nom")));
+  ASSERT_OK(batch.TimedPut(&zero, Slice("foo"), Slice("bar"),
+                           /*write_unix_time*/ 0u));
 
   TestHandler handler;
   ASSERT_OK(batch.Iterate(&handler));
@@ -673,13 +1023,17 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {
       "DeleteRangeCF(2, 3foo, 4foo)"
       "MergeCF(3, threethree, 3three)"
       "Put(foo, bar)"
-      "Merge(omom, nom)",
+      "Merge(omom, nom)"
+      "TimedPut(foo, bar, 0)",
       handler.seen);
 }
 
 TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   WriteBatchWithIndex batch;
-  ColumnFamilyHandleImplDummy zero(0), two(2), three(3), eight(8);
+  ColumnFamilyHandleImplDummy zero(0);
+  ColumnFamilyHandleImplDummy two(2);
+  ColumnFamilyHandleImplDummy three(3);
+  ColumnFamilyHandleImplDummy eight(8);
   ASSERT_OK(batch.Put(&zero, Slice("foo"), Slice("bar")));
   ASSERT_OK(batch.Put(&two, Slice("twofoo"), Slice("bar2")));
   ASSERT_OK(batch.Put(&eight, Slice("eightfoo"), Slice("bar8")));
@@ -688,6 +1042,8 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   ASSERT_OK(batch.Merge(&three, Slice("threethree"), Slice("3three")));
   ASSERT_OK(batch.Put(&zero, Slice("foo"), Slice("bar")));
   ASSERT_OK(batch.Merge(Slice("omom"), Slice("nom")));
+  ASSERT_TRUE(
+      batch.TimedPut(&zero, Slice("foo"), Slice("bar"), 0u).IsNotSupported());
 
   std::unique_ptr<WBWIIterator> iter;
 
@@ -695,15 +1051,16 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   iter->Seek("eightfoo");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
-  ASSERT_EQ(WriteType::kPutRecord, iter->Entry().type);
+  // For the same key, most recent update is ordered first.
+  ASSERT_EQ(WriteType::kDeleteRecord, iter->Entry().type);
   ASSERT_EQ("eightfoo", iter->Entry().key.ToString());
-  ASSERT_EQ("bar8", iter->Entry().value.ToString());
 
   iter->Next();
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
-  ASSERT_EQ(WriteType::kDeleteRecord, iter->Entry().type);
+  ASSERT_EQ(WriteType::kPutRecord, iter->Entry().type);
   ASSERT_EQ("eightfoo", iter->Entry().key.ToString());
+  ASSERT_EQ("bar8", iter->Entry().value.ToString());
 
   iter->Next();
   ASSERT_OK(iter->status());
@@ -713,15 +1070,15 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   iter->Seek("twofoo");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
-  ASSERT_EQ(WriteType::kPutRecord, iter->Entry().type);
+  ASSERT_EQ(WriteType::kSingleDeleteRecord, iter->Entry().type);
   ASSERT_EQ("twofoo", iter->Entry().key.ToString());
-  ASSERT_EQ("bar2", iter->Entry().value.ToString());
 
   iter->Next();
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
-  ASSERT_EQ(WriteType::kSingleDeleteRecord, iter->Entry().type);
+  ASSERT_EQ(WriteType::kPutRecord, iter->Entry().type);
   ASSERT_EQ("twofoo", iter->Entry().key.ToString());
+  ASSERT_EQ("bar2", iter->Entry().value.ToString());
 
   iter->Next();
   ASSERT_OK(iter->status());
@@ -1012,7 +1369,13 @@ TEST_F(WriteBatchTest, UpdateTimestamps) {
   static constexpr size_t timestamp_size = sizeof(uint64_t);
 
   {
-    WriteBatch wb1, wb2, wb3, wb4, wb5, wb6, wb7;
+    WriteBatch wb1;
+    WriteBatch wb2;
+    WriteBatch wb3;
+    WriteBatch wb4;
+    WriteBatch wb5;
+    WriteBatch wb6;
+    WriteBatch wb7;
     ASSERT_OK(wb1.Put(&cf0, "key", "value"));
     ASSERT_FALSE(WriteBatchInternal::HasKeyWithTimestamp(wb1));
     ASSERT_OK(wb2.Put(&cf4, "key", "value"));

@@ -5,17 +5,21 @@
 
 #include "db/db_impl/db_impl_readonly.h"
 
+#include <algorithm>
+#include <optional>
+
 #include "db/arena_wrapped_db_iter.h"
+#include "db/blob/blob_fetcher.h"
 #include "db/db_impl/compacted_db_impl.h"
 #include "db/db_impl/db_impl.h"
-#include "db/db_iter.h"
+#include "db/db_impl/db_impl_metadata.h"
+#include "db/manifest_ops.h"
 #include "db/merge_context.h"
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 
 DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
                                const std::string& dbname)
@@ -26,96 +30,80 @@ DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
   LogFlush(immutable_db_options_.info_log);
 }
 
-DBImplReadOnly::~DBImplReadOnly() {}
+DBImplReadOnly::~DBImplReadOnly() = default;
 
-// Implementations of the DB interface
-Status DBImplReadOnly::Get(const ReadOptions& read_options,
-                           ColumnFamilyHandle* column_family, const Slice& key,
-                           PinnableSlice* pinnable_val) {
-  return Get(read_options, column_family, key, pinnable_val,
-             /*timestamp*/ nullptr);
+void DBImplReadOnly::MultiGetWithMetadata(
+    const ReadOptions& options, const size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
+  std::vector<std::string>* timestamps = GetOutputTimestamps(output_metadata);
+  if (timestamps != nullptr) {
+    timestamps->resize(num_keys);
+  }
+  std::vector<uint8_t>* newer_version_present =
+      GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    newer_version_present->assign(num_keys, false);
+  }
+  autovector<ColumnFamilyHandle*, MultiGetContext::MAX_BATCH_SIZE>
+      stack_column_families;
+  std::vector<ColumnFamilyHandle*> heap_column_families;
+  ColumnFamilyHandle** mutable_column_families = MakeMutableCfHandles(
+      column_families, num_keys, &stack_column_families, &heap_column_families);
+  DBImpl::MultiGet(options, num_keys, mutable_column_families, keys, values,
+                   timestamps != nullptr ? timestamps->data() : nullptr,
+                   statuses, sorted_input);
 }
 
-Status DBImplReadOnly::Get(const ReadOptions& read_options,
-                           ColumnFamilyHandle* column_family, const Slice& key,
-                           PinnableSlice* pinnable_val,
-                           std::string* timestamp) {
-  assert(pinnable_val != nullptr);
-  // TODO: stopwatch DB_GET needed?, perf timer needed?
-  PERF_TIMER_GUARD(get_snapshot_time);
-
-  assert(column_family);
-  if (read_options.timestamp) {
-    const Status s = FailIfTsMismatchCf(
-        column_family, *(read_options.timestamp), /*ts_for_read=*/true);
-    if (!s.ok()) {
-      return s;
-    }
-  } else {
-    const Status s = FailIfCfHasTs(column_family);
-    if (!s.ok()) {
-      return s;
-    }
+void DBImplReadOnly::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableWideColumns* results, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, bool sorted_input) {
+  const Status s = InitMultiGetEntityOutputMetadata(num_keys, output_metadata);
+  if (!s.ok()) {
+    std::fill_n(statuses, num_keys, s);
+    return;
   }
-
-  // Clear the timestamps for returning results so that we can distinguish
-  // between tombstone or key that has never been written
-  if (timestamp) {
-    timestamp->clear();
-  }
-
-  const Comparator* ucmp = column_family->GetComparator();
-  assert(ucmp);
-  std::string* ts = ucmp->timestamp_size() > 0 ? timestamp : nullptr;
-
-  Status s;
-  SequenceNumber snapshot = versions_->LastSequence();
-  GetWithTimestampReadCallback read_cb(snapshot);
-  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
-  auto cfd = cfh->cfd();
-  if (tracer_) {
-    InstrumentedMutexLock lock(&trace_mutex_);
-    if (tracer_) {
-      tracer_->Get(column_family, key);
-    }
-  }
-  SuperVersion* super_version = cfd->GetSuperVersion();
-  MergeContext merge_context;
-  SequenceNumber max_covering_tombstone_seq = 0;
-  LookupKey lkey(key, snapshot, read_options.timestamp);
-  PERF_TIMER_STOP(get_snapshot_time);
-  if (super_version->mem->Get(lkey, pinnable_val->GetSelf(),
-                              /*columns=*/nullptr, ts, &s, &merge_context,
-                              &max_covering_tombstone_seq, read_options,
-                              false /* immutable_memtable */, &read_cb)) {
-    pinnable_val->PinSelf();
-    RecordTick(stats_, MEMTABLE_HIT);
-  } else {
-    PERF_TIMER_GUARD(get_from_output_files_time);
-    PinnedIteratorsManager pinned_iters_mgr;
-    super_version->current->Get(
-        read_options, lkey, pinnable_val, /*columns=*/nullptr, ts, &s,
-        &merge_context, &max_covering_tombstone_seq, &pinned_iters_mgr,
-        /*value_found*/ nullptr,
-        /*key_exists*/ nullptr, /*seq*/ nullptr, &read_cb,
-        /*is_blob*/ nullptr,
-        /*do_merge*/ true);
-    RecordTick(stats_, MEMTABLE_MISS);
-  }
-  RecordTick(stats_, NUMBER_KEYS_READ);
-  size_t size = pinnable_val->size();
-  RecordTick(stats_, BYTES_READ, size);
-  RecordInHistogram(stats_, BYTES_PER_READ, size);
-  PERF_COUNTER_ADD(get_read_bytes, size);
-  return s;
+  MultiGetEntityWithoutNewerVersionTracking(this, options, num_keys,
+                                            column_families, keys, results,
+                                            statuses, sorted_input);
 }
 
-Iterator* DBImplReadOnly::NewIterator(const ReadOptions& read_options,
+void DBImplReadOnly::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys, const Slice* keys,
+    PinnableAttributeGroups* results, MultiGetOutputMetadata* output_metadata) {
+  const size_t total_count = CountAttributeGroups(num_keys, results);
+  const Status s =
+      InitMultiGetEntityOutputMetadata(total_count, output_metadata);
+  if (!results) {
+    s.PermitUncheckedError();
+    return;
+  }
+  if (!s.ok()) {
+    SetAttributeGroupsStatus(num_keys, results, s);
+    return;
+  }
+  MultiGetEntity(options, num_keys, keys, results);
+}
+
+Iterator* DBImplReadOnly::NewIterator(const ReadOptions& _read_options,
                                       ColumnFamilyHandle* column_family) {
+  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+      _read_options.io_activity != Env::IOActivity::kDBIterator) {
+    return NewErrorIterator(Status::InvalidArgument(
+        "Can only call NewIterator with `ReadOptions::io_activity` is "
+        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`"));
+  }
+  ReadOptions read_options(_read_options);
+  if (read_options.io_activity == Env::IOActivity::kUnknown) {
+    read_options.io_activity = Env::IOActivity::kDBIterator;
+  }
   assert(column_family);
   if (read_options.timestamp) {
-    const Status s = FailIfTsMismatchCf(
-        column_family, *(read_options.timestamp), /*ts_for_read=*/true);
+    const Status s =
+        FailIfTsMismatchCf(column_family, *(read_options.timestamp));
     if (!s.ok()) {
       return NewErrorIterator(s);
     }
@@ -128,76 +116,135 @@ Iterator* DBImplReadOnly::NewIterator(const ReadOptions& read_options,
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
   auto cfd = cfh->cfd();
   SuperVersion* super_version = cfd->GetSuperVersion()->Ref();
+  if (read_options.timestamp && read_options.timestamp->size() > 0) {
+    const Status s = FailIfReadCollapsedHistory(cfd, super_version,
+                                                *(read_options.timestamp));
+    if (!s.ok()) {
+      cfd->GetSuperVersion()->Unref();
+      return NewErrorIterator(s);
+    }
+  }
   SequenceNumber latest_snapshot = versions_->LastSequence();
   SequenceNumber read_seq =
       read_options.snapshot != nullptr
-          ? reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
-                ->number_
+          ? static_cast<const SnapshotImpl*>(read_options.snapshot)->number_
           : latest_snapshot;
   ReadCallback* read_callback = nullptr;  // No read callback provided.
-  auto db_iter = NewArenaWrappedDbIterator(
-      env_, read_options, *cfd->ioptions(), super_version->mutable_cf_options,
-      super_version->current, read_seq,
-      super_version->mutable_cf_options.max_sequential_skip_in_iterations,
-      super_version->version_number, read_callback);
-  auto internal_iter = NewInternalIterator(
-      db_iter->GetReadOptions(), cfd, super_version, db_iter->GetArena(),
-      read_seq, /* allow_unprepared_value */ true, db_iter);
-  db_iter->SetIterUnderDBIter(internal_iter);
-  return db_iter;
+  return NewArenaWrappedDbIterator(
+      env_, read_options, cfh, super_version, read_seq, read_callback, this,
+      /*expose_blob_index=*/false, /*allow_refresh=*/false,
+      /*allow_mark_memtable_for_flush=*/false);
 }
 
 Status DBImplReadOnly::NewIterators(
     const ReadOptions& read_options,
     const std::vector<ColumnFamilyHandle*>& column_families,
     std::vector<Iterator*>* iterators) {
-  if (read_options.timestamp) {
-    for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfTsMismatchCf(cf, *(read_options.timestamp),
-                                          /*ts_for_read=*/true);
-      if (!s.ok()) {
-        return s;
-      }
-    }
-  } else {
-    for (auto* cf : column_families) {
-      assert(cf);
-      const Status s = FailIfCfHasTs(cf);
-      if (!s.ok()) {
-        return s;
-      }
-    }
-  }
+  return NewIterators(
+      std::vector<ReadOptions>(column_families.size(), read_options),
+      column_families, iterators);
+}
 
-  ReadCallback* read_callback = nullptr;  // No read callback provided.
+Status DBImplReadOnly::NewIterators(
+    const std::vector<ReadOptions>& read_options,
+    const std::vector<ColumnFamilyHandle*>& column_families,
+    std::vector<Iterator*>* iterators) {
+  if (read_options.size() != column_families.size()) {
+    return Status::InvalidArgument(
+        "read_options and column_families must have the same size");
+  }
   if (iterators == nullptr) {
     return Status::InvalidArgument("iterators not allowed to be nullptr");
   }
-  iterators->clear();
-  iterators->reserve(column_families.size());
-  SequenceNumber latest_snapshot = versions_->LastSequence();
-  SequenceNumber read_seq =
-      read_options.snapshot != nullptr
-          ? reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
-                ->number_
-          : latest_snapshot;
 
-  for (auto cfh : column_families) {
-    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cfh)->cfd();
-    auto* sv = cfd->GetSuperVersion()->Ref();
-    auto* db_iter = NewArenaWrappedDbIterator(
-        env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
-        sv->current, read_seq,
-        sv->mutable_cf_options.max_sequential_skip_in_iterations,
-        sv->version_number, read_callback);
-    auto* internal_iter = NewInternalIterator(
-        db_iter->GetReadOptions(), cfd, sv, db_iter->GetArena(), read_seq,
-        /* allow_unprepared_value */ true, db_iter);
-    db_iter->SetIterUnderDBIter(internal_iter);
-    iterators->push_back(db_iter);
+  if (column_families.empty()) {
+    iterators->clear();
+    return Status::OK();
   }
 
+  const Snapshot* const snapshot = read_options.front().snapshot;
+  const bool tailing = read_options.front().tailing;
+  std::vector<ReadOptions> normalized_read_options;
+  normalized_read_options.reserve(read_options.size());
+  for (size_t i = 0; i < read_options.size(); ++i) {
+    const ReadOptions& options = read_options[i];
+    if (options.io_activity != Env::IOActivity::kUnknown &&
+        options.io_activity != Env::IOActivity::kDBIterator) {
+      return Status::InvalidArgument(
+          "Can only call NewIterators with `ReadOptions::io_activity` is "
+          "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`");
+    }
+    if (options.read_tier == kPersistedTier) {
+      return Status::NotSupported(
+          "ReadTier::kPersistedData is not yet supported in iterators.");
+    }
+    if (options.snapshot != snapshot) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same snapshot");
+    }
+    if (options.tailing != tailing) {
+      return Status::InvalidArgument(
+          "All ReadOptions must use the same tailing setting");
+    }
+
+    auto* cf = column_families[i];
+    assert(cf);
+    Status s;
+    if (options.timestamp) {
+      s = FailIfTsMismatchCf(cf, *(options.timestamp));
+    } else {
+      s = FailIfCfHasTs(cf);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+
+    normalized_read_options.emplace_back(options);
+    if (normalized_read_options.back().io_activity ==
+        Env::IOActivity::kUnknown) {
+      normalized_read_options.back().io_activity = Env::IOActivity::kDBIterator;
+    }
+  }
+
+  iterators->clear();
+  iterators->reserve(column_families.size());
+
+  SequenceNumber read_seq =
+      snapshot != nullptr ? static_cast<const SnapshotImpl*>(snapshot)->number_
+                          : versions_->LastSequence();
+  autovector<std::tuple<ColumnFamilyHandleImpl*, SuperVersion*>> cfh_to_sv;
+  for (auto* cf : column_families) {
+    auto* cfh = static_cast_with_check<ColumnFamilyHandleImpl>(cf);
+    cfh_to_sv.emplace_back(cfh, cfh->cfd()->GetSuperVersion()->Ref());
+  }
+
+  const auto unref_super_versions = [&]() {
+    for (const auto& entry : cfh_to_sv) {
+      std::get<1>(entry)->Unref();
+    }
+  };
+  for (size_t i = 0; i < cfh_to_sv.size(); ++i) {
+    const ReadOptions& options = normalized_read_options[i];
+    if (options.timestamp && !options.timestamp->empty()) {
+      auto* cfd = std::get<0>(cfh_to_sv[i])->cfd();
+      auto* sv = std::get<1>(cfh_to_sv[i]);
+      const Status s =
+          FailIfReadCollapsedHistory(cfd, sv, *(options.timestamp));
+      if (!s.ok()) {
+        unref_super_versions();
+        return s;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < cfh_to_sv.size(); ++i) {
+    auto* cfh = std::get<0>(cfh_to_sv[i]);
+    auto* sv = std::get<1>(cfh_to_sv[i]);
+    iterators->push_back(NewArenaWrappedDbIterator(
+        env_, normalized_read_options[i], cfh, sv, read_seq,
+        nullptr /* read_callback */, this, /* expose_blob_index */ false,
+        /* allow_refresh */ false, /* allow_mark_memtable_for_flush */ false));
+  }
   return Status::OK();
 }
 
@@ -212,8 +259,8 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
     const std::shared_ptr<FileSystem>& fs = db_options.env->GetFileSystem();
     std::string manifest_path;
     uint64_t manifest_file_number;
-    s = VersionSet::GetCurrentManifestPath(dbname, fs.get(), &manifest_path,
-                                           &manifest_file_number);
+    s = GetCurrentManifestPath(dbname, fs.get(), /*is_retry=*/false,
+                               &manifest_path, &manifest_file_number);
   } else {
     // Historic behavior that doesn't necessarily make sense
     s = db_options.env->CreateDirIfMissing(dbname);
@@ -223,7 +270,8 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
 }  // namespace
 
 Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
-                           DB** dbptr, bool /*error_if_wal_file_exists*/) {
+                           std::unique_ptr<DB>* dbptr,
+                           bool /*error_if_wal_file_exists*/) {
   Status s = OpenForReadOnlyCheckExistence(options, dbname);
   if (!s.ok()) {
     return s;
@@ -240,8 +288,7 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  column_families.emplace_back(kDefaultColumnFamilyName, cf_options);
   std::vector<ColumnFamilyHandle*> handles;
 
   s = DBImplReadOnly::OpenForReadOnlyWithoutCheck(
@@ -258,7 +305,7 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
 Status DB::OpenForReadOnly(
     const DBOptions& db_options, const std::string& dbname,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+    std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
   // If dbname does not exist in the file system, should not do anything
   Status s = OpenForReadOnlyCheckExistence(db_options, dbname);
@@ -274,7 +321,7 @@ Status DB::OpenForReadOnly(
 Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
     const DBOptions& db_options, const std::string& dbname,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+    std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
   *dbptr = nullptr;
   handles->clear();
@@ -286,7 +333,7 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
                            error_if_wal_file_exists);
   if (s.ok()) {
     // set column family handles
-    for (auto cf : column_families) {
+    for (const auto& cf : column_families) {
       auto cfd =
           impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
       if (cfd == nullptr) {
@@ -301,11 +348,17 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
       sv_context.NewSuperVersion();
       cfd->InstallSuperVersion(&sv_context, &impl->mutex_);
     }
+
+    impl->opened_successfully_ = true;
+
+    if (db_options.open_files_async) {
+      impl->ScheduleAsyncFileOpening();
+    }
   }
   impl->mutex_.Unlock();
   sv_context.Clean();
   if (s.ok()) {
-    *dbptr = impl;
+    dbptr->reset(impl);
     for (auto* h : *handles) {
       impl->NewThreadStatusCfInfo(
           static_cast_with_check<ColumnFamilyHandleImpl>(h)->cfd());
@@ -320,5 +373,17 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
   return s;
 }
 
-
 }  // namespace ROCKSDB_NAMESPACE
+
+// Generate the regular and coroutine versions of the functions defined in
+// db_impl_readonly_sync_and_async.h by including it twice. The macros expand
+// differently based on whether WITH_COROUTINES or WITHOUT_COROUTINES is
+// defined.
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "db/db_impl/db_impl_readonly_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "db/db_impl/db_impl_readonly_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on

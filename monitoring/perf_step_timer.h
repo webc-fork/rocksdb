@@ -5,7 +5,7 @@
 //
 #pragma once
 #include "monitoring/perf_level_imp.h"
-#include "monitoring/statistics.h"
+#include "monitoring/statistics_impl.h"
 #include "rocksdb/system_clock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -25,6 +25,12 @@ class PerfStepTimer {
         start_(0),
         metric_(metric),
         statistics_(statistics) {}
+
+  // No copying allowed
+  PerfStepTimer(const PerfStepTimer&) = delete;
+  PerfStepTimer& operator=(const PerfStepTimer&) = delete;
+  PerfStepTimer(PerfStepTimer&&) = delete;
+  PerfStepTimer& operator=(PerfStepTimer&&) = delete;
 
   ~PerfStepTimer() { Stop(); }
 

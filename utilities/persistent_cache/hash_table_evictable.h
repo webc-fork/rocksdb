@@ -5,7 +5,6 @@
 //
 #pragma once
 
-
 #include <functional>
 
 #include "util/random.h"
@@ -34,6 +33,12 @@ class EvictableHashTable : private HashTable<T*, Hash, Equal> {
   }
 
   virtual ~EvictableHashTable() { AssertEmptyLRU(); }
+
+  // No copying allowed
+  EvictableHashTable(const EvictableHashTable&) = delete;
+  EvictableHashTable& operator=(const EvictableHashTable&) = delete;
+  EvictableHashTable(EvictableHashTable&&) = delete;
+  EvictableHashTable& operator=(EvictableHashTable&&) = delete;
 
   //
   // Insert given record to hash table (and LRU list)
@@ -163,4 +168,3 @@ class EvictableHashTable : private HashTable<T*, Hash, Equal> {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-

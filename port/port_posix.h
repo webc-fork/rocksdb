@@ -13,7 +13,7 @@
 
 #include <thread>
 
-#include "rocksdb/options.h"
+#include "rocksdb/port_defs.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 // size_t printf formatting named in the manner of C99 standard formatting
@@ -30,14 +30,6 @@
 #define PLATFORM_IS_LITTLE_ENDIAN \
   (__DARWIN_BYTE_ORDER == __DARWIN_LITTLE_ENDIAN)
 #endif
-#elif defined(OS_SOLARIS)
-#include <sys/isa_defs.h>
-#ifdef _LITTLE_ENDIAN
-#define PLATFORM_IS_LITTLE_ENDIAN true
-#else
-#define PLATFORM_IS_LITTLE_ENDIAN false
-#endif
-#include <alloca.h>
 #elif defined(OS_AIX)
 #include <arpa/nameser_compat.h>
 #include <sys/types.h>
@@ -62,9 +54,9 @@
 #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
 #endif
 
-#if defined(OS_MACOSX) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||      \
-    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || \
-    defined(OS_ANDROID) || defined(CYGWIN) || defined(OS_AIX)
+#if defined(OS_MACOSX) || defined(OS_FREEBSD) || defined(OS_NETBSD) ||        \
+    defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) || defined(OS_ANDROID) || \
+    defined(CYGWIN) || defined(OS_AIX)
 // Use fread/fwrite/fflush on platforms without _unlocked variants
 #define fread_unlocked fread
 #define fwrite_unlocked fwrite
@@ -101,6 +93,8 @@ class Mutex {
   // No copying
   Mutex(const Mutex&) = delete;
   void operator=(const Mutex&) = delete;
+  Mutex(Mutex&&) = delete;
+  void operator=(Mutex&&) = delete;
 
   ~Mutex();
 
@@ -109,9 +103,9 @@ class Mutex {
 
   bool TryLock();
 
-  // this will assert if the mutex is not locked
-  // it does NOT verify that mutex is held by a calling thread
-  void AssertHeld();
+  // This will fail assertion if the mutex is not locked.
+  // It does NOT verify that mutex is held by a calling thread.
+  void AssertHeld() const;
 
   // Also implement std Lockable
   inline void lock() { Lock(); }
@@ -132,14 +126,18 @@ class RWMutex {
   // No copying allowed
   RWMutex(const RWMutex&) = delete;
   void operator=(const RWMutex&) = delete;
+  RWMutex(RWMutex&&) = delete;
+  void operator=(RWMutex&&) = delete;
 
   ~RWMutex();
 
   void ReadLock();
+  bool TryReadLock();
   void WriteLock();
+  bool TryWriteLock();
   void ReadUnlock();
   void WriteUnlock();
-  void AssertHeld() {}
+  void AssertHeld() const {}
 
  private:
   pthread_rwlock_t mu_;  // the underlying platform mutex
@@ -149,6 +147,9 @@ class CondVar {
  public:
   explicit CondVar(Mutex* mu);
   ~CondVar();
+
+  Mutex* GetMutex() const { return mu_; }
+
   void Wait();
   // Timed condition wait.  Returns true if timeout occurred.
   bool TimedWait(uint64_t abs_time_us);
@@ -176,11 +177,11 @@ static inline void AsmVolatilePause() {
 }
 
 // Returns -1 if not available on this platform
-extern int PhysicalCoreID();
+int PhysicalCoreID();
 
 using OnceType = pthread_once_t;
 #define LEVELDB_ONCE_INIT PTHREAD_ONCE_INIT
-extern void InitOnce(OnceType* once, void (*initializer)());
+void InitOnce(OnceType* once, void (*initializer)());
 
 #ifndef CACHE_LINE_SIZE
 // To test behavior with non-native cache line size, e.g. for
@@ -208,9 +209,9 @@ extern void InitOnce(OnceType* once, void (*initializer)());
 static_assert((CACHE_LINE_SIZE & (CACHE_LINE_SIZE - 1)) == 0,
               "Cache line size must be a power of 2 number of bytes");
 
-extern void* cacheline_aligned_alloc(size_t size);
+void* cacheline_aligned_alloc(size_t size);
 
-extern void cacheline_aligned_free(void* memblock);
+void cacheline_aligned_free(void* memblock);
 
 #if defined(__aarch64__)
 //  __builtin_prefetch(..., 1) turns into a prefetch into prfm pldl3keep. On
@@ -223,15 +224,25 @@ extern void cacheline_aligned_free(void* memblock);
 #define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
 #endif
 
-extern void Crash(const std::string& srcfile, int srcline);
+void Crash(const std::string& srcfile, int srcline);
 
-extern int GetMaxOpenFiles();
+// Terminates the process immediately with the given exit code, bypassing the
+// usual shutdown path: no atexit handlers run and no static/global destructors
+// are invoked (POSIX _exit(); same on Windows). This is the safe way to abort
+// from a process that still has background threads running (e.g. RocksDB's
+// compaction/flush threads). A normal exit() would tear down static objects
+// those threads are concurrently accessing, causing cross-thread
+// use-after-free. Use this instead of exit() once a DB has been opened and
+// background threads may be live.
+[[noreturn]] void ImmediateExit(int code);
+
+int GetMaxOpenFiles();
 
 extern const size_t kPageSize;
 
 using ThreadId = pid_t;
 
-extern void SetCpuPriority(ThreadId id, CpuPriority priority);
+void SetCpuPriority(ThreadId id, CpuPriority priority);
 
 int64_t GetProcessID();
 

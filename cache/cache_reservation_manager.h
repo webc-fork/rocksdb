@@ -32,9 +32,9 @@ class CacheReservationManager {
   // for an incremental amount of memory used (i.e, incremental_memory_used)
   class CacheReservationHandle {
    public:
-    virtual ~CacheReservationHandle() {}
+    virtual ~CacheReservationHandle() = default;
   };
-  virtual ~CacheReservationManager() {}
+  virtual ~CacheReservationManager() = default;
   virtual Status UpdateCacheReservation(std::size_t new_memory_used) = 0;
   // TODO(hx235): replace the usage of
   // `UpdateCacheReservation(memory_used_delta, increase)` with
@@ -44,8 +44,8 @@ class CacheReservationManager {
                                         bool increase) = 0;
   virtual Status MakeCacheReservation(
       std::size_t incremental_memory_used,
-      std::unique_ptr<CacheReservationManager::CacheReservationHandle>
-          *handle) = 0;
+      std::unique_ptr<CacheReservationManager::CacheReservationHandle>*
+          handle) = 0;
   virtual std::size_t GetTotalReservedCacheSize() = 0;
   virtual std::size_t GetTotalMemoryUsed() = 0;
 };
@@ -90,11 +90,11 @@ class CacheReservationManagerImpl
                                        bool delayed_decrease = false);
 
   // no copy constructor, copy assignment, move constructor, move assignment
-  CacheReservationManagerImpl(const CacheReservationManagerImpl &) = delete;
-  CacheReservationManagerImpl &operator=(const CacheReservationManagerImpl &) =
+  CacheReservationManagerImpl(const CacheReservationManagerImpl&) = delete;
+  CacheReservationManagerImpl& operator=(const CacheReservationManagerImpl&) =
       delete;
-  CacheReservationManagerImpl(CacheReservationManagerImpl &&) = delete;
-  CacheReservationManagerImpl &operator=(CacheReservationManagerImpl &&) =
+  CacheReservationManagerImpl(CacheReservationManagerImpl&&) = delete;
+  CacheReservationManagerImpl& operator=(CacheReservationManagerImpl&&) =
       delete;
 
   ~CacheReservationManagerImpl() override;
@@ -178,7 +178,7 @@ class CacheReservationManagerImpl
   // REQUIRES: handle != nullptr
   Status MakeCacheReservation(
       std::size_t incremental_memory_used,
-      std::unique_ptr<CacheReservationManager::CacheReservationHandle> *handle)
+      std::unique_ptr<CacheReservationManager::CacheReservationHandle>* handle)
       override;
 
   // Return the size of the cache (which is a multiple of kSizeDummyEntry)
@@ -200,7 +200,7 @@ class CacheReservationManagerImpl
   // For testing only - it is to help ensure the CacheItemHelperForRole<R>
   // accessed from CacheReservationManagerImpl and the one accessed from the
   // test are from the same translation units
-  static const Cache::CacheItemHelper *TEST_GetCacheItemHelperForRole();
+  static const Cache::CacheItemHelper* TEST_GetCacheItemHelperForRole();
 
  private:
   static constexpr std::size_t kSizeDummyEntry = 256 * 1024;
@@ -216,7 +216,7 @@ class CacheReservationManagerImpl
   bool delayed_decrease_;
   std::atomic<std::size_t> cache_allocated_size_;
   std::size_t memory_used_;
-  std::vector<Cache::Handle *> dummy_handles_;
+  std::vector<Cache::Handle*> dummy_handles_;
   CacheKey cache_key_;
 };
 
@@ -235,6 +235,11 @@ class ConcurrentCacheReservationManager
       cache_res_mgr_ = cache_res_mgr;
       cache_res_handle_ = std::move(cache_res_handle);
     }
+    // No copying allowed
+    CacheReservationHandle(const CacheReservationHandle&) = delete;
+    CacheReservationHandle& operator=(const CacheReservationHandle&) = delete;
+    CacheReservationHandle(CacheReservationHandle&&) = delete;
+    CacheReservationHandle& operator=(CacheReservationHandle&&) = delete;
 
     ~CacheReservationHandle() override {
       std::lock_guard<std::mutex> lock(cache_res_mgr_->cache_res_mgr_mu_);
@@ -251,14 +256,14 @@ class ConcurrentCacheReservationManager
       std::shared_ptr<CacheReservationManager> cache_res_mgr) {
     cache_res_mgr_ = std::move(cache_res_mgr);
   }
-  ConcurrentCacheReservationManager(const ConcurrentCacheReservationManager &) =
+  ConcurrentCacheReservationManager(const ConcurrentCacheReservationManager&) =
       delete;
-  ConcurrentCacheReservationManager &operator=(
-      const ConcurrentCacheReservationManager &) = delete;
-  ConcurrentCacheReservationManager(ConcurrentCacheReservationManager &&) =
+  ConcurrentCacheReservationManager& operator=(
+      const ConcurrentCacheReservationManager&) = delete;
+  ConcurrentCacheReservationManager(ConcurrentCacheReservationManager&&) =
       delete;
-  ConcurrentCacheReservationManager &operator=(
-      ConcurrentCacheReservationManager &&) = delete;
+  ConcurrentCacheReservationManager& operator=(
+      ConcurrentCacheReservationManager&&) = delete;
 
   ~ConcurrentCacheReservationManager() override {}
 
@@ -273,9 +278,10 @@ class ConcurrentCacheReservationManager
     std::size_t total_mem_used = cache_res_mgr_->GetTotalMemoryUsed();
     Status s;
     if (!increase) {
-      assert(total_mem_used >= memory_used_delta);
-      s = cache_res_mgr_->UpdateCacheReservation(total_mem_used -
-                                                 memory_used_delta);
+      s = cache_res_mgr_->UpdateCacheReservation(
+          (total_mem_used > memory_used_delta)
+              ? (total_mem_used - memory_used_delta)
+              : 0);
     } else {
       s = cache_res_mgr_->UpdateCacheReservation(total_mem_used +
                                                  memory_used_delta);
@@ -285,7 +291,7 @@ class ConcurrentCacheReservationManager
 
   inline Status MakeCacheReservation(
       std::size_t incremental_memory_used,
-      std::unique_ptr<CacheReservationManager::CacheReservationHandle> *handle)
+      std::unique_ptr<CacheReservationManager::CacheReservationHandle>* handle)
       override {
     std::unique_ptr<CacheReservationManager::CacheReservationHandle>
         wrapped_handle;

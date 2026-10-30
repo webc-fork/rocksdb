@@ -109,11 +109,15 @@ public class BlockBasedTableConfigTest {
     tableConfig.setIndexType(IndexType.kBinarySearch);
     tableConfig.setDataBlockIndexType(DataBlockIndexType.kDataBlockBinarySearch);
     tableConfig.setChecksumType(ChecksumType.kNoChecksum);
+    tableConfig.setIndexSearchType(IndexSearchType.kBinary);
+    tableConfig.setUniformCvThreshold(0.25);
     try (final Options options = new Options().setTableFormatConfig(tableConfig)) {
-      String opts = getOptionAsString(options);
+      final String opts = getOptionAsString(options);
       assertThat(opts).contains("index_type=kBinarySearch");
       assertThat(opts).contains("data_block_index_type=kDataBlockBinarySearch");
       assertThat(opts).contains("checksum=kNoChecksum");
+      assertThat(opts).contains("index_block_search_type=kBinary");
+      assertThat(opts).contains("uniform_cv_threshold=0.25");
     }
 
     tableConfig.setIndexType(IndexType.kHashSearch);
@@ -121,7 +125,7 @@ public class BlockBasedTableConfigTest {
     tableConfig.setChecksumType(ChecksumType.kCRC32c);
     try (final Options options = new Options().setTableFormatConfig(tableConfig)) {
       options.useCappedPrefixExtractor(1); // Needed to use kHashSearch
-      String opts = getOptionAsString(options);
+      final String opts = getOptionAsString(options);
       assertThat(opts).contains("index_type=kHashSearch");
       assertThat(opts).contains("data_block_index_type=kDataBlockBinaryAndHash");
       assertThat(opts).contains("checksum=kCRC32c");
@@ -130,7 +134,7 @@ public class BlockBasedTableConfigTest {
     tableConfig.setIndexType(IndexType.kTwoLevelIndexSearch);
     tableConfig.setChecksumType(ChecksumType.kxxHash);
     try (final Options options = new Options().setTableFormatConfig(tableConfig)) {
-      String opts = getOptionAsString(options);
+      final String opts = getOptionAsString(options);
       assertThat(opts).contains("index_type=kTwoLevelIndexSearch");
       assertThat(opts).contains("checksum=kxxHash");
     }
@@ -138,30 +142,29 @@ public class BlockBasedTableConfigTest {
     tableConfig.setIndexType(IndexType.kBinarySearchWithFirstKey);
     tableConfig.setChecksumType(ChecksumType.kxxHash64);
     try (final Options options = new Options().setTableFormatConfig(tableConfig)) {
-      String opts = getOptionAsString(options);
+      final String opts = getOptionAsString(options);
       assertThat(opts).contains("index_type=kBinarySearchWithFirstKey");
       assertThat(opts).contains("checksum=kxxHash64");
     }
 
     tableConfig.setChecksumType(ChecksumType.kXXH3);
     try (final Options options = new Options().setTableFormatConfig(tableConfig)) {
-      String opts = getOptionAsString(options);
+      final String opts = getOptionAsString(options);
       assertThat(opts).contains("checksum=kXXH3");
     }
   }
 
-  private String getOptionAsString(Options options) throws Exception {
+  private String getOptionAsString(final Options options) throws Exception {
     options.setCreateIfMissing(true);
-    String dbPath = dbFolder.getRoot().getAbsolutePath();
-    String result;
-    try (final RocksDB db = RocksDB.open(options, dbPath);
+    final String dbPath = dbFolder.getRoot().getAbsolutePath();
+    final String result;
+    try (final RocksDB ignored = RocksDB.open(options, dbPath);
          final Stream<Path> pathStream = Files.walk(Paths.get(dbPath))) {
-      Path optionsPath =
-          pathStream
-              .filter(p -> p.getFileName().toString().startsWith("OPTIONS"))
+      final Path optionsPath =
+          pathStream.filter(p -> p.getFileName().toString().startsWith("OPTIONS"))
               .findAny()
               .orElseThrow(() -> new AssertionError("Missing options file"));
-      byte[] optionsData = Files.readAllBytes(optionsPath);
+      final byte[] optionsData = Files.readAllBytes(optionsPath);
       result = new String(optionsData, StandardCharsets.UTF_8);
     }
     RocksDB.destroyDB(dbPath, options);
@@ -357,9 +360,27 @@ public class BlockBasedTableConfigTest {
         new BlockBasedTableConfig().setFormatVersion(99999);
 
     try (final Options options = new Options().setTableFormatConfig(blockBasedTableConfig);
-         final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
+         final RocksDB ignored = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
       fail("Opening the database with an invalid format_version should have raised an exception");
     }
+  }
+
+  @Test
+  public void separateKeyValueInDataBlock() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    assertThat(blockBasedTableConfig.separateKeyValueInDataBlock()).isFalse();
+    blockBasedTableConfig.setSeparateKeyValueInDataBlock(true);
+    assertThat(blockBasedTableConfig.separateKeyValueInDataBlock()).isTrue();
+  }
+
+  @Test
+  public void uniformCvThreshold() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    assertThat(blockBasedTableConfig.uniformCvThreshold()).isEqualTo(0.2);
+    blockBasedTableConfig.setUniformCvThreshold(0.5);
+    assertThat(blockBasedTableConfig.uniformCvThreshold()).isEqualTo(0.5);
+    blockBasedTableConfig.setUniformCvThreshold(-1.0);
+    assertThat(blockBasedTableConfig.uniformCvThreshold()).isEqualTo(-1.0);
   }
 
   @Test
@@ -379,11 +400,52 @@ public class BlockBasedTableConfigTest {
   }
 
   @Test
+  public void superBlockAlignmentSize() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    blockBasedTableConfig.setSuperBlockAlignmentSize(1024 * 1024);
+    assertThat(blockBasedTableConfig.superBlockAlignmentSize()).isEqualTo(1024 * 1024);
+  }
+
+  @Test
+  public void superBlockAlignmentSpaceOverheadRatio() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    blockBasedTableConfig.setSuperBlockAlignmentSpaceOverheadRatio(4096);
+    assertThat(blockBasedTableConfig.superBlockAlignmentSpaceOverheadRatio()).isEqualTo(4096);
+  }
+
+  @Test
   public void indexShortening() {
     final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
     blockBasedTableConfig.setIndexShortening(IndexShorteningMode.kShortenSeparatorsAndSuccessor);
     assertThat(blockBasedTableConfig.indexShortening())
         .isEqualTo(IndexShorteningMode.kShortenSeparatorsAndSuccessor);
+  }
+
+  @Test
+  public void indexSearchType() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    assertThat(IndexSearchType.values().length).isEqualTo(3);
+    blockBasedTableConfig.setIndexSearchType(IndexSearchType.kInterpolation);
+    assertThat(blockBasedTableConfig.indexSearchType()).isEqualTo(IndexSearchType.kInterpolation);
+    blockBasedTableConfig.setIndexSearchType(IndexSearchType.kBinary);
+    assertThat(blockBasedTableConfig.indexSearchType()).isEqualTo(IndexSearchType.kBinary);
+    blockBasedTableConfig.setIndexSearchType(IndexSearchType.kAuto);
+    assertThat(blockBasedTableConfig.indexSearchType()).isEqualTo(IndexSearchType.kAuto);
+  }
+
+  @Test
+  public void optimizeKeyCommonPrefix() {
+    final BlockBasedTableConfig blockBasedTableConfig = new BlockBasedTableConfig();
+    assertThat(OptimizeKeyCommonPrefix.values().length).isEqualTo(3);
+    // Default is kIfFastSeek.
+    assertThat(blockBasedTableConfig.optimizeKeyCommonPrefix())
+        .isEqualTo(OptimizeKeyCommonPrefix.kIfFastSeek);
+    blockBasedTableConfig.setOptimizeKeyCommonPrefix(OptimizeKeyCommonPrefix.kDisabled);
+    assertThat(blockBasedTableConfig.optimizeKeyCommonPrefix())
+        .isEqualTo(OptimizeKeyCommonPrefix.kDisabled);
+    blockBasedTableConfig.setOptimizeKeyCommonPrefix(OptimizeKeyCommonPrefix.kEnabled);
+    assertThat(blockBasedTableConfig.optimizeKeyCommonPrefix())
+        .isEqualTo(OptimizeKeyCommonPrefix.kEnabled);
   }
 
   @Deprecated

@@ -10,15 +10,11 @@ package org.rocksdb;
  * {@link org.rocksdb.RocksDB}.
  */
 public class FlushOptions extends RocksObject {
-  static {
-    RocksDB.loadLibrary();
-  }
-
   /**
    * Construct a new instance of FlushOptions.
    */
   public FlushOptions(){
-    super(newFlushOptions());
+    super(newFlushOptionsInance());
   }
 
   /**
@@ -47,13 +43,13 @@ public class FlushOptions extends RocksObject {
   }
 
   /**
-   * Set to true so that flush would proceeds immediately even it it means
+   * Set to true so that flush would proceed immediately even if it means
    * writes will stall for the duration of the flush.
-   *
+   * <p>
    * Set to false so that the operation will wait until it's possible to do
    * the flush without causing stall or until required flush is performed by
    * someone else (foreground call or background thread).
-   *
+   * <p>
    * Default: false
    *
    * @param allowWriteStall true to allow writes to stall for flush, false
@@ -78,13 +74,57 @@ public class FlushOptions extends RocksObject {
     return allowWriteStall(nativeHandle_);
   }
 
-  private native static long newFlushOptions();
-  @Override protected final native void disposeInternal(final long handle);
+  /**
+   * If true (and {@link #waitForFlush()} is also true), the flush operation will
+   * not return until the registered
+   * {@link org.rocksdb.AbstractEventListener}'s {@code onFlushCompleted}
+   * callbacks for the flushed memtables have finished running.
+   * <p>
+   * By default (false), a flush with wait may return as soon as the flush
+   * result is committed, which can be before (or while) the completion callbacks
+   * execute on the background flush thread. Has no effect when
+   * {@link #waitForFlush()} is false.
+   * <p>
+   * Default: false
+   *
+   * @param listenerWait true to wait for the flush-completion listener callbacks
+   *     to finish, false otherwise.
+   *
+   * @return instance of current FlushOptions.
+   */
+  public FlushOptions setListenerWait(final boolean listenerWait) {
+    assert (isOwningHandle());
+    setListenerWait(nativeHandle_, listenerWait);
+    return this;
+  }
 
-  private native void setWaitForFlush(final long handle,
-      final boolean wait);
-  private native boolean waitForFlush(final long handle);
-  private native void setAllowWriteStall(final long handle,
-      final boolean allowWriteStall);
-  private native boolean allowWriteStall(final long handle);
+  /**
+   * Returns true if the flush operation waits for the flush-completion listener
+   * callbacks to finish, false otherwise.
+   *
+   * @return true if the flush waits for the flush-completion listener callbacks
+   */
+  public boolean listenerWait() {
+    assert (isOwningHandle());
+    return listenerWait(nativeHandle_);
+  }
+
+  private static long newFlushOptionsInance() {
+    RocksDB.loadLibrary();
+    return newFlushOptions();
+  }
+  private static native long newFlushOptions();
+  @Override
+  protected final void disposeInternal(final long handle) {
+    disposeInternalJni(handle);
+  }
+
+  private static native void disposeInternalJni(final long handle);
+
+  private static native void setWaitForFlush(final long handle, final boolean wait);
+  private static native boolean waitForFlush(final long handle);
+  private static native void setAllowWriteStall(final long handle, final boolean allowWriteStall);
+  private static native boolean allowWriteStall(final long handle);
+  private static native void setListenerWait(final long handle, final boolean listenerWait);
+  private static native boolean listenerWait(final long handle);
 }

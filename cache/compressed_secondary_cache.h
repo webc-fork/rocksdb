@@ -9,13 +9,13 @@
 #include <cstddef>
 #include <memory>
 
-#include "cache/lru_cache.h"
-#include "memory/memory_allocator.h"
+#include "cache/cache_reservation_manager.h"
+#include "memory/memory_allocator_impl.h"
+#include "rocksdb/advanced_compression.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
-#include "util/compression.h"
-#include "util/mutexlock.h"
+#include "util/atomic.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -29,6 +29,10 @@ class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
       const CompressedSecondaryCacheResultHandle&) = delete;
   CompressedSecondaryCacheResultHandle& operator=(
       const CompressedSecondaryCacheResultHandle&) = delete;
+  CompressedSecondaryCacheResultHandle(CompressedSecondaryCacheResultHandle&&) =
+      delete;
+  CompressedSecondaryCacheResultHandle& operator=(
+      CompressedSecondaryCacheResultHandle&&) = delete;
 
   bool IsReady() override { return true; }
 
@@ -69,27 +73,23 @@ class CompressedSecondaryCacheResultHandle : public SecondaryCacheResultHandle {
 
 class CompressedSecondaryCache : public SecondaryCache {
  public:
-  CompressedSecondaryCache(
-      size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-      double high_pri_pool_ratio, double low_pri_pool_ratio,
-      std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
-      bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
-      CacheMetadataChargePolicy metadata_charge_policy =
-          kDefaultCacheMetadataChargePolicy,
-      CompressionType compression_type = CompressionType::kLZ4Compression,
-      uint32_t compress_format_version = 2,
-      bool enable_custom_split_merge = false);
+  explicit CompressedSecondaryCache(
+      const CompressedSecondaryCacheOptions& opts);
   ~CompressedSecondaryCache() override;
 
   const char* Name() const override { return "CompressedSecondaryCache"; }
 
   Status Insert(const Slice& key, Cache::ObjectPtr value,
-                const Cache::CacheItemHelper* helper) override;
+                const Cache::CacheItemHelper* helper,
+                bool force_insert) override;
+
+  Status InsertSaved(const Slice& key, const Slice& saved, CompressionType type,
+                     CacheTier source) override;
 
   std::unique_ptr<SecondaryCacheResultHandle> Lookup(
       const Slice& key, const Cache::CacheItemHelper* helper,
       Cache::CreateContext* create_context, bool /*wait*/, bool advise_erase,
-      bool& is_in_sec_cache) override;
+      Statistics* stats, bool& kept_in_sec_cache) override;
 
   bool SupportForceErase() const override { return true; }
 
@@ -101,10 +101,16 @@ class CompressedSecondaryCache : public SecondaryCache {
 
   Status GetCapacity(size_t& capacity) override;
 
+  Status Deflate(size_t decrease) override;
+
+  Status Inflate(size_t increase) override;
+
   std::string GetPrintableOptions() const override;
 
+  size_t TEST_GetUsage() { return cache_->GetUsage(); }
+
  private:
-  friend class CompressedSecondaryCacheTest;
+  friend class CompressedSecondaryCacheTestBase;
   static constexpr std::array<uint16_t, 8> malloc_bin_sizes_{
       128, 256, 512, 1024, 2048, 4096, 8192, 16384};
 
@@ -121,20 +127,27 @@ class CompressedSecondaryCache : public SecondaryCache {
   // Split value into chunks to better fit into jemalloc bins. The chunks
   // are stored in CacheValueChunk and extra charge is needed for each chunk,
   // so the cache charge is recalculated here.
-  CacheValueChunk* SplitValueIntoChunks(const Slice& value,
-                                        CompressionType compression_type,
-                                        size_t& charge);
+  CacheValueChunk* SplitValueIntoChunks(const Slice& value, size_t& charge);
 
-  // After merging chunks, the extra charge for each chunk is removed, so
-  // the charge is recalculated.
-  CacheAllocationPtr MergeChunksIntoValue(const void* chunks_head,
-                                          size_t& charge);
+  std::string MergeChunksIntoValue(const CacheValueChunk* head);
+
+  bool MaybeInsertDummy(const Slice& key);
+
+  Status InsertInternal(const Slice& key, Cache::ObjectPtr value,
+                        const Cache::CacheItemHelper* helper,
+                        CompressionType type, CacheTier source);
+
+  size_t TEST_GetCharge(const Slice& key);
 
   // TODO: clean up to use cleaner interfaces in typed_cache.h
   const Cache::CacheItemHelper* GetHelper(bool enable_custom_split_merge) const;
   std::shared_ptr<Cache> cache_;
   CompressedSecondaryCacheOptions cache_options_;
+  std::unique_ptr<Compressor> compressor_;
+  std::shared_ptr<Decompressor> decompressor_;
   mutable port::Mutex capacity_mutex_;
+  std::shared_ptr<ConcurrentCacheReservationManager> cache_res_mgr_;
+  RelaxedAtomic<bool> disable_cache_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

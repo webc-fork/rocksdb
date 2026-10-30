@@ -9,7 +9,7 @@
 
 #include "rocksdb/status.h"
 
-#include <stdio.h>
+#include <cstdio>
 #ifdef OS_WIN
 #include <string.h>
 #endif
@@ -21,8 +21,8 @@ namespace ROCKSDB_NAMESPACE {
 
 std::unique_ptr<const char[]> Status::CopyState(const char* s) {
   const size_t cch = std::strlen(s) + 1;  // +1 for the null terminator
-  char* rv = new char[cch];
-  std::strncpy(rv, s, cch);
+  char* rv = new char[cch];               // does no zero-init;
+  std::memcpy(rv, s, cch);
   return std::unique_ptr<const char[]>(rv);
 }
 
@@ -41,9 +41,14 @@ static const char* msgs[static_cast<int>(Status::kMaxSubCode)] = {
     "Insufficient capacity for merge operands",
     // kManualCompactionPaused
     "Manual compaction paused",
-    " (overwritten)",    // kOverwritten, subcode of OK
-    "Txn not prepared",  // kTxnNotPrepared
-    "IO fenced off",     // kIOFenced
+    " (overwritten)",         // kOverwritten, subcode of OK
+    "Txn not prepared",       // kTxnNotPrepared
+    "IO fenced off",          // kIOFenced
+    "Merge operator failed",  // kMergeOperatorFailed
+    "Number of operands merged exceeded threshold",  // kMergeOperandThresholdExceeded
+    "MultiScan reached file prefetch limit",         // kPrefetchLimitReached
+    "Not expected code path",                        // kNotExpectedCodePath
+    "All compactions aborted",                       // kCompactionAborted
 };
 
 Status::Status(Code _code, SubCode _subcode, const Slice& msg,

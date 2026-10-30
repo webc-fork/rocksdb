@@ -12,14 +12,15 @@
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
-#include "folly/experimental/coro/Coroutine.h"
-#include "folly/experimental/coro/Task.h"
+#include "folly/coro/Coroutine.h"
+#include "folly/coro/Task.h"
 #endif
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/table_reader_caller.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
 #include "table/multiget_context.h"
+#include "util/coro_utils.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -39,7 +40,7 @@ class MultiGetContext;
 // BlockBasedTable, PlainTable and CuckooTable format.
 class TableReader {
  public:
-  virtual ~TableReader() {}
+  virtual ~TableReader() = default;
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
@@ -60,8 +61,14 @@ class TableReader {
       size_t compaction_readahead_size = 0,
       bool allow_unprepared_value = false) = 0;
 
+  // read_options.snapshot needs to outlive this call.
   virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
       const ReadOptions& /*read_options*/) {
+    return nullptr;
+  }
+
+  virtual FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(
+      SequenceNumber /* read_seqno */, const Slice* /* timestamp */) {
     return nullptr;
   }
 
@@ -76,7 +83,8 @@ class TableReader {
   // function and letting ApproximateSize take optional start and end, so
   // that absolute start and end can be specified and optimized without
   // key / index work.
-  virtual uint64_t ApproximateOffsetOf(const Slice& key,
+  virtual uint64_t ApproximateOffsetOf(const ReadOptions& read_options,
+                                       const Slice& key,
                                        TableReaderCaller caller) = 0;
 
   // Given start and end keys, return the approximate data size in the file
@@ -84,7 +92,8 @@ class TableReader {
   // includes effects like compression of the underlying data and applicable
   // portions of metadata including filters and indexes. Nullptr for start or
   // end (or both) indicates absolute start or end of the table.
-  virtual uint64_t ApproximateSize(const Slice& start, const Slice& end,
+  virtual uint64_t ApproximateSize(const ReadOptions& read_options,
+                                   const Slice& start, const Slice& end,
                                    TableReaderCaller caller) = 0;
 
   struct Anchor {
@@ -129,6 +138,15 @@ class TableReader {
                      const SliceTransform* prefix_extractor,
                      bool skip_filters = false) = 0;
 
+#if USE_COROUTINES
+  virtual folly::coro::Task<Status> GetCoroutine(
+      const ReadOptions& readOptions, const Slice& key, GetContext* get_context,
+      const SliceTransform* prefix_extractor, bool skip_filters = false) {
+    co_return Get(readOptions, key, get_context, prefix_extractor,
+                  skip_filters);
+  }
+#endif  // USE_COROUTINES
+
   // Use bloom filters in the table file, if present, to filter out keys. The
   // mget_range will be updated to skip keys that get a negative result from
   // the filter lookup.
@@ -160,7 +178,8 @@ class TableReader {
   // Prefetch data corresponding to a give range of keys
   // Typically this functionality is required for table implementations that
   // persists the data on a non volatile storage medium like disk/SSD
-  virtual Status Prefetch(const Slice* begin = nullptr,
+  virtual Status Prefetch(const ReadOptions& /* read_options */,
+                          const Slice* begin = nullptr,
                           const Slice* end = nullptr) {
     (void)begin;
     (void)end;
@@ -170,14 +189,25 @@ class TableReader {
   }
 
   // convert db file to a human readable form
-  virtual Status DumpTable(WritableFile* /*out_file*/) {
+  virtual Status DumpTable(WritableFile* /*out_file*/,
+                           bool /*show_sequence_number_type*/ = false) {
     return Status::NotSupported("DumpTable() not supported");
   }
 
   // check whether there is corruption in this db file
   virtual Status VerifyChecksum(const ReadOptions& /*read_options*/,
-                                TableReaderCaller /*caller*/) {
+                                TableReaderCaller /*caller*/,
+                                bool /*meta_blocks_only*/ = false) {
     return Status::NotSupported("VerifyChecksum() not supported");
+  }
+
+  // Tell the reader that the file should now be obsolete, e.g. as a hint
+  // to delete relevant cache entries on destruction. (It might not be safe
+  // to "unpin" cache entries until destruction time.) NOTE: must be thread
+  // safe because multiple table cache references might all mark this file as
+  // obsolete when they are released (the last of which destroys this reader).
+  virtual void MarkObsolete(uint32_t /*uncache_aggressiveness*/) {
+    // no-op as default
   }
 };
 

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cassert>
+#include <cstdint>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -50,6 +51,8 @@ class SharedBlobFileMetaData {
 
   SharedBlobFileMetaData(SharedBlobFileMetaData&&) = delete;
   SharedBlobFileMetaData& operator=(SharedBlobFileMetaData&&) = delete;
+
+  ~SharedBlobFileMetaData() = default;
 
   uint64_t GetBlobFileSize() const;
   uint64_t GetBlobFileNumber() const { return blob_file_number_; }
@@ -108,6 +111,8 @@ class BlobFileMetaData {
 
   BlobFileMetaData(BlobFileMetaData&&) = delete;
   BlobFileMetaData& operator=(BlobFileMetaData&&) = delete;
+
+  ~BlobFileMetaData() = default;
 
   const std::shared_ptr<SharedBlobFileMetaData>& GetSharedMeta() const {
     return shared_meta_;

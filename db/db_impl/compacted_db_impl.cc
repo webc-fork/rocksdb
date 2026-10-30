@@ -5,17 +5,17 @@
 
 #include "db/db_impl/compacted_db_impl.h"
 
+#include <algorithm>
+
+#include "db/blob/blob_fetcher.h"
 #include "db/db_impl/db_impl.h"
+#include "db/db_impl/db_impl_metadata.h"
 #include "db/version_set.h"
 #include "logging/logging.h"
 #include "table/get_context.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-extern void MarkKeyMayExist(void* arg);
-extern bool SaveValue(void* arg, const ParsedInternalKey& parsed_key,
-                      const Slice& v, bool hit_and_return);
 
 CompactedDBImpl::CompactedDBImpl(const DBOptions& options,
                                  const std::string& dbname)
@@ -25,7 +25,7 @@ CompactedDBImpl::CompactedDBImpl(const DBOptions& options,
       version_(nullptr),
       user_comparator_(nullptr) {}
 
-CompactedDBImpl::~CompactedDBImpl() {}
+CompactedDBImpl::~CompactedDBImpl() = default;
 
 size_t CompactedDBImpl::FindFile(const Slice& key) {
   size_t right = files_.num_files - 1;
@@ -37,144 +37,88 @@ size_t CompactedDBImpl::FindFile(const Slice& key) {
       files_.files);
 }
 
-Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
-                            const Slice& key, PinnableSlice* value) {
-  return Get(options, /*column_family*/ nullptr, key, value,
-             /*timestamp*/ nullptr);
+Status CompactedDBImpl::GetWithMetadata(const ReadOptions& options,
+                                        ColumnFamilyHandle* column_family,
+                                        const Slice& key, PinnableSlice* value,
+                                        OutputMetadata* output_metadata) {
+  std::string* timestamp = GetOutputTimestamp(output_metadata);
+  bool* newer_version_present = GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    *newer_version_present = false;
+  }
+  if (value == nullptr) {
+    return Status::InvalidArgument(
+        "Cannot call GetWithMetadata with a null value");
+  }
+  return Get(options, column_family, key, value, timestamp);
 }
 
-Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
-                            const Slice& key, PinnableSlice* value,
-                            std::string* timestamp) {
-  assert(user_comparator_);
-  if (options.timestamp) {
-    const Status s = FailIfTsMismatchCf(
-        DefaultColumnFamily(), *(options.timestamp), /*ts_for_read=*/true);
-    if (!s.ok()) {
-      return s;
-    }
-  } else {
-    const Status s = FailIfCfHasTs(DefaultColumnFamily());
-    if (!s.ok()) {
-      return s;
-    }
-  }
-
-  // Clear the timestamps for returning results so that we can distinguish
-  // between tombstone or key that has never been written
-  if (timestamp) {
-    timestamp->clear();
-  }
-
-  GetWithTimestampReadCallback read_cb(kMaxSequenceNumber);
-  std::string* ts =
-      user_comparator_->timestamp_size() > 0 ? timestamp : nullptr;
-  LookupKey lkey(key, kMaxSequenceNumber, options.timestamp);
-  GetContext get_context(user_comparator_, nullptr, nullptr, nullptr,
-                         GetContext::kNotFound, lkey.user_key(), value,
-                         /*columns=*/nullptr, ts, nullptr, nullptr, true,
-                         nullptr, nullptr, nullptr, nullptr, &read_cb);
-
-  const FdWithKeyRange& f = files_.files[FindFile(lkey.user_key())];
-  if (user_comparator_->CompareWithoutTimestamp(
-          key, /*a_has_ts=*/false,
-          ExtractUserKeyAndStripTimestamp(f.smallest_key,
-                                          user_comparator_->timestamp_size()),
-          /*b_has_ts=*/false) < 0) {
-    return Status::NotFound();
-  }
-  Status s = f.fd.table_reader->Get(options, lkey.internal_key(), &get_context,
-                                    nullptr);
-  if (!s.ok() && !s.IsNotFound()) {
+Status CompactedDBImpl::GetEntityWithMetadata(const ReadOptions& options,
+                                              ColumnFamilyHandle* column_family,
+                                              const Slice& key,
+                                              PinnableWideColumns* columns,
+                                              OutputMetadata* output_metadata) {
+  Status s = InitGetEntityOutputMetadata(output_metadata);
+  if (!s.ok()) {
     return s;
   }
-  if (get_context.State() == GetContext::kFound) {
-    return Status::OK();
-  }
-  return Status::NotFound();
+  return GetEntity(options, column_family, key, columns);
 }
 
-std::vector<Status> CompactedDBImpl::MultiGet(
-    const ReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
-    const std::vector<Slice>& keys, std::vector<std::string>* values) {
-  return MultiGet(options, keys, values, /*timestamps*/ nullptr);
-}
-
-std::vector<Status> CompactedDBImpl::MultiGet(
-    const ReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
-    const std::vector<Slice>& keys, std::vector<std::string>* values,
-    std::vector<std::string>* timestamps) {
-  assert(user_comparator_);
-  size_t num_keys = keys.size();
-
-  if (options.timestamp) {
-    Status s = FailIfTsMismatchCf(DefaultColumnFamily(), *(options.timestamp),
-                                  /*ts_for_read=*/true);
-    if (!s.ok()) {
-      return std::vector<Status>(num_keys, s);
-    }
-  } else {
-    Status s = FailIfCfHasTs(DefaultColumnFamily());
-    if (!s.ok()) {
-      return std::vector<Status>(num_keys, s);
-    }
-  }
-
-  // Clear the timestamps for returning results so that we can distinguish
-  // between tombstone or key that has never been written
-  if (timestamps) {
-    for (auto& ts : *timestamps) {
-      ts.clear();
-    }
-  }
-
-  GetWithTimestampReadCallback read_cb(kMaxSequenceNumber);
-  autovector<TableReader*, 16> reader_list;
-  for (const auto& key : keys) {
-    LookupKey lkey(key, kMaxSequenceNumber, options.timestamp);
-    const FdWithKeyRange& f = files_.files[FindFile(lkey.user_key())];
-    if (user_comparator_->CompareWithoutTimestamp(
-            key, /*a_has_ts=*/false,
-            ExtractUserKeyAndStripTimestamp(f.smallest_key,
-                                            user_comparator_->timestamp_size()),
-            /*b_has_ts=*/false) < 0) {
-      reader_list.push_back(nullptr);
-    } else {
-      f.fd.table_reader->Prepare(lkey.internal_key());
-      reader_list.push_back(f.fd.table_reader);
-    }
-  }
-  std::vector<Status> statuses(num_keys, Status::NotFound());
-  values->resize(num_keys);
-  if (timestamps) {
+void CompactedDBImpl::MultiGetWithMetadata(
+    const ReadOptions& options, size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableSlice* values, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, const bool sorted_input) {
+  std::vector<std::string>* timestamps = GetOutputTimestamps(output_metadata);
+  if (timestamps != nullptr) {
     timestamps->resize(num_keys);
   }
-  int idx = 0;
-  for (auto* r : reader_list) {
-    if (r != nullptr) {
-      PinnableSlice pinnable_val;
-      std::string& value = (*values)[idx];
-      LookupKey lkey(keys[idx], kMaxSequenceNumber, options.timestamp);
-      std::string* timestamp = timestamps ? &(*timestamps)[idx] : nullptr;
-      GetContext get_context(
-          user_comparator_, nullptr, nullptr, nullptr, GetContext::kNotFound,
-          lkey.user_key(), &pinnable_val, /*columns=*/nullptr,
-          user_comparator_->timestamp_size() > 0 ? timestamp : nullptr, nullptr,
-          nullptr, true, nullptr, nullptr, nullptr, nullptr, &read_cb);
-      Status s = r->Get(options, lkey.internal_key(), &get_context, nullptr);
-      assert(static_cast<size_t>(idx) < statuses.size());
-      if (!s.ok() && !s.IsNotFound()) {
-        statuses[idx] = s;
-      } else {
-        value.assign(pinnable_val.data(), pinnable_val.size());
-        if (get_context.State() == GetContext::kFound) {
-          statuses[idx] = Status::OK();
-        }
-      }
-    }
-    ++idx;
+  std::vector<uint8_t>* newer_version_present =
+      GetOutputNewerVersionPresent(output_metadata);
+  if (newer_version_present != nullptr) {
+    newer_version_present->assign(num_keys, false);
   }
-  return statuses;
+  autovector<ColumnFamilyHandle*, MultiGetContext::MAX_BATCH_SIZE>
+      stack_column_families;
+  std::vector<ColumnFamilyHandle*> heap_column_families;
+  ColumnFamilyHandle** mutable_column_families = MakeMutableCfHandles(
+      column_families, num_keys, &stack_column_families, &heap_column_families);
+  MultiGet(options, num_keys, mutable_column_families, keys, values,
+           timestamps != nullptr ? timestamps->data() : nullptr, statuses,
+           sorted_input);
+}
+
+void CompactedDBImpl::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys,
+    ColumnFamilyHandle* const* column_families, const Slice* keys,
+    PinnableWideColumns* results, Status* statuses,
+    MultiGetOutputMetadata* output_metadata, bool sorted_input) {
+  const Status s = InitMultiGetEntityOutputMetadata(num_keys, output_metadata);
+  if (!s.ok()) {
+    std::fill_n(statuses, num_keys, s);
+    return;
+  }
+  MultiGetEntityWithoutNewerVersionTracking(this, options, num_keys,
+                                            column_families, keys, results,
+                                            statuses, sorted_input);
+}
+
+void CompactedDBImpl::MultiGetEntityWithMetadata(
+    const ReadOptions& options, size_t num_keys, const Slice* keys,
+    PinnableAttributeGroups* results, MultiGetOutputMetadata* output_metadata) {
+  const size_t total_count = CountAttributeGroups(num_keys, results);
+  const Status s =
+      InitMultiGetEntityOutputMetadata(total_count, output_metadata);
+  if (!results) {
+    s.PermitUncheckedError();
+    return;
+  }
+  if (!s.ok()) {
+    SetAttributeGroupsStatus(num_keys, results, s);
+    return;
+  }
+  MultiGetEntity(options, num_keys, keys, results);
 }
 
 Status CompactedDBImpl::Init(const Options& options) {
@@ -210,6 +154,7 @@ Status CompactedDBImpl::Init(const Options& options) {
       return Status::NotSupported("Both L0 and other level contain files");
     }
     files_ = l0;
+    files_level_ = 0;
     return Status::OK();
   }
 
@@ -222,13 +167,14 @@ Status CompactedDBImpl::Init(const Options& options) {
   int level = vstorage->num_non_empty_levels() - 1;
   if (vstorage->LevelFilesBrief(level).num_files > 0) {
     files_ = vstorage->LevelFilesBrief(level);
+    files_level_ = level;
     return Status::OK();
   }
   return Status::NotSupported("no file exists");
 }
 
 Status CompactedDBImpl::Open(const Options& options, const std::string& dbname,
-                             DB** dbptr) {
+                             std::unique_ptr<DB>* dbptr) {
   *dbptr = nullptr;
 
   if (options.max_open_files != -1) {
@@ -241,15 +187,35 @@ Status CompactedDBImpl::Open(const Options& options, const std::string& dbname,
   std::unique_ptr<CompactedDBImpl> db(new CompactedDBImpl(db_options, dbname));
   Status s = db->Init(options);
   if (s.ok()) {
+    {
+      InstrumentedMutexLock l(&db->mutex_);
+      db->opened_successfully_ = true;
+      if (db->immutable_db_options_.open_files_async) {
+        db->ScheduleAsyncFileOpening();
+      }
+    }
     s = db->StartPeriodicTaskScheduler();
   }
   if (s.ok()) {
     ROCKS_LOG_INFO(db->immutable_db_options_.info_log,
                    "Opened the db as fully compacted mode");
     LogFlush(db->immutable_db_options_.info_log);
-    *dbptr = db.release();
+    *dbptr = std::move(db);
   }
   return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
+
+// Generate the regular and coroutine versions of the functions defined in
+// compacted_db_impl_sync_and_async.h by including it twice. The macros expand
+// differently based on whether WITH_COROUTINES or WITHOUT_COROUTINES is
+// defined.
+// clang-format off
+#define WITHOUT_COROUTINES
+#include "db/db_impl/compacted_db_impl_sync_and_async.h"
+#undef WITHOUT_COROUTINES
+#define WITH_COROUTINES
+#include "db/db_impl/compacted_db_impl_sync_and_async.h"
+#undef WITH_COROUTINES
+// clang-format on

@@ -260,7 +260,7 @@ void locktree_manager::run_escalation(void) {
     static void run(void *extra) {
       locktree_manager *mgr = (locktree_manager *)extra;
       mgr->escalate_all_locktrees();
-    };
+    }
   };
   m_escalator.run(this, escalation_fn::run, this);
 }
@@ -505,20 +505,6 @@ void locktree_manager::get_status(LTM_STATUS statp) {
   LTM_STATUS_VAL(LTM_LONG_WAIT_TIME) = lt_counters.long_wait_time;
   LTM_STATUS_VAL(LTM_TIMEOUT_COUNT) = lt_counters.timeout_count;
   *statp = ltm_status;
-}
-
-void locktree_manager::kill_waiter(void *extra) {
-  mutex_lock();
-  int r = 0;
-  uint32_t num_locktrees = m_locktree_map.size();
-  for (uint32_t i = 0; i < num_locktrees; i++) {
-    locktree *lt;
-    r = m_locktree_map.fetch(i, &lt);
-    invariant_zero(r);
-    if (r) continue;  // Get rid of "may be used uninitialized" warning
-    lock_request::kill_waiter(lt, extra);
-  }
-  mutex_unlock();
 }
 
 } /* namespace toku */

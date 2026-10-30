@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include "rocksdb/db.h"
 #include "rocksdb/types.h"
 
@@ -15,7 +14,7 @@ namespace ROCKSDB_NAMESPACE {
 // store multiple versions of a same user key due to snapshots, compaction not
 // happening yet, etc.
 struct KeyVersion {
-  KeyVersion() : user_key(""), value(""), sequence(0), type(0) {}
+  KeyVersion() : sequence(0), type(0) {}
 
   KeyVersion(const std::string& _user_key, const std::string& _value,
              SequenceNumber _sequence, int _type)
@@ -34,13 +33,12 @@ struct KeyVersion {
 // copied to memory, if the range covers too many keys, the memory usage
 // may be huge. `max_num_ikeys` can be used to cap the memory usage.
 // The result is inserted into the provided vector, `key_versions`.
-Status GetAllKeyVersions(DB* db, Slice begin_key, Slice end_key,
+Status GetAllKeyVersions(DB* db, OptSlice begin_key, OptSlice end_key,
                          size_t max_num_ikeys,
                          std::vector<KeyVersion>* key_versions);
 
-Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, Slice begin_key,
-                         Slice end_key, size_t max_num_ikeys,
+Status GetAllKeyVersions(DB* db, ColumnFamilyHandle* cfh, OptSlice begin_key,
+                         OptSlice end_key, size_t max_num_ikeys,
                          std::vector<KeyVersion>* key_versions);
 
 }  // namespace ROCKSDB_NAMESPACE
-

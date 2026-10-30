@@ -9,18 +9,24 @@
 
 #pragma once
 
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "db/column_family.h"
 #include "db/log_writer.h"
 #include "db/version_set.h"
+#include "util/autovector.h"
+#include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 class MemTable;
 struct SuperVersion;
 
+// The purpose of this struct is to simplify pushing work such as
+// allocation/construction, de-allocation/destruction, and notifications to
+// outside of holding the DB mutex.
 struct SuperVersionContext {
   struct WriteStallNotification {
     WriteStallInfo write_stall_info;
@@ -47,6 +53,7 @@ struct SuperVersionContext {
   // No copies
   SuperVersionContext(const SuperVersionContext& other) = delete;
   void operator=(const SuperVersionContext& other) = delete;
+  void operator=(SuperVersionContext&& other) = delete;
 
   void NewSuperVersion() {
     new_superversion = std::unique_ptr<SuperVersion>(new SuperVersion());
@@ -119,7 +126,7 @@ struct JobContext {
         break;
       }
     }
-    return memtables_to_free.size() > 0 || logs_to_free.size() > 0 ||
+    return memtables_to_free.size() > 0 || wals_to_free.size() > 0 ||
            job_snapshot != nullptr || sv_have_sth;
   }
 
@@ -129,6 +136,37 @@ struct JobContext {
       return job_snapshot->snapshot()->GetSequenceNumber();
     }
     return kMaxSequenceNumber;
+  }
+
+  SequenceNumber GetLatestSnapshotSequence() const {
+    assert(snapshot_context_initialized);
+    if (snapshot_seqs.empty()) {
+      return 0;
+    }
+    return snapshot_seqs.back();
+  }
+
+  SequenceNumber GetEarliestSnapshotSequence() const {
+    assert(snapshot_context_initialized);
+    if (snapshot_seqs.empty()) {
+      return kMaxSequenceNumber;
+    }
+    return snapshot_seqs.front();
+  }
+
+  void InitSnapshotContext(SnapshotChecker* checker,
+                           std::unique_ptr<ManagedSnapshot> managed_snapshot,
+                           SequenceNumber earliest_write_conflict,
+                           std::vector<SequenceNumber>&& snapshots) {
+    if (snapshot_context_initialized) {
+      return;
+    }
+    snapshot_context_initialized = true;
+    snapshot_checker = checker;
+    assert(!job_snapshot);
+    job_snapshot = std::move(managed_snapshot);
+    earliest_write_conflict_snapshot = earliest_write_conflict;
+    snapshot_seqs = std::move(snapshots);
   }
 
   // Structure to store information for candidate files to delete.
@@ -141,9 +179,6 @@ struct JobContext {
       return file_name == other.file_name && file_path == other.file_path;
     }
   };
-
-  // Unique job id
-  int job_id;
 
   // a list of all files that we'll consider deleting
   // (every once in a while this is filled up with all files
@@ -170,41 +205,87 @@ struct JobContext {
   // will be reused later
   std::vector<uint64_t> log_recycle_files;
 
+  // Files quarantined from deletion. This list contains file numbers for files
+  // that are in an ambiguous states. This includes newly generated SST files
+  // and blob files from flush and compaction job whose VersionEdits' persist
+  // state in Manifest are unclear. An old manifest file whose immediately
+  // following new manifest file's CURRENT file creation is in an unclear state.
+  // WAL logs don't have this premature deletion risk since
+  // min_log_number_to_keep is only updated after successful manifest commits.
+  // So this data structure doesn't track log files.
+  autovector<uint64_t> files_to_quarantine;
+
+  // Blob file numbers that PurgeObsoleteFiles must keep. This includes both
+  // actively written direct-write files and sealed direct-write files that are
+  // still reachable through live memtables / old SuperVersions.
+  // Collected under db_mutex_ in FindObsoleteFiles so PurgeObsoleteFiles can
+  // safely use the snapshot without taking DB mutex.
+  UnorderedSet<uint64_t> active_blob_direct_write_files;
+
+  // Snapshot of VersionSet's next file number taken before collecting active
+  // direct-write blob files. This keeps the current purge pass from racing a
+  // concurrently created blob file that was not yet part of the active set.
+  uint64_t min_blob_file_number_to_keep = std::numeric_limits<uint64_t>::max();
+
   // a list of manifest files that we need to delete
   std::vector<std::string> manifest_delete_files;
 
   // a list of memtables to be free
-  autovector<MemTable*> memtables_to_free;
+  autovector<ReadOnlyMemTable*> memtables_to_free;
 
   // contexts for installing superversions for multiple column families
   std::vector<SuperVersionContext> superversion_contexts;
 
-  autovector<log::Writer*> logs_to_free;
+  autovector<log::Writer*> wals_to_free;
 
   // the current manifest_file_number, log_number and prev_log_number
   // that corresponds to the set of files in 'live'.
-  uint64_t manifest_file_number;
-  uint64_t pending_manifest_file_number;
-  uint64_t log_number;
-  uint64_t prev_log_number;
+  uint64_t manifest_file_number = 0;
+  uint64_t pending_manifest_file_number = 0;
+
+  // Used for remote compaction. To prevent OPTIONS files from getting
+  // purged by PurgeObsoleteFiles() of the primary host
+  uint64_t min_options_file_number;
+  // Exact OPTIONS file committed by the current MANIFEST. Unlike
+  // min_options_file_number, this protects one authoritative file even when
+  // higher-numbered uncommitted OPTIONS files exist.
+  uint64_t manifest_options_file_number = 0;
+  uint64_t log_number = 0;
+  uint64_t prev_log_number = 0;
 
   uint64_t min_pending_output = 0;
-  uint64_t prev_total_log_size = 0;
-  size_t num_alive_log_files = 0;
+  uint64_t prev_wals_total_size = 0;
+  size_t num_alive_wal_files = 0;
   uint64_t size_log_to_delete = 0;
 
   // Snapshot taken before flush/compaction job.
   std::unique_ptr<ManagedSnapshot> job_snapshot;
+  SnapshotChecker* snapshot_checker = nullptr;
+  std::vector<SequenceNumber> snapshot_seqs;
+  // This is the earliest snapshot that could be used for write-conflict
+  // checking by a transaction.  For any user-key newer than this snapshot, we
+  // should make sure not to remove evidence that a write occurred.
+  SequenceNumber earliest_write_conflict_snapshot = kMaxSequenceNumber;
+
+  // Unique job id
+  int job_id;
+
+  bool snapshot_context_initialized = false;
 
   explicit JobContext(int _job_id, bool create_superversion = false) {
     job_id = _job_id;
-    manifest_file_number = 0;
-    pending_manifest_file_number = 0;
-    log_number = 0;
-    prev_log_number = 0;
     superversion_contexts.emplace_back(
         SuperVersionContext(create_superversion));
   }
+
+  // Delete the default constructor
+  JobContext() = delete;
+
+  // No copying allowed
+  JobContext(const JobContext&) = delete;
+  JobContext& operator=(const JobContext&) = delete;
+  JobContext(JobContext&&) = delete;
+  JobContext& operator=(JobContext&&) = delete;
 
   // For non-empty JobContext Clean() has to be called at least once before
   // before destruction (see asserts in ~JobContext()). Should be called with
@@ -219,18 +300,18 @@ struct JobContext {
     for (auto m : memtables_to_free) {
       delete m;
     }
-    for (auto l : logs_to_free) {
+    for (auto l : wals_to_free) {
       delete l;
     }
 
     memtables_to_free.clear();
-    logs_to_free.clear();
+    wals_to_free.clear();
     job_snapshot.reset();
   }
 
   ~JobContext() {
     assert(memtables_to_free.size() == 0);
-    assert(logs_to_free.size() == 0);
+    assert(wals_to_free.size() == 0);
   }
 };
 

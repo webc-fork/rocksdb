@@ -40,6 +40,12 @@ class RangeLockList {
 
   RangeLockList() : releasing_locks_(false) {}
 
+  // No copying allowed
+  RangeLockList(const RangeLockList&) = delete;
+  RangeLockList& operator=(const RangeLockList&) = delete;
+  RangeLockList(RangeLockList&&) = delete;
+  RangeLockList& operator=(RangeLockList&&) = delete;
+
   void Append(ColumnFamilyId cf_id, const DBT* left_key, const DBT* right_key);
   void ReleaseLocks(RangeTreeLockManager* mgr, PessimisticTransaction* txn,
                     bool all_trx_locks);
@@ -63,9 +69,12 @@ class RangeLockList {
 class RangeTreeLockTracker : public LockTracker {
  public:
   RangeTreeLockTracker() : range_list_(nullptr) {}
+  ~RangeTreeLockTracker() override = default;
 
   RangeTreeLockTracker(const RangeTreeLockTracker&) = delete;
   RangeTreeLockTracker& operator=(const RangeTreeLockTracker&) = delete;
+  RangeTreeLockTracker(RangeTreeLockTracker&&) = delete;
+  RangeTreeLockTracker& operator=(RangeTreeLockTracker&&) = delete;
 
   void Track(const PointLockRequest&) override;
   void Track(const RangeLockRequest&) override;
@@ -94,7 +103,7 @@ class RangeTreeLockTracker : public LockTracker {
   void Clear() override;
 
   // "If this method is not supported, returns nullptr."
-  virtual LockTracker* GetTrackedLocksSinceSavePoint(
+  LockTracker* GetTrackedLocksSinceSavePoint(
       const LockTracker&) const override {
     return nullptr;
   }
@@ -116,7 +125,9 @@ class RangeTreeLockTracker : public LockTracker {
 
   void ReleaseLocks(RangeTreeLockManager* mgr, PessimisticTransaction* txn,
                     bool all_trx_locks) {
-    if (range_list_) range_list_->ReleaseLocks(mgr, txn, all_trx_locks);
+    if (range_list_) {
+      range_list_->ReleaseLocks(mgr, txn, all_trx_locks);
+    }
   }
 
   void ReplaceLocks(const toku::locktree* lt,

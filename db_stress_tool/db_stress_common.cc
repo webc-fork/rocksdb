@@ -11,16 +11,25 @@
 #ifdef GFLAGS
 #include "db_stress_tool/db_stress_common.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <limits>
+#include <mutex>
 
+#include "db_stress_tool/db_stress_test_base.h"
+#include "file/file_util.h"
+#include "file/filename.h"
+#include "rocksdb/secondary_cache.h"
 #include "util/file_checksum_helper.h"
 #include "util/xxhash.h"
 
-ROCKSDB_NAMESPACE::Env* db_stress_listener_env = nullptr;
-ROCKSDB_NAMESPACE::Env* db_stress_env = nullptr;
-// If non-null, injects read error at a rate specified by the
-// read_fault_one_in or write_fault_one_in flag
-std::shared_ptr<ROCKSDB_NAMESPACE::FaultInjectionTestFS> fault_fs_guard;
+ROCKSDB_NAMESPACE::Env* raw_env = nullptr;
+std::shared_ptr<ROCKSDB_NAMESPACE::SecondaryCache> compressed_secondary_cache;
+std::shared_ptr<ROCKSDB_NAMESPACE::Cache> block_cache;
+std::shared_ptr<ROCKSDB_NAMESPACE::WriteBufferManager> wbm;
+std::shared_ptr<ROCKSDB_NAMESPACE::RateLimiter> rate_limiter;
 enum ROCKSDB_NAMESPACE::CompressionType compression_type_e =
     ROCKSDB_NAMESPACE::kSnappyCompression;
 enum ROCKSDB_NAMESPACE::CompressionType bottommost_compression_type_e =
@@ -32,6 +41,83 @@ std::vector<double> sum_probs(100001);
 constexpr int64_t zipf_sum_size = 100000;
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+class BlockingAsyncCallback : public DB::AsyncCallback {
+ public:
+  void OnComplete() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    done_ = true;
+    cv_.notify_one();
+  }
+
+  void Wait() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this] { return done_; });
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+};
+
+}  // namespace
+
+Status DbStressGet(DB* db, const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   PinnableSlice* value, std::string* timestamp) {
+#if USE_COROUTINES
+  if (FLAGS_use_async_db_api) {
+    BlockingAsyncCallback callback;
+    Status status;
+    db->GetAsync(options, column_family, key, value, timestamp, status,
+                 callback);
+    callback.Wait();
+    return status;
+  }
+#endif  // USE_COROUTINES
+  return db->Get(options, column_family, key, value, timestamp);
+}
+
+Status DbStressGet(DB* db, const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   std::string* value, std::string* timestamp) {
+#if USE_COROUTINES
+  if (FLAGS_use_async_db_api) {
+    BlockingAsyncCallback callback;
+    Status status;
+    db->GetAsync(options, column_family, key, value, timestamp, status,
+                 callback);
+    callback.Wait();
+    return status;
+  }
+#endif  // USE_COROUTINES
+  return db->Get(options, column_family, key, value, timestamp);
+}
+
+Status DbStressGet(DB* db, const ReadOptions& options, const Slice& key,
+                   std::string* value) {
+  return DbStressGet(db, options, db->DefaultColumnFamily(), key, value);
+}
+
+void DbStressMultiGet(DB* db, const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, size_t num_keys,
+                      const Slice* keys, PinnableSlice* values,
+                      Status* statuses) {
+#if USE_COROUTINES
+  if (FLAGS_use_async_db_api) {
+    std::vector<ColumnFamilyHandle*> column_families(num_keys, column_family);
+    BlockingAsyncCallback callback;
+    db->MultiGetAsync(options, num_keys, column_families.data(), keys, values,
+                      statuses, callback);
+    callback.Wait();
+    return;
+  }
+#endif  // USE_COROUTINES
+  db->MultiGet(options, column_family, num_keys, keys, values, statuses);
+}
 
 // Zipfian distribution is generated based on a pre-calculated array.
 // It should be used before start the stress test.
@@ -70,7 +156,10 @@ void InitializeHotKeyGenerator(double alpha) {
 // the closer to 0, the higher probability will be. To randomly distribute
 // the hot keys in [0, max_key], we use Random64 to shuffle it.
 int64_t GetOneHotKeyID(double rand_seed, int64_t max_key) {
-  int64_t low = 1, mid, high = zipf_sum_size, zipf = 0;
+  int64_t low = 1;
+  int64_t mid;
+  int64_t high = zipf_sum_size;
+  int64_t zipf = 0;
   while (low <= high) {
     mid = (low + high) / 2;
     if (sum_probs[mid] >= rand_seed && sum_probs[mid - 1] < rand_seed) {
@@ -87,9 +176,248 @@ int64_t GetOneHotKeyID(double rand_seed, int64_t max_key) {
   return rand_local.Next() % max_key;
 }
 
+namespace {
+
+constexpr uint64_t kLongActiveOperationTimeoutMultiplier = 4;
+
+int LivenessSleepMicros() {
+  const std::chrono::microseconds max_sleep_micros(
+      std::numeric_limits<int>::max());
+  const uint64_t max_sleep_seconds =
+      std::chrono::duration_cast<std::chrono::seconds>(max_sleep_micros)
+          .count();
+  const std::chrono::seconds sleep_seconds(
+      std::min(FLAGS_liveness_check_interval_sec, max_sleep_seconds));
+  return static_cast<int>(
+      std::chrono::duration_cast<std::chrono::microseconds>(sleep_seconds)
+          .count());
+}
+
+bool StopBgThreadIfNeeded(SharedState* shared) {
+  port::Mutex* mu = shared->GetMutex();
+  // The liveness watchdog must not block on the shared harness mutex; a stuck
+  // holder is one of the failure modes it needs to report.
+  if (!mu->TryLock()) {
+    return false;
+  }
+
+  if (!shared->ShouldStopBgThread()) {
+    mu->Unlock();
+    return false;
+  }
+
+  shared->IncBgThreadsFinished();
+  if (shared->BgThreadsFinished()) {
+    shared->GetCondVar()->SignalAll();
+  }
+  mu->Unlock();
+  return true;
+}
+
+uint64_t ElapsedMicros(uint64_t now, uint64_t start) {
+  return now >= start ? now - start : 0;
+}
+
+uint64_t ElapsedSeconds(uint64_t now, uint64_t start) {
+  constexpr uint64_t kMicrosPerSecond = 1000 * 1000;
+  return ElapsedMicros(now, start) / kMicrosPerSecond;
+}
+
+uint64_t ActiveOperationTimeoutSeconds(StressOperationType type,
+                                       uint64_t no_progress_timeout_sec) {
+  switch (type) {
+    case StressOperationType::kNone:
+    case StressOperationType::kCount:
+      return 0;
+    case StressOperationType::kCompactFiles:
+    case StressOperationType::kCompactRange:
+    case StressOperationType::kFlush:
+    case StressOperationType::kVerifyDb:
+    case StressOperationType::kVerifyChecksum:
+    case StressOperationType::kVerifyFileChecksums:
+    case StressOperationType::kIngestExternalFile:
+    case StressOperationType::kBackup:
+    case StressOperationType::kCheckpoint:
+    case StressOperationType::kApproximateSize:
+    case StressOperationType::kPauseBackground:
+    case StressOperationType::kGetLiveFiles:
+      return no_progress_timeout_sec * kLongActiveOperationTimeoutMultiplier;
+    case StressOperationType::kReopen:
+    case StressOperationType::kSetOptions:
+    case StressOperationType::kManualWalFlush:
+    case StressOperationType::kLockWal:
+    case StressOperationType::kSyncWal:
+    case StressOperationType::kMetadata:
+    case StressOperationType::kDisableFileDeletions:
+    case StressOperationType::kDisableManualCompaction:
+    case StressOperationType::kAbortResumeCompactions:
+    case StressOperationType::kGetProperty:
+    case StressOperationType::kTableProperties:
+    case StressOperationType::kSnapshot:
+    case StressOperationType::kKeyMayExist:
+    case StressOperationType::kRead:
+    case StressOperationType::kPrefixScan:
+    case StressOperationType::kWrite:
+    case StressOperationType::kDelete:
+    case StressOperationType::kDeleteRange:
+    case StressOperationType::kIterate:
+    case StressOperationType::kCustom:
+      return no_progress_timeout_sec;
+  }
+  return no_progress_timeout_sec;
+}
+
+void PrintLivenessState(SharedState* shared, uint64_t now) {
+  fprintf(stderr, "Finished db_stress operations=%" PRIu64 "\n",
+          shared->GetFinishedOps());
+  fprintf(stderr, "Successful compactions=%" PRIu64 "\n",
+          shared->GetSuccessfulCompactions());
+  fprintf(stderr, "Completed db_stress operation scopes by type:");
+  bool printed_completed_op_count = false;
+  for (size_t i = 1; i < kStressOperationTypeCount; ++i) {
+    const auto type = static_cast<StressOperationType>(i);
+    const uint64_t count = shared->GetCompletedOpsForDiagnostics(type);
+    if (count > 0) {
+      fprintf(stderr, " %s=%" PRIu64, StressOperationTypeName(type), count);
+      printed_completed_op_count = true;
+    }
+  }
+  if (!printed_completed_op_count) {
+    fprintf(stderr, " none");
+  }
+  fprintf(stderr, "\n");
+
+  for (uint32_t tid = 0; tid < shared->GetNumThreads(); ++tid) {
+    const ThreadOperationSnapshot snapshot =
+        shared->GetThreadOperationSnapshot(tid);
+    if (snapshot.type == StressOperationType::kNone ||
+        snapshot.started_micros == 0) {
+      fprintf(stderr, "thread %" PRIu32 " active_op=none\n", tid);
+      continue;
+    }
+
+    fprintf(stderr,
+            "thread %" PRIu32 " active_op=%s active_op_started_micros=%" PRIu64
+            " active_op_elapsed_micros=%" PRIu64 "\n",
+            tid, StressOperationTypeName(snapshot.type),
+            snapshot.started_micros,
+            ElapsedMicros(now, snapshot.started_micros));
+  }
+}
+
+bool HasStuckWriteOperation(SharedState* shared, uint64_t now,
+                            uint64_t timeout_sec) {
+  for (uint32_t tid = 0; tid < shared->GetNumThreads(); ++tid) {
+    const ThreadOperationSnapshot snapshot =
+        shared->GetThreadOperationSnapshot(tid);
+    const uint64_t elapsed_micros = ElapsedMicros(now, snapshot.started_micros);
+    const uint64_t elapsed_seconds =
+        ElapsedSeconds(now, snapshot.started_micros);
+    if (snapshot.type == StressOperationType::kWrite &&
+        snapshot.started_micros != 0 && elapsed_seconds >= timeout_sec) {
+      fprintf(stderr,
+              "Liveness watchdog detected a stuck write operation on thread "
+              "%" PRIu32 " for %" PRIu64
+              " seconds. active_op_elapsed_micros=%" PRIu64
+              " active_op_timeout_seconds=%" PRIu64 "\n",
+              tid, elapsed_seconds, elapsed_micros, timeout_sec);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HasTimedOutNonWriteOperation(SharedState* shared, uint64_t now,
+                                  uint64_t no_progress_timeout_sec) {
+  for (uint32_t tid = 0; tid < shared->GetNumThreads(); ++tid) {
+    const ThreadOperationSnapshot snapshot =
+        shared->GetThreadOperationSnapshot(tid);
+    if (snapshot.type == StressOperationType::kWrite ||
+        snapshot.started_micros == 0) {
+      continue;
+    }
+
+    const uint64_t timeout_sec =
+        ActiveOperationTimeoutSeconds(snapshot.type, no_progress_timeout_sec);
+    if (timeout_sec != 0 &&
+        ElapsedSeconds(now, snapshot.started_micros) >= timeout_sec) {
+      fprintf(stderr,
+              "Liveness watchdog detected a timed out active operation on "
+              "thread %" PRIu32
+              ". active_op=%s active_op_elapsed_micros=%" PRIu64
+              " active_op_timeout_seconds=%" PRIu64 "\n",
+              tid, StressOperationTypeName(snapshot.type),
+              ElapsedMicros(now, snapshot.started_micros), timeout_sec);
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+void LivenessWatchdogThread(void* v) {
+  assert(FLAGS_liveness_check_interval_sec > 0);
+  assert(FLAGS_liveness_no_progress_timeout_sec > 0);
+
+  auto* thread = static_cast<ThreadState*>(v);
+  SharedState* shared = thread->shared;
+
+  uint64_t last_finished_ops = shared->GetFinishedOps();
+  uint64_t last_progress_time_micros = raw_env->NowMicros();
+  const uint64_t no_progress_timeout_sec =
+      FLAGS_liveness_no_progress_timeout_sec;
+
+  while (true) {
+    if (StopBgThreadIfNeeded(shared)) {
+      return;
+    }
+
+    const bool started = shared->OperationStarted();
+    const bool all_operated = shared->OperationFinished();
+
+    const uint64_t now = raw_env->NowMicros();
+    if (!started || all_operated) {
+      last_finished_ops = shared->GetFinishedOps();
+      last_progress_time_micros = now;
+      raw_env->SleepForMicroseconds(LivenessSleepMicros());
+      continue;
+    }
+
+    const uint64_t finished_ops = shared->GetFinishedOps();
+    if (HasStuckWriteOperation(shared, now, no_progress_timeout_sec)) {
+      PrintLivenessState(shared, now);
+      fflush(stderr);
+      shared->TerminateWithoutMutex();
+    } else if (HasTimedOutNonWriteOperation(shared, now,
+                                            no_progress_timeout_sec)) {
+      PrintLivenessState(shared, now);
+      fflush(stderr);
+      shared->TerminateWithoutMutex();
+    } else if (finished_ops != last_finished_ops) {
+      last_finished_ops = finished_ops;
+      last_progress_time_micros = now;
+    } else if (now >= last_progress_time_micros &&
+               ElapsedSeconds(now, last_progress_time_micros) >=
+                   no_progress_timeout_sec) {
+      fprintf(stderr,
+              "Liveness watchdog detected no completed db_stress operations "
+              "for %" PRIu64 " seconds. finished_ops=%" PRIu64 "\n",
+              FLAGS_liveness_no_progress_timeout_sec, finished_ops);
+      PrintLivenessState(shared, now);
+      fflush(stderr);
+      shared->TerminateWithoutMutex();
+    } else if (now < last_progress_time_micros) {
+      last_progress_time_micros = now;
+    }
+
+    raw_env->SleepForMicroseconds(LivenessSleepMicros());
+  }
+}
+
 void PoolSizeChangeThread(void* v) {
   assert(FLAGS_compaction_thread_pool_adjust_interval > 0);
-  ThreadState* thread = reinterpret_cast<ThreadState*>(v);
+  ThreadState* thread = static_cast<ThreadState*>(v);
   SharedState* shared = thread->shared;
 
   while (true) {
@@ -112,10 +440,10 @@ void PoolSizeChangeThread(void* v) {
     if (new_thread_pool_size < 1) {
       new_thread_pool_size = 1;
     }
-    db_stress_env->SetBackgroundThreads(new_thread_pool_size,
-                                        ROCKSDB_NAMESPACE::Env::Priority::LOW);
+    raw_env->SetBackgroundThreads(new_thread_pool_size,
+                                  ROCKSDB_NAMESPACE::Env::Priority::LOW);
     // Sleep up to 3 seconds
-    db_stress_env->SleepForMicroseconds(
+    raw_env->SleepForMicroseconds(
         thread->rand.Next() % FLAGS_compaction_thread_pool_adjust_interval *
             1000 +
         1);
@@ -124,7 +452,7 @@ void PoolSizeChangeThread(void* v) {
 
 void DbVerificationThread(void* v) {
   assert(FLAGS_continuous_verification_interval > 0);
-  auto* thread = reinterpret_cast<ThreadState*>(v);
+  auto* thread = static_cast<ThreadState*>(v);
   SharedState* shared = thread->shared;
   StressTest* stress_test = shared->GetStressTest();
   assert(stress_test != nullptr);
@@ -142,8 +470,354 @@ void DbVerificationThread(void* v) {
     if (!shared->HasVerificationFailedYet()) {
       stress_test->ContinuouslyVerifyDb(thread);
     }
-    db_stress_env->SleepForMicroseconds(
+    raw_env->SleepForMicroseconds(
         thread->rand.Next() % FLAGS_continuous_verification_interval * 1000 +
+        1);
+  }
+}
+
+void CompressedCacheSetCapacityThread(void* v) {
+  assert(FLAGS_compressed_secondary_cache_size > 0 ||
+         FLAGS_compressed_secondary_cache_ratio > 0.0);
+  auto* thread = static_cast<ThreadState*>(v);
+  SharedState* shared = thread->shared;
+  while (true) {
+    {
+      MutexLock l(shared->GetMutex());
+      if (shared->ShouldStopBgThread()) {
+        shared->IncBgThreadsFinished();
+        if (shared->BgThreadsFinished()) {
+          shared->GetCondVar()->SignalAll();
+        }
+        return;
+      }
+    }
+    raw_env->SleepForMicroseconds(FLAGS_secondary_cache_update_interval);
+    if (FLAGS_compressed_secondary_cache_size > 0) {
+      Status s = compressed_secondary_cache->SetCapacity(0);
+      size_t capacity;
+      if (s.ok()) {
+        s = compressed_secondary_cache->GetCapacity(capacity);
+        assert(capacity == 0);
+      }
+      raw_env->SleepForMicroseconds(10 * 1000 * 1000);
+      if (s.ok()) {
+        s = compressed_secondary_cache->SetCapacity(
+            FLAGS_compressed_secondary_cache_size);
+      }
+      if (s.ok()) {
+        s = compressed_secondary_cache->GetCapacity(capacity);
+        assert(capacity == FLAGS_compressed_secondary_cache_size);
+      }
+      if (!s.ok()) {
+        fprintf(stderr, "Compressed cache Set/GetCapacity returned error: %s\n",
+                s.ToString().c_str());
+      }
+    } else if (FLAGS_compressed_secondary_cache_ratio > 0.0) {
+      if (thread->rand.OneIn(2)) {  // if (thread->rand.OneIn(2)) {
+        size_t capacity = block_cache->GetCapacity();
+        size_t adjustment;
+        if (FLAGS_use_write_buffer_manager && FLAGS_db_write_buffer_size > 0) {
+          adjustment = (capacity - FLAGS_db_write_buffer_size);
+        } else {
+          adjustment = capacity;
+        }
+        // Lower by upto 50% of usable block cache capacity
+        adjustment = (adjustment * thread->rand.Uniform(50)) / 100;
+        block_cache->SetCapacity(capacity - adjustment);
+        fprintf(stdout, "New cache capacity = %zu\n",
+                block_cache->GetCapacity());
+        raw_env->SleepForMicroseconds(10 * 1000 * 1000);
+        block_cache->SetCapacity(capacity);
+      } else {
+        Status s;
+        double new_comp_cache_ratio =
+            (double)thread->rand.Uniform(
+                FLAGS_compressed_secondary_cache_ratio * 100) /
+            100;
+        fprintf(stdout, "New comp cache ratio = %f\n", new_comp_cache_ratio);
+
+        s = UpdateTieredCache(block_cache, /*capacity*/ -1,
+                              new_comp_cache_ratio);
+        if (s.ok()) {
+          raw_env->SleepForMicroseconds(10 * 1000 * 1000);
+        }
+        if (s.ok()) {
+          s = UpdateTieredCache(block_cache, /*capacity*/ -1,
+                                FLAGS_compressed_secondary_cache_ratio);
+        }
+        if (!s.ok()) {
+          fprintf(stderr, "UpdateTieredCache returned error: %s\n",
+                  s.ToString().c_str());
+        }
+      }
+    }
+  }
+}
+
+#ifndef NDEBUG
+static void SetupFaultInjectionForRemoteCompaction(SharedState* shared) {
+  auto fault_fs = shared->GetStressTest()->GetDbFaultInjectionFs();
+  if (!fault_fs) {
+    return;
+  }
+
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kRead, shared->GetSeed(), FLAGS_read_fault_one_in,
+      FLAGS_inject_error_severity == 1 /* retryable */,
+      FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kRead);
+
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kWrite, shared->GetSeed(), FLAGS_write_fault_one_in,
+      FLAGS_inject_error_severity == 1 /* retryable */,
+      FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(FaultInjectionIOType::kWrite);
+
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataRead, shared->GetSeed(),
+      FLAGS_metadata_read_fault_one_in,
+      FLAGS_inject_error_severity == 1 /* retryable */,
+      FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataRead);
+
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataWrite, shared->GetSeed(),
+      FLAGS_metadata_write_fault_one_in,
+      FLAGS_inject_error_severity == 1 /* retryable */,
+      FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataWrite);
+}
+#endif  // NDEBUG
+
+static CompactionServiceOptionsOverride CreateOverrideOptions(
+    const Options& options, const CompactionServiceJobInfo& job_info) {
+  CompactionServiceOptionsOverride override_options{
+      .env = options.env,
+      .file_checksum_gen_factory = options.file_checksum_gen_factory,
+      .merge_operator = options.merge_operator,
+      .compaction_filter = options.compaction_filter,
+      .compaction_filter_factory = options.compaction_filter_factory,
+      .prefix_extractor = options.prefix_extractor,
+      .sst_partitioner_factory = options.sst_partitioner_factory,
+      .listeners = options.listeners,
+      .statistics = options.statistics,
+      .table_properties_collector_factories =
+          options.table_properties_collector_factories};
+
+  // TODO(jaykorean) - create a new compaction filter / merge operator and
+  // others for remote compactions
+  //
+  // Create a new Table Factory
+  ConfigOptions config_options;
+  config_options.ignore_unknown_options = false;
+  config_options.ignore_unsupported_options = false;
+
+  Status s = TableFactory::CreateFromString(config_options,
+                                            options.table_factory->Name(),
+                                            &override_options.table_factory);
+
+  if (s.ok()) {
+    std::string options_str;
+    s = options.table_factory->GetOptionString(config_options, &options_str);
+    if (s.ok()) {
+      s = override_options.table_factory->ConfigureFromString(config_options,
+                                                              options_str);
+    }
+  }
+
+  if (!s.ok()) {
+    fprintf(stdout,
+            "Failed to set up TableFactory for remote compaction - (%s): %s\n",
+            job_info.db_name.c_str(), s.ToString().c_str());
+  }
+
+  return override_options;
+}
+
+static Status CleanupOutputDirectory(const std::string& output_directory) {
+  // Uses raw_env (no fault injection); cleanup must always succeed.
+  Status s = DestroyDir(raw_env, output_directory);
+  if (!s.ok()) {
+    fprintf(stderr,
+            "Failed to destroy output directory %s when allow_resumption is "
+            "false: %s\n",
+            output_directory.c_str(), s.ToString().c_str());
+  }
+
+  if (s.ok()) {
+    s = raw_env->CreateDir(output_directory);
+    if (!s.ok()) {
+      fprintf(stderr,
+              "Failed to recreate output directory %s when allow_resumption is "
+              "false: %s\n",
+              output_directory.c_str(), s.ToString().c_str());
+    }
+  }
+
+  return s;
+}
+
+// Set up cancellation mechanism for testing resumable remote compactions.
+// Spawns a detached thread to trigger cancellation after a delay (50ms
+// initially, or 2/3 of the previous successful compaction time for adaptive
+// timing). First-time jobs are always canceled; retries have a 10% chance
+// to test consecutive cancellation scenarios.
+static std::shared_ptr<std::atomic<bool>> SetupCancellation(
+    OpenAndCompactOptions& open_compact_options, bool was_canceled,
+    Random& rand, uint64_t successful_compaction_end_to_end_micros) {
+  auto canceled = std::make_shared<std::atomic<bool>>(false);
+  open_compact_options.canceled = canceled.get();
+
+  bool should_cancel = !was_canceled || rand.OneIn(10);
+
+  if (should_cancel) {
+    std::thread interruption_thread(
+        [canceled, successful_compaction_end_to_end_micros]() {
+          uint64_t sleep_micros =
+              successful_compaction_end_to_end_micros == 0
+                  ? 50000
+                  : successful_compaction_end_to_end_micros * 2 / 3;
+          std::this_thread::sleep_for(std::chrono::microseconds(sleep_micros));
+          canceled->store(true);
+        });
+    interruption_thread.detach();
+  }
+
+  return canceled;
+}
+
+// Process the result of OpenAndCompact operation
+static void ProcessCompactionResult(
+    const Status& s, const std::string& job_id,
+    const CompactionServiceJobInfo& job_info,
+    const std::string& serialized_input, const std::string& output_directory,
+    const std::string& serialized_output, SharedState* shared,
+    uint64_t& successful_compaction_end_to_end_micros, uint64_t start_micros,
+    Env* env) {
+  if (s.IsManualCompactionPaused() && FLAGS_allow_resumption_one_in > 0) {
+    // Re-enqueue for retry
+    shared->EnqueueRemoteCompaction(job_id, job_info, serialized_input,
+                                    output_directory, true /* was_cancelled */);
+    return;
+  }
+
+  if (!s.ok()) {
+    if (!StressTest::IsErrorInjectedAndRetryable(s)) {
+      // Print in stdout instead of stderr to avoid stress test failure,
+      // because OpenAndCompact() failure doesn't necessarily mean
+      // primary db instance failure.
+      fprintf(stdout, "Failed to run OpenAndCompact(%s): %s\n",
+              job_info.db_name.c_str(), s.ToString().c_str());
+    }
+  } else {
+    // Track successful completion time
+    successful_compaction_end_to_end_micros = env->NowMicros() - start_micros;
+  }
+
+  // Add the output regardless of status, so that primary DB doesn't rely
+  // on the timeout to finish waiting. The actual failure from the
+  // deserialization can fail the compaction properly
+  shared->AddRemoteCompactionResult(job_id, s, serialized_output);
+}
+
+static void ProcessRemoteCompactionJob(
+    const std::string& job_id, const CompactionServiceJobInfo& job_info,
+    const std::string& serialized_input,
+    const std::string& output_directory_name, bool was_canceled,
+    SharedState* shared, StressTest* stress_test, Random& rand,
+    uint64_t& successful_compaction_end_to_end_micros) {
+  auto options = stress_test->GetOptions(job_info.cf_id);
+  assert(options.env != nullptr);
+
+  auto override_options = CreateOverrideOptions(options, job_info);
+
+  OpenAndCompactOptions open_compact_options;
+  open_compact_options.max_secondary_open_retries =
+      FLAGS_openandcompact_max_secondary_open_retries;
+  if (FLAGS_allow_resumption_one_in > 0) {
+    open_compact_options.allow_resumption =
+        rand.OneIn(FLAGS_allow_resumption_one_in);
+  } else {
+    open_compact_options.allow_resumption = false;
+  }
+
+  if (!open_compact_options.allow_resumption) {
+    CleanupOutputDirectory(RemoteCompactionJobDir(
+        job_info.db_name, options.use_session_tmp_dir_for_remote_compaction,
+        output_directory_name));
+  }
+
+  std::shared_ptr<std::atomic<bool>> canceled = nullptr;
+  if (FLAGS_allow_resumption_one_in > 0) {
+    canceled = SetupCancellation(open_compact_options, was_canceled, rand,
+                                 successful_compaction_end_to_end_micros);
+  }
+
+  std::string serialized_output;
+  uint64_t start_micros = options.env->NowMicros();
+
+  Status s = DB::OpenAndCompact(open_compact_options, job_info.db_name,
+                                output_directory_name, serialized_input,
+                                &serialized_output, override_options);
+
+  ProcessCompactionResult(s, job_id, job_info, serialized_input,
+                          output_directory_name, serialized_output, shared,
+                          successful_compaction_end_to_end_micros, start_micros,
+                          options.env);
+}
+
+void RemoteCompactionWorkerThread(void* v) {
+  assert(FLAGS_remote_compaction_worker_threads > 0);
+  assert(FLAGS_remote_compaction_worker_interval > 0);
+
+  auto* thread = static_cast<ThreadState*>(v);
+  SharedState* shared = thread->shared;
+  StressTest* stress_test = shared->GetStressTest();
+  assert(stress_test != nullptr);
+
+#ifndef NDEBUG
+  SetupFaultInjectionForRemoteCompaction(shared);
+#endif  // NDEBUG
+
+  // Tracks the duration (in microseconds) of the most recent successfully
+  // completed compaction from start to finish. This value is used in
+  // SetupCancellation() to adaptively set up cancellation point for a
+  // compaction
+  uint64_t successful_compaction_end_to_end_micros = 0;
+  Random rand(static_cast<uint32_t>(FLAGS_seed));
+
+  // Main worker loop
+  while (true) {
+    // Check if we should stop
+    {
+      MutexLock l(shared->GetMutex());
+      if (shared->ShouldStopBgThread()) {
+        shared->IncBgThreadsFinished();
+        if (shared->BgThreadsFinished()) {
+          shared->GetCondVar()->SignalAll();
+        }
+        return;
+      }
+    }
+
+    std::string job_id;
+    CompactionServiceJobInfo job_info;
+    std::string serialized_input;
+    std::string output_directory;
+    bool was_canceled;
+
+    if (shared->DequeueRemoteCompaction(&job_id, &job_info, &serialized_input,
+                                        &output_directory, &was_canceled)) {
+      ProcessRemoteCompactionJob(
+          job_id, job_info, serialized_input, output_directory, was_canceled,
+          shared, stress_test, rand, successful_compaction_end_to_end_micros);
+    }
+
+    raw_env->SleepForMicroseconds(
+        thread->rand.Next() % FLAGS_remote_compaction_worker_interval * 1000 +
         1);
   }
 }
@@ -239,6 +913,17 @@ uint32_t GetValueBase(Slice s) {
   return res;
 }
 
+AttributeGroups GenerateAttributeGroups(
+    const std::vector<ColumnFamilyHandle*>& cfhs, uint32_t value_base,
+    const Slice& slice) {
+  WideColumns columns = GenerateWideColumns(value_base, slice);
+  AttributeGroups attribute_groups;
+  for (auto* cfh : cfhs) {
+    attribute_groups.emplace_back(cfh, columns);
+  }
+  return attribute_groups;
+}
+
 WideColumns GenerateWideColumns(uint32_t value_base, const Slice& slice) {
   WideColumns columns;
 
@@ -270,19 +955,87 @@ WideColumns GenerateExpectedWideColumns(uint32_t value_base,
 
   WideColumns columns = GenerateWideColumns(value_base, slice);
 
-  std::sort(columns.begin(), columns.end(),
-            [](const WideColumn& lhs, const WideColumn& rhs) {
-              return lhs.name().compare(rhs.name()) < 0;
-            });
+  WideColumnsHelper::SortColumns(columns);
 
   return columns;
 }
 
+bool VerifyWideColumns(const Slice& value, const WideColumns& columns) {
+  if (value.size() < sizeof(uint32_t)) {
+    return false;
+  }
+
+  const uint32_t value_base = GetValueBase(value);
+
+  const WideColumns expected_columns =
+      GenerateExpectedWideColumns(value_base, value);
+
+  if (columns != expected_columns) {
+    return false;
+  }
+
+  return true;
+}
+
+bool VerifyWideColumns(const WideColumns& columns) {
+  if (!WideColumnsHelper::HasDefaultColumn(columns)) {
+    return false;
+  }
+
+  const Slice& value_of_default = WideColumnsHelper::GetDefaultColumn(columns);
+
+  return VerifyWideColumns(value_of_default, columns);
+}
+
+bool VerifyIteratorAttributeGroups(
+    const IteratorAttributeGroups& attribute_groups) {
+  for (const auto& attribute_group : attribute_groups) {
+    if (!VerifyWideColumns(attribute_group.columns())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string GetNowNanos() {
-  uint64_t t = db_stress_env->NowNanos();
+  uint64_t t = raw_env->NowNanos();
   std::string ret;
   PutFixed64(&ret, t);
   return ret;
+}
+
+std::string GetReadTimestamp() {
+  uint64_t read_timestamp = raw_env->NowNanos();
+  if (!FLAGS_persist_user_defined_timestamps) {
+    // Add 10 seconds of headroom because a concurrent flush can advance
+    // full_history_ts_low making the read timestamp invalid.
+    read_timestamp += 10'000'000'000ULL;
+  }
+
+  std::string ret;
+  PutFixed64(&ret, read_timestamp);
+  return ret;
+}
+
+uint64_t GetWriteUnixTime(ThreadState* thread) {
+  static uint64_t kPreserveSeconds =
+      std::max(FLAGS_preserve_internal_time_seconds,
+               FLAGS_preclude_last_level_data_seconds);
+  static uint64_t kFallbackTime = std::numeric_limits<uint64_t>::max();
+  int64_t write_time = 0;
+  Status s = raw_env->GetCurrentTime(&write_time);
+  uint32_t write_time_mode = thread->rand.Uniform(3);
+  if (write_time_mode == 0 || !s.ok()) {
+    return kFallbackTime;
+  } else if (write_time_mode == 1) {
+    uint64_t delta = kPreserveSeconds > 0
+                         ? static_cast<uint64_t>(thread->rand.Uniform(
+                               static_cast<int>(kPreserveSeconds)))
+                         : 0;
+    return static_cast<uint64_t>(write_time) - delta;
+  } else {
+    return static_cast<uint64_t>(write_time) - kPreserveSeconds;
+  }
 }
 
 namespace {
@@ -294,7 +1047,13 @@ class MyXXH64Checksum : public FileChecksumGenerator {
     XXH64_reset(state_, 0);
   }
 
-  virtual ~MyXXH64Checksum() override { XXH64_freeState(state_); }
+  // No copying allowed
+  MyXXH64Checksum(const MyXXH64Checksum&) = delete;
+  MyXXH64Checksum& operator=(const MyXXH64Checksum&) = delete;
+  MyXXH64Checksum(MyXXH64Checksum&&) = delete;
+  MyXXH64Checksum& operator=(MyXXH64Checksum&&) = delete;
+
+  ~MyXXH64Checksum() override { XXH64_freeState(state_); }
 
   void Update(const char* data, size_t n) override {
     XXH64_update(state_, data, n);
@@ -385,6 +1144,8 @@ std::shared_ptr<FileChecksumGenFactory> GetFileChecksumImpl(
   return std::make_shared<DbStressChecksumGenFactory>(internal_name);
 }
 
+// Expected values state files are always on local filesystem (Python owns
+// this dir), so use Env::Default() (PosixEnv) even when raw_env is remote.
 Status DeleteFilesInDirectory(const std::string& dirname) {
   std::vector<std::string> filenames;
   Status s = Env::Default()->GetChildren(dirname, &filenames);
@@ -454,6 +1215,28 @@ Status DestroyUnverifiedSubdir(const std::string& dirname) {
     s = Env::Default()->DeleteDir(kUnverifiedDirname);
   }
   return s;
+}
+
+Status DbStressDestroyDb(const std::string& db_path) {
+  Status s;
+  Options options;
+  // Use raw_env (no DbStressFSWrapper) because DbStressFSWrapper renames
+  // MANIFEST files to MANIFEST-xxx_renamed_ instead of deleting them during
+  // normal DB operation (to preserve history for debugging). Using raw_env
+  // here ensures DestroyDB actually deletes these files. DestroyDir below
+  // catches any remaining files not known to DestroyDB.
+  options.env = raw_env;
+  // Remove DB files in a principled way to avoid issues
+  if (FLAGS_use_blob_db) {
+    s = blob_db::DestroyBlobDB(db_path, options, blob_db::BlobDBOptions());
+  } else {
+    s = DestroyDB(db_path, options);
+  }
+  if (!s.ok()) {
+    return s;
+  }
+  // Remove everything else recursively (catches MANIFEST_renamed_ files)
+  return DestroyDir(raw_env, db_path);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

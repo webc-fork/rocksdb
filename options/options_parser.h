@@ -7,6 +7,7 @@
 
 #include <map>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/env.h"
@@ -32,11 +33,13 @@ enum OptionSection : char {
 static const std::string opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
-Status PersistRocksDBOptions(const DBOptions& db_opt,
+Status PersistRocksDBOptions(const WriteOptions& write_options,
+                             const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
                              const std::vector<ColumnFamilyOptions>& cf_opts,
                              const std::string& file_name, FileSystem* fs);
-Status PersistRocksDBOptions(const ConfigOptions& config_options,
+Status PersistRocksDBOptions(const WriteOptions& write_options,
+                             const ConfigOptions& config_options,
                              const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
                              const std::vector<ColumnFamilyOptions>& cf_opts,
@@ -45,7 +48,7 @@ Status PersistRocksDBOptions(const ConfigOptions& config_options,
 class RocksDBOptionsParser {
  public:
   explicit RocksDBOptionsParser();
-  ~RocksDBOptionsParser() {}
+  ~RocksDBOptionsParser() = default;
   void Reset();
 
   // `file_readahead_size` is used for readahead for the option file.
@@ -78,6 +81,12 @@ class RocksDBOptionsParser {
       const ConfigOptions& config_options, const DBOptions& db_opt,
       const std::vector<std::string>& cf_names,
       const std::vector<ColumnFamilyOptions>& cf_opts,
+      const std::string& file_name, FileSystem* fs);
+  static Status VerifyRocksDBOptionsFromFile(
+      const ConfigOptions& config_options, const DBOptions& db_opt,
+      const std::vector<std::string>& cf_names,
+      const std::vector<ColumnFamilyOptions>& cf_opts,
+      const std::unordered_set<std::string>& live_cf_names,
       const std::string& file_name, FileSystem* fs);
   static Status VerifyDBOptions(
       const ConfigOptions& config_options, const DBOptions& base_opt,
@@ -144,6 +153,5 @@ class RocksDBOptionsParser {
   int db_version[3];
   int opt_file_version[3];
 };
-
 
 }  // namespace ROCKSDB_NAMESPACE

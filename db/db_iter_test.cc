@@ -45,6 +45,14 @@ class TestIterator : public InternalIterator {
     Add(argkey, kTypeValue, argvalue);
   }
 
+  void AddTimedPut(std::string argkey, std::string argvalue,
+                   uint64_t write_unix_time) {
+    std::string packed_value;
+    [[maybe_unused]] auto packed_value_slice =
+        PackValueAndWriteTime(argvalue, write_unix_time, &packed_value);
+    Add(argkey, kTypeValuePreferredSeqno, packed_value);
+  }
+
   void AddDeletion(std::string argkey) {
     Add(argkey, kTypeDeletion, std::string());
   }
@@ -65,8 +73,7 @@ class TestIterator : public InternalIterator {
            size_t seq_num, bool update_iter = false) {
     valid_ = true;
     ParsedInternalKey internal_key(argkey, seq_num, type);
-    data_.push_back(
-        std::pair<std::string, std::string>(std::string(), argvalue));
+    data_.emplace_back(std::string(), argvalue);
     AppendInternalKey(&data_.back().first, internal_key);
     if (update_iter && valid_ && cmp.Compare(data_.back().first, key()) < 0) {
       // insert a key smaller than current key
@@ -209,12 +216,19 @@ class TestIterator : public InternalIterator {
   bool IsKeyPinned() const override { return true; }
   bool IsValuePinned() const override { return true; }
 
+  void Prepare(const MultiScanArgs* /*scan_opts*/) override {
+    ++prepare_call_count_;
+  }
+
+  size_t prepare_call_count() const { return prepare_call_count_; }
+
  private:
   bool initialized_;
   bool valid_;
   size_t sequence_number_;
   size_t iter_;
   size_t steps_ = 0;
+  size_t prepare_call_count_ = 0;
 
   InternalKeyComparator cmp;
   std::vector<std::pair<std::string, std::string>> data_;
@@ -236,6 +250,53 @@ class DBIteratorTest : public testing::Test {
   DBIteratorTest() : env_(Env::Default()) {}
 };
 
+TEST_F(DBIteratorTest, PrepareForwardsValidatedScanRanges) {
+  Options options;
+  ImmutableOptions ioptions = ImmutableOptions(options);
+  MutableCFOptions mutable_cf_options = MutableCFOptions(options);
+  TestIterator* internal_iter = new TestIterator(BytewiseComparator());
+  internal_iter->AddPut("a", "val_a");
+  internal_iter->AddPut("b", "val_b");
+  internal_iter->Finish();
+
+  ReadOptions ro;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
+      env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
+      internal_iter, nullptr /* version */, 10 /* sequence */,
+      nullptr /* read_callback */, /*active_mem=*/nullptr));
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert("a", "c");
+
+  db_iter->Prepare(scan_opts);
+  ASSERT_OK(db_iter->status());
+  EXPECT_EQ(internal_iter->prepare_call_count(), 1);
+}
+
+TEST_F(DBIteratorTest, PrepareDoesNotForwardInvalidScanRanges) {
+  Options options;
+  ImmutableOptions ioptions = ImmutableOptions(options);
+  MutableCFOptions mutable_cf_options = MutableCFOptions(options);
+  TestIterator* internal_iter = new TestIterator(BytewiseComparator());
+  internal_iter->AddPut("a", "val_a");
+  internal_iter->AddPut("b", "val_b");
+  internal_iter->Finish();
+
+  ReadOptions ro;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
+      env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
+      internal_iter, nullptr /* version */, 10 /* sequence */,
+      nullptr /* read_callback */, /*active_mem=*/nullptr));
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert("b", "d");
+  scan_opts.insert("a", "c");
+
+  db_iter->Prepare(scan_opts);
+  EXPECT_TRUE(db_iter->status().IsInvalidArgument());
+  EXPECT_EQ(internal_iter->prepare_call_count(), 0);
+}
+
 TEST_F(DBIteratorTest, DBIteratorPrevNext) {
   Options options;
   ImmutableOptions ioptions = ImmutableOptions(options);
@@ -252,11 +313,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     internal_iter->Finish();
 
     ReadOptions ro;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -275,6 +335,7 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
 
     db_iter->Next();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
   // Test to check the SeekToLast() with iterate_upper_bound not set
   {
@@ -286,11 +347,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     internal_iter->Finish();
 
     ReadOptions ro;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -314,11 +374,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -348,11 +407,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -385,11 +443,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(!db_iter->Valid());
@@ -417,11 +474,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 7 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     SetPerfLevel(kEnableCount);
     ASSERT_TRUE(GetPerfLevel() == kEnableCount);
@@ -457,11 +513,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 4 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -484,11 +539,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(!db_iter->Valid());
@@ -509,11 +563,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -546,11 +599,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     ReadOptions ro;
     ro.iterate_upper_bound = &prefix;
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 7 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     SetPerfLevel(kEnableCount);
     ASSERT_TRUE(GetPerfLevel() == kEnableCount);
@@ -578,11 +630,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     internal_iter->Finish();
 
     ReadOptions ro;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -623,11 +674,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     internal_iter->Finish();
 
     ReadOptions ro;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 2 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "b");
@@ -656,11 +706,10 @@ TEST_F(DBIteratorTest, DBIteratorPrevNext) {
     internal_iter->Finish();
 
     ReadOptions ro;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "c");
@@ -688,11 +737,10 @@ TEST_F(DBIteratorTest, DBIteratorEmpty) {
     TestIterator* internal_iter = new TestIterator(BytewiseComparator());
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 0 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(!db_iter->Valid());
     ASSERT_OK(db_iter->status());
@@ -702,11 +750,10 @@ TEST_F(DBIteratorTest, DBIteratorEmpty) {
     TestIterator* internal_iter = new TestIterator(BytewiseComparator());
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 0 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToFirst();
     ASSERT_TRUE(!db_iter->Valid());
     ASSERT_OK(db_iter->status());
@@ -727,11 +774,10 @@ TEST_F(DBIteratorTest, DBIteratorUseSkipCountSkips) {
   }
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      2 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      2 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToLast();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "c");
@@ -774,11 +820,11 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       internal_iter->Finish();
 
       options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, i + 2 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(db_iter->Valid());
 
@@ -812,11 +858,11 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       internal_iter->AddPut("c", "200");
       internal_iter->Finish();
 
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, i + 2 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(db_iter->Valid());
 
@@ -843,11 +889,10 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       internal_iter->AddPut("c", "200");
       internal_iter->Finish();
 
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, 202 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(db_iter->Valid());
 
@@ -878,11 +923,11 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       }
       internal_iter->AddPut("c", "200");
       internal_iter->Finish();
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, i /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(!db_iter->Valid());
       ASSERT_OK(db_iter->status());
@@ -898,11 +943,10 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
     }
     internal_iter->AddPut("c", "200");
     internal_iter->Finish();
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 200 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "c");
@@ -936,11 +980,11 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       }
       internal_iter->Finish();
 
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, i + 2 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(db_iter->Valid());
 
@@ -973,11 +1017,11 @@ TEST_F(DBIteratorTest, DBIteratorUseSkip) {
       }
       internal_iter->Finish();
 
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, i + 2 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
       db_iter->SeekToLast();
       ASSERT_TRUE(db_iter->Valid());
 
@@ -1025,11 +1069,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 0;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1073,11 +1116,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1119,11 +1161,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1159,11 +1200,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1196,11 +1236,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -1228,11 +1267,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1267,11 +1305,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
     internal_iter->Finish();
 
     ro.max_skippable_internal_keys = 2;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     ASSERT_TRUE(db_iter->Valid());
@@ -1306,11 +1343,11 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
       internal_iter->Finish();
 
       ro.max_skippable_internal_keys = i;
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
           env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
           internal_iter, nullptr /* version */, 2 * i + 1 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
 
       db_iter->SeekToFirst();
       ASSERT_TRUE(db_iter->Valid());
@@ -1361,11 +1398,10 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
 
       options.max_sequential_skip_in_iterations = 1000;
       ro.max_skippable_internal_keys = i;
-      std::unique_ptr<Iterator> db_iter(NewDBIterator(
-          env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
+      std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
+          env_, ro, ioptions, MutableCFOptions(options), BytewiseComparator(),
           internal_iter, nullptr /* version */, 2 * i + 1 /* sequence */,
-          options.max_sequential_skip_in_iterations,
-          nullptr /* read_callback */));
+          nullptr /* read_callback */, /*active_mem=*/nullptr));
 
       db_iter->SeekToFirst();
       ASSERT_TRUE(db_iter->Valid());
@@ -1388,6 +1424,60 @@ TEST_F(DBIteratorTest, DBIteratorSkipInternalKeys) {
   }
 }
 
+TEST_F(DBIteratorTest, DBIteratorTimedPutBasic) {
+  ReadOptions ro;
+  Options options;
+  options.merge_operator = MergeOperators::CreateFromStringId("stringappend");
+
+  TestIterator* internal_iter = new TestIterator(BytewiseComparator());
+  internal_iter->AddTimedPut("a", "0", /*write_unix_time=*/0);
+  internal_iter->AddMerge("a", "1");
+  internal_iter->AddTimedPut("b", "0", /*write_unix_time=*/0);
+  internal_iter->AddDeletion("b");
+  internal_iter->AddTimedPut("c", "01", /*write_unix_time=*/0);
+  internal_iter->AddTimedPut("c", "02", /*write_unix_time=*/0);
+  internal_iter->AddTimedPut("c", "2", /*write_unix_time=*/0);
+  internal_iter->AddTimedPut("d", "3", /*write_unix_time=*/0);
+  internal_iter->Finish();
+
+  options.max_sequential_skip_in_iterations = 1;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
+      env_, ro, ImmutableOptions(options), MutableCFOptions(options),
+      BytewiseComparator(), internal_iter, nullptr /* version */,
+      7 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
+  db_iter->SeekToFirst();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "a");
+  ASSERT_EQ(db_iter->value().ToString(), "0,1");
+  db_iter->Next();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "c");
+  ASSERT_EQ(db_iter->value().ToString(), "2");
+  db_iter->Next();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "d");
+  ASSERT_EQ(db_iter->value().ToString(), "3");
+  db_iter->Next();
+  ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
+
+  db_iter->SeekToLast();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "d");
+  ASSERT_EQ(db_iter->value().ToString(), "3");
+  db_iter->Prev();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "c");
+  ASSERT_EQ(db_iter->value().ToString(), "2");
+  db_iter->Prev();
+  ASSERT_TRUE(db_iter->Valid());
+  ASSERT_EQ(db_iter->key().ToString(), "a");
+  ASSERT_EQ(db_iter->value().ToString(), "0,1");
+  db_iter->Prev();
+  ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
+}
+
 TEST_F(DBIteratorTest, DBIterator1) {
   ReadOptions ro;
   Options options;
@@ -1401,11 +1491,10 @@ TEST_F(DBIteratorTest, DBIterator1) {
   internal_iter->AddMerge("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      1 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      1 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -1415,6 +1504,7 @@ TEST_F(DBIteratorTest, DBIterator1) {
   ASSERT_EQ(db_iter->key().ToString(), "b");
   db_iter->Next();
   ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
 }
 
 TEST_F(DBIteratorTest, DBIterator2) {
@@ -1430,11 +1520,10 @@ TEST_F(DBIteratorTest, DBIterator2) {
   internal_iter->AddMerge("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      0 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      0 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -1456,11 +1545,10 @@ TEST_F(DBIteratorTest, DBIterator3) {
   internal_iter->AddMerge("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      2 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      2 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -1482,11 +1570,10 @@ TEST_F(DBIteratorTest, DBIterator4) {
   internal_iter->AddMerge("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      4 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      4 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -1517,17 +1604,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 0 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1541,17 +1628,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 1 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1,merge_2");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1565,17 +1652,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 2 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1,merge_2,merge_3");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1589,17 +1676,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 3 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "put_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1613,17 +1700,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 4 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "put_1,merge_4");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1637,17 +1724,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 5 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "put_1,merge_4,merge_5");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1661,17 +1748,17 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 6 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "put_1,merge_4,merge_5,merge_6");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1683,11 +1770,10 @@ TEST_F(DBIteratorTest, DBIterator5) {
     internal_iter->AddMerge("a", "merge_2");
     internal_iter->AddPut("b", "val_b");
     internal_iter->Finish();
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 10 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->Seek("b");
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "b");
@@ -1715,17 +1801,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 0 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1739,17 +1825,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 1 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1,merge_2");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1763,17 +1849,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 2 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1,merge_2,merge_3");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1787,13 +1873,13 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 3 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1807,17 +1893,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 4 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_4");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1831,17 +1917,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 5 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_4,merge_5");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1855,17 +1941,17 @@ TEST_F(DBIteratorTest, DBIterator6) {
     internal_iter->AddMerge("a", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 6 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_4,merge_5,merge_6");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 }
 
@@ -1899,17 +1985,17 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 0 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
     ASSERT_EQ(db_iter->key().ToString(), "a");
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1935,11 +2021,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 2 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -1952,6 +2037,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -1977,11 +2063,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 4 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -1994,6 +2079,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2019,11 +2105,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 5 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2041,6 +2126,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2066,11 +2152,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 6 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2089,6 +2174,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2114,11 +2200,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 7 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2131,6 +2216,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2156,11 +2242,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 9 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2179,6 +2264,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2204,11 +2290,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 13 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2228,6 +2313,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 
   {
@@ -2253,11 +2339,10 @@ TEST_F(DBIteratorTest, DBIterator7) {
     internal_iter->AddDeletion("c");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
+    std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
         env_, ro, ioptions, mutable_cf_options, BytewiseComparator(),
         internal_iter, nullptr /* version */, 14 /* sequence */,
-        options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+        nullptr /* read_callback */, /*active_mem=*/nullptr));
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
 
@@ -2271,6 +2356,7 @@ TEST_F(DBIteratorTest, DBIterator7) {
     ASSERT_EQ(db_iter->value().ToString(), "merge_1");
     db_iter->Prev();
     ASSERT_TRUE(!db_iter->Valid());
+    ASSERT_OK(db_iter->status());
   }
 }
 
@@ -2285,11 +2371,10 @@ TEST_F(DBIteratorTest, DBIterator8) {
   internal_iter->AddPut("b", "0");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToLast();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "b");
@@ -2317,11 +2402,11 @@ TEST_F(DBIteratorTest, DBIterator9) {
     internal_iter->AddMerge("d", "merge_6");
     internal_iter->Finish();
 
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
-        env_, ro, ImmutableOptions(options), MutableCFOptions(options),
-        BytewiseComparator(), internal_iter, nullptr /* version */,
-        10 /* sequence */, options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+    std::unique_ptr<Iterator> db_iter(
+        DBIter::NewIter(env_, ro, ImmutableOptions(options),
+                        MutableCFOptions(options), BytewiseComparator(),
+                        internal_iter, nullptr /* version */, 10 /* sequence */,
+                        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToLast();
     ASSERT_TRUE(db_iter->Valid());
@@ -2385,11 +2470,10 @@ TEST_F(DBIteratorTest, DBIterator10) {
   internal_iter->AddPut("d", "4");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
 
   db_iter->Seek("c");
   ASSERT_TRUE(db_iter->Valid());
@@ -2426,10 +2510,10 @@ TEST_F(DBIteratorTest, SeekToLastOccurrenceSeq0) {
   internal_iter->AddPut("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, 0 /* force seek */, nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -2440,6 +2524,7 @@ TEST_F(DBIteratorTest, SeekToLastOccurrenceSeq0) {
   ASSERT_EQ(db_iter->value().ToString(), "2");
   db_iter->Next();
   ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
 }
 
 TEST_F(DBIteratorTest, DBIterator11) {
@@ -2455,11 +2540,10 @@ TEST_F(DBIteratorTest, DBIterator11) {
   internal_iter->AddMerge("b", "2");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      1 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      1 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToFirst();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "a");
@@ -2469,6 +2553,7 @@ TEST_F(DBIteratorTest, DBIterator11) {
   ASSERT_EQ(db_iter->key().ToString(), "b");
   db_iter->Next();
   ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
 }
 
 TEST_F(DBIteratorTest, DBIterator12) {
@@ -2483,10 +2568,10 @@ TEST_F(DBIteratorTest, DBIterator12) {
   internal_iter->AddSingleDeletion("b");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, 0 /* force seek */, nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->SeekToLast();
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "c");
@@ -2497,6 +2582,7 @@ TEST_F(DBIteratorTest, DBIterator12) {
   ASSERT_EQ(db_iter->value().ToString(), "1");
   db_iter->Prev();
   ASSERT_FALSE(db_iter->Valid());
+  ASSERT_OK(db_iter->status());
 }
 
 TEST_F(DBIteratorTest, DBIterator13) {
@@ -2521,11 +2607,11 @@ TEST_F(DBIteratorTest, DBIterator13) {
   internal_iter->AddPut(key, "8");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  options.max_sequential_skip_in_iterations = 3;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      2 /* sequence */, 3 /* max_sequential_skip_in_iterations */,
-      nullptr /* read_callback */));
+      2 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->Seek("b");
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), key);
@@ -2551,11 +2637,11 @@ TEST_F(DBIteratorTest, DBIterator14) {
   internal_iter->AddPut("c", "9");
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  options.max_sequential_skip_in_iterations = 1;
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      4 /* sequence */, 1 /* max_sequential_skip_in_iterations */,
-      nullptr /* read_callback */));
+      4 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
   db_iter->Seek("b");
   ASSERT_TRUE(db_iter->Valid());
   ASSERT_EQ(db_iter->key().ToString(), "b");
@@ -2589,13 +2675,14 @@ class DBIterWithMergeIterTest : public testing::Test {
     child_iters.push_back(internal_iter2_);
     InternalKeyComparator icomp(BytewiseComparator());
     InternalIterator* merge_iter =
-        NewMergingIterator(&icomp_, &child_iters[0], 2u);
+        NewMergingIterator(&icomp_, child_iters.data(), 2u);
 
-    db_iter_.reset(NewDBIterator(
+    options_.max_sequential_skip_in_iterations = 3;
+    db_iter_.reset(DBIter::NewIter(
         env_, ro_, ImmutableOptions(options_), MutableCFOptions(options_),
         BytewiseComparator(), merge_iter, nullptr /* version */,
-        8 /* read data earlier than seqId 8 */,
-        3 /* max iterators before reseek */, nullptr /* read_callback */));
+        8 /* read data earlier than seqId 8 */, nullptr /* read_callback */,
+        /*active_mem=*/nullptr));
   }
 
   Env* env_;
@@ -2635,6 +2722,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIterator1) {
   ASSERT_EQ(db_iter_->value().ToString(), "3");
   db_iter_->Next();
   ASSERT_FALSE(db_iter_->Valid());
+  ASSERT_OK(db_iter_->status());
 }
 
 TEST_F(DBIterWithMergeIterTest, InnerMergeIterator2) {
@@ -2796,7 +2884,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIteratorDataRace4) {
   // Seek() and before calling Prev()
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "MergeIterator::Prev:BeforePrev", [&](void* arg) {
-        IteratorWrapper* it = reinterpret_cast<IteratorWrapper*>(arg);
+        IteratorWrapper* it = static_cast<IteratorWrapper*>(arg);
         if (it->key().starts_with("z")) {
           internal_iter2_->Add("x", kTypeValue, "7", 16u, true);
           internal_iter2_->Add("x", kTypeValue, "7", 15u, true);
@@ -2847,7 +2935,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIteratorDataRace5) {
   // Seek() and before calling Prev()
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "MergeIterator::Prev:BeforePrev", [&](void* arg) {
-        IteratorWrapper* it = reinterpret_cast<IteratorWrapper*>(arg);
+        IteratorWrapper* it = static_cast<IteratorWrapper*>(arg);
         if (it->key().starts_with("z")) {
           internal_iter2_->Add("x", kTypeValue, "7", 16u, true);
           internal_iter2_->Add("x", kTypeValue, "7", 15u, true);
@@ -2894,7 +2982,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIteratorDataRace6) {
   // Seek() and before calling Prev()
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "MergeIterator::Prev:BeforePrev", [&](void* arg) {
-        IteratorWrapper* it = reinterpret_cast<IteratorWrapper*>(arg);
+        IteratorWrapper* it = static_cast<IteratorWrapper*>(arg);
         if (it->key().starts_with("z")) {
           internal_iter2_->Add("x", kTypeValue, "7", 16u, true);
         }
@@ -2943,7 +3031,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIteratorDataRace7) {
   // Seek() and before calling Prev()
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "MergeIterator::Prev:BeforePrev", [&](void* arg) {
-        IteratorWrapper* it = reinterpret_cast<IteratorWrapper*>(arg);
+        IteratorWrapper* it = static_cast<IteratorWrapper*>(arg);
         if (it->key().starts_with("z")) {
           internal_iter2_->Add("x", kTypeValue, "7", 16u, true);
           internal_iter2_->Add("x", kTypeValue, "7", 15u, true);
@@ -2996,7 +3084,7 @@ TEST_F(DBIterWithMergeIterTest, InnerMergeIteratorDataRace8) {
   // before calling Prev()
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "MergeIterator::Prev:BeforePrev", [&](void* arg) {
-        IteratorWrapper* it = reinterpret_cast<IteratorWrapper*>(arg);
+        IteratorWrapper* it = static_cast<IteratorWrapper*>(arg);
         if (it->key().starts_with("z")) {
           internal_iter2_->Add("x", kTypeValue, "7", 16u, true);
           internal_iter2_->Add("y", kTypeValue, "7", 17u, true);
@@ -3030,11 +3118,10 @@ TEST_F(DBIteratorTest, SeekPrefixTombstones) {
   internal_iter->Finish();
 
   ro.prefix_same_as_start = true;
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
 
   int skipped_keys = 0;
 
@@ -3067,11 +3154,11 @@ TEST_F(DBIteratorTest, SeekToFirstLowerBound) {
     Slice lower_bound(lower_bound_str);
     ro.iterate_lower_bound = &lower_bound;
     Options options;
-    std::unique_ptr<Iterator> db_iter(NewDBIterator(
-        env_, ro, ImmutableOptions(options), MutableCFOptions(options),
-        BytewiseComparator(), internal_iter, nullptr /* version */,
-        10 /* sequence */, options.max_sequential_skip_in_iterations,
-        nullptr /* read_callback */));
+    std::unique_ptr<Iterator> db_iter(
+        DBIter::NewIter(env_, ro, ImmutableOptions(options),
+                        MutableCFOptions(options), BytewiseComparator(),
+                        internal_iter, nullptr /* version */, 10 /* sequence */,
+                        nullptr /* read_callback */, /*active_mem=*/nullptr));
 
     db_iter->SeekToFirst();
     if (i == kNumKeys + 1) {
@@ -3107,11 +3194,10 @@ TEST_F(DBIteratorTest, PrevLowerBound) {
   Slice lower_bound(lower_bound_str);
   ro.iterate_lower_bound = &lower_bound;
   Options options;
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
 
   db_iter->SeekToLast();
   for (int i = kNumKeys; i >= kLowerBound; --i) {
@@ -3136,11 +3222,10 @@ TEST_F(DBIteratorTest, SeekLessLowerBound) {
   Slice lower_bound(lower_bound_str);
   ro.iterate_lower_bound = &lower_bound;
   Options options;
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ro, ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
 
   auto before_lower_bound_str = std::to_string(kLowerBound - 1);
   Slice before_lower_bound(lower_bound_str);
@@ -3162,11 +3247,10 @@ TEST_F(DBIteratorTest, ReverseToForwardWithDisappearingKeys) {
   }
   internal_iter->Finish();
 
-  std::unique_ptr<Iterator> db_iter(NewDBIterator(
+  std::unique_ptr<Iterator> db_iter(DBIter::NewIter(
       env_, ReadOptions(), ImmutableOptions(options), MutableCFOptions(options),
       BytewiseComparator(), internal_iter, nullptr /* version */,
-      10 /* sequence */, options.max_sequential_skip_in_iterations,
-      nullptr /* read_callback */));
+      10 /* sequence */, nullptr /* read_callback */, /*active_mem=*/nullptr));
 
   db_iter->SeekForPrev("a");
   ASSERT_TRUE(db_iter->Valid());

@@ -8,14 +8,15 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "file/filename.h"
 
-#include <ctype.h>
-#include <stdio.h>
-
+#include <cctype>
 #include <cinttypes>
+#include <cstdio>
 #include <vector>
 
+#include "file/file_util.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/env.h"
+#include "rocksdb/file_system.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -24,6 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 
 const std::string kCurrentFileName = "CURRENT";
 const std::string kOptionsFileNamePrefix = "OPTIONS-";
+const std::string kCompactionProgressFileNamePrefix = "COMPACTION_PROGRESS-";
 const std::string kTempFileNameSuffix = "dbtmp";
 
 static const std::string kRocksDbTFileExt = "sst";
@@ -241,6 +243,49 @@ std::string TempOptionsFileName(const std::string& dbname, uint64_t file_num) {
   return dbname + "/" + buffer;
 }
 
+std::string CompactionProgressFileName(const std::string& dbname,
+                                       uint64_t timestamp) {
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "%s%llu",
+           kCompactionProgressFileNamePrefix.c_str(),
+           static_cast<unsigned long long>(timestamp));
+  return dbname + "/" + buffer;
+}
+
+std::string TempCompactionProgressFileName(const std::string& dbname,
+                                           uint64_t timestamp) {
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "%s%llu.%s",
+           kCompactionProgressFileNamePrefix.c_str(),
+           static_cast<unsigned long long>(timestamp),
+           kTempFileNameSuffix.c_str());
+  return dbname + "/" + buffer;
+}
+
+std::string SessionTmpDir(const std::string& dbname) {
+  std::string result = dbname;
+  result.append("/").append(kSessionTmpDirName);
+  return result;
+}
+
+std::string RemoteCompactionJobDir(const std::string& dbname,
+                                   bool use_output_root_dir,
+                                   const std::string& job_dir_name) {
+  if (!use_output_root_dir) {
+    std::string db_prefix = dbname;
+    if (db_prefix.empty() || db_prefix.back() != '/') {
+      db_prefix.append("/");
+    }
+    if (job_dir_name.compare(0, db_prefix.size(), db_prefix) == 0) {
+      return job_dir_name;
+    }
+    return db_prefix.append(job_dir_name);
+  }
+  std::string result = SessionTmpDir(dbname);
+  result.append("/").append(job_dir_name);
+  return result;
+}
+
 std::string MetaDatabaseName(const std::string& dbname, uint64_t number) {
   char buf[100];
   snprintf(buf, sizeof(buf), "/METADB-%llu",
@@ -263,7 +308,14 @@ std::string IdentityFileName(const std::string& dbname) {
 //    dbname/METADB-[0-9]+
 //    dbname/OPTIONS-[0-9]+
 //    dbname/OPTIONS-[0-9]+.dbtmp
+//    dbname/COMPACTION_PROGRESS-[timestamp]
+//    dbname/COMPACTION_PROGRESS-[timestamp].dbtmp
 //    Disregards / at the beginning
+//
+// The DB directory may also contain the session temporary directory (see
+// SessionTmpDir) and dbname/archive/.
+// ParseFileName deliberately rejects directories so the obsolete-file scan
+// does not treat them as deletion candidates.
 bool ParseFileName(const std::string& fname, uint64_t* number, FileType* type,
                    WalFileType* log_type) {
   return ParseFileName(fname, number, "", type, log_type);
@@ -338,6 +390,24 @@ bool ParseFileName(const std::string& fname, uint64_t* number,
     }
     *number = ts_suffix;
     *type = is_temp_file ? kTempFile : kOptionsFile;
+  } else if (rest.starts_with(kCompactionProgressFileNamePrefix)) {
+    uint64_t timestamp;
+    bool is_temp_file = false;
+    rest.remove_prefix(kCompactionProgressFileNamePrefix.size());
+    const std::string kTempFileNameSuffixWithDot =
+        std::string(".") + kTempFileNameSuffix;
+    if (rest.ends_with(kTempFileNameSuffixWithDot)) {
+      rest.remove_suffix(kTempFileNameSuffixWithDot.size());
+      is_temp_file = true;
+    }
+    if (!ConsumeDecimalNumber(&rest, &timestamp)) {
+      return false;
+    }
+    if (!rest.empty()) {
+      return false;
+    }
+    *number = timestamp;
+    *type = is_temp_file ? kTempFile : kCompactionProgressFile;
   } else {
     // Avoid strtoull() to keep filename format independent of the
     // current locale
@@ -385,8 +455,9 @@ bool ParseFileName(const std::string& fname, uint64_t* number,
   return true;
 }
 
-IOStatus SetCurrentFile(FileSystem* fs, const std::string& dbname,
-                        uint64_t descriptor_number,
+IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
+                        const std::string& dbname, uint64_t descriptor_number,
+                        Temperature temp,
                         FSDirectory* dir_contains_current_file) {
   // Remove leading "dbname/" and add newline to manifest file name
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
@@ -394,21 +465,28 @@ IOStatus SetCurrentFile(FileSystem* fs, const std::string& dbname,
   assert(contents.starts_with(dbname + "/"));
   contents.remove_prefix(dbname.size() + 1);
   std::string tmp = TempFileName(dbname, descriptor_number);
-  IOStatus s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true);
+  IOOptions opts;
+  IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
+  if (s.ok()) {
+    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
+                          file_opts);
+  }
   TEST_SYNC_POINT_CALLBACK("SetCurrentFile:BeforeRename", &s);
   if (s.ok()) {
     TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:0", REDUCE_ODDS2);
-    s = fs->RenameFile(tmp, CurrentFileName(dbname), IOOptions(), nullptr);
+    s = fs->RenameFile(tmp, CurrentFileName(dbname), opts, nullptr);
     TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:1", REDUCE_ODDS2);
     TEST_SYNC_POINT_CALLBACK("SetCurrentFile:AfterRename", &s);
   }
   if (s.ok()) {
     if (dir_contains_current_file != nullptr) {
       s = dir_contains_current_file->FsyncWithDirOptions(
-          IOOptions(), nullptr, DirFsyncOptions(CurrentFileName(dbname)));
+          opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
     }
   } else {
-    fs->DeleteFile(tmp, IOOptions(), nullptr)
+    fs->DeleteFile(tmp, opts, nullptr)
         .PermitUncheckedError();  // NOTE: PermitUncheckedError is acceptable
                                   // here as we are already handling an error
                                   // case, and this is just a best-attempt
@@ -417,7 +495,8 @@ IOStatus SetCurrentFile(FileSystem* fs, const std::string& dbname,
   return s;
 }
 
-Status SetIdentityFile(Env* env, const std::string& dbname,
+Status SetIdentityFile(const WriteOptions& write_options, Env* env,
+                       const std::string& dbname, Temperature temp,
                        const std::string& db_id) {
   std::string id;
   if (db_id.empty()) {
@@ -429,17 +508,24 @@ Status SetIdentityFile(Env* env, const std::string& dbname,
   // Reserve the filename dbname/000000.dbtmp for the temporary identity file
   std::string tmp = TempFileName(dbname, 0);
   std::string identify_file_name = IdentityFileName(dbname);
-  Status s = WriteStringToFile(env, id, tmp, true);
+  Status s;
+  IOOptions opts;
+  s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
+  if (s.ok()) {
+    s = WriteStringToFile(env->GetFileSystem().get(), id, tmp,
+                          /*should_sync=*/true, opts, file_opts);
+  }
   if (s.ok()) {
     s = env->RenameFile(tmp, identify_file_name);
   }
   std::unique_ptr<FSDirectory> dir_obj;
   if (s.ok()) {
-    s = env->GetFileSystem()->NewDirectory(dbname, IOOptions(), &dir_obj,
-                                           nullptr);
+    s = env->GetFileSystem()->NewDirectory(dbname, opts, &dir_obj, nullptr);
   }
   if (s.ok()) {
-    s = dir_obj->FsyncWithDirOptions(IOOptions(), nullptr,
+    s = dir_obj->FsyncWithDirOptions(opts, nullptr,
                                      DirFsyncOptions(identify_file_name));
   }
 
@@ -447,7 +533,7 @@ Status SetIdentityFile(Env* env, const std::string& dbname,
   // if it is not impelmented. Detailed explanations can be found in
   // db/db_impl/db_impl.h
   if (s.ok()) {
-    Status temp_s = dir_obj->Close(IOOptions(), nullptr);
+    Status temp_s = dir_obj->Close(opts, nullptr);
     if (!temp_s.ok()) {
       if (temp_s.IsNotSupported()) {
         temp_s.PermitUncheckedError();
@@ -463,10 +549,17 @@ Status SetIdentityFile(Env* env, const std::string& dbname,
 }
 
 IOStatus SyncManifest(const ImmutableDBOptions* db_options,
+                      const WriteOptions& write_options,
                       WritableFileWriter* file) {
   TEST_KILL_RANDOM_WITH_WEIGHT("SyncManifest:0", REDUCE_ODDS2);
   StopWatch sw(db_options->clock, db_options->stats, MANIFEST_FILE_SYNC_MICROS);
-  return file->Sync(db_options->use_fsync);
+  IOOptions io_options;
+  IOStatus s = PrepareIOFromWriteOptions(write_options, io_options);
+  if (!s.ok()) {
+    return s;
+  }
+  return db_options->use_fsync ? file->Fsync(io_options)
+                               : file->Sync(io_options);
 }
 
 Status GetInfoLogFiles(const std::shared_ptr<FileSystem>& fs,

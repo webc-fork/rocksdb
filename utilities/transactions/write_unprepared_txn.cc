@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/write_unprepared_txn.h"
 
 #include "db/db_impl/db_impl.h"
@@ -375,10 +374,11 @@ Status WriteUnpreparedTxn::FlushWriteBatchToDBInternal(bool prepared) {
   uint64_t seq_used = kMaxSequenceNumber;
   // log_number_ should refer to the oldest log containing uncommitted data
   // from the current transaction. This means that if log_number_ is set,
-  // WriteImpl should not overwrite that value, so set log_used to nullptr if
+  // WriteImpl should not overwrite that value, so set wal_used to nullptr if
   // log_number_ is already set.
   s = db_impl_->WriteImpl(write_options, GetWriteBatch()->GetWriteBatch(),
-                          /*callback*/ nullptr, &last_log_number_,
+                          /*callback*/ nullptr, /*user_write_cb=*/nullptr,
+                          &last_log_number_,
                           /*log ref*/ 0, !DISABLE_MEMTABLE, &seq_used,
                           prepare_batch_cnt_, &add_prepared_callback);
   if (log_number_ == 0) {
@@ -394,7 +394,9 @@ Status WriteUnpreparedTxn::FlushWriteBatchToDBInternal(bool prepared) {
   // unprep_seqs_ will also contain prepared seqnos since they are treated in
   // the same way in the prepare/commit callbacks. See the comment on the
   // definition of unprep_seqs_.
-  unprep_seqs_[prepare_seq] = prepare_batch_cnt_;
+  if (s.ok()) {
+    unprep_seqs_[prepare_seq] = prepare_batch_cnt_;
+  }
 
   // Reset transaction state.
   if (!prepared) {
@@ -595,7 +597,7 @@ Status WriteUnpreparedTxn::CommitInternal() {
   const uint64_t zero_log_number = 0ull;
   size_t batch_cnt = UNLIKELY(commit_batch_cnt) ? commit_batch_cnt : 1;
   s = db_impl_->WriteImpl(write_options_, working_batch, nullptr, nullptr,
-                          zero_log_number, disable_memtable, &seq_used,
+                          nullptr, zero_log_number, disable_memtable, &seq_used,
                           batch_cnt, pre_release_callback);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   const SequenceNumber commit_batch_seq = seq_used;
@@ -606,13 +608,18 @@ Status WriteUnpreparedTxn::CommitInternal() {
       for (const auto& seq : unprep_seqs_) {
         wpt_db_->RemovePrepared(seq.first, seq.second);
       }
-    }
-    if (UNLIKELY(!do_one_write)) {
+      unprep_seqs_.clear();
+      flushed_save_points_.reset(nullptr);
+      unflushed_save_points_.reset(nullptr);
+    } else if (UNLIKELY(!do_one_write)) {
+      // The commit write failed after add_prepared_callback may have added a
+      // prepared entry for commit_batch_seq. Since commit_batch_seq is never
+      // stored in unprep_seqs_ on this path, a follow-up Rollback() cannot
+      // remove it, so clean it up here. unprep_seqs_ is otherwise preserved so
+      // the transaction can still be rolled back after the caller recovers
+      // from the write error.
       wpt_db_->RemovePrepared(commit_batch_seq, commit_batch_cnt);
     }
-    unprep_seqs_.clear();
-    flushed_save_points_.reset(nullptr);
-    unflushed_save_points_.reset(nullptr);
     return s;
   }  // else do the 2nd write to publish seq
 
@@ -639,8 +646,8 @@ Status WriteUnpreparedTxn::CommitInternal() {
   const size_t ONE_BATCH = 1;
   const uint64_t NO_REF_LOG = 0;
   s = db_impl_->WriteImpl(write_options_, &empty_batch, nullptr, nullptr,
-                          NO_REF_LOG, DISABLE_MEMTABLE, &seq_used, ONE_BATCH,
-                          &update_commit_map_with_commit_batch);
+                          nullptr, NO_REF_LOG, DISABLE_MEMTABLE, &seq_used,
+                          ONE_BATCH, &update_commit_map_with_commit_batch);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   // Note RemovePrepared should be called after WriteImpl that publishsed the
   // seq. Otherwise SmallestUnCommittedSeq optimization breaks.
@@ -727,6 +734,7 @@ Status WriteUnpreparedTxn::RollbackInternal() {
   assert(GetId() > 0);
   Status s;
   auto read_at_seq = kMaxSequenceNumber;
+  // TODO: plumb Env::IOActivity, Env::IOPriority
   ReadOptions roptions;
   // to prevent callback's seq to be overrriden inside DBImpk::Get
   roptions.snapshot = wpt_db_->GetMaxSnapshot();
@@ -770,8 +778,8 @@ Status WriteUnpreparedTxn::RollbackInternal() {
   // data that is written to DB but not yet committed, while the rollback
   // batch commits with PreReleaseCallback.
   s = db_impl_->WriteImpl(write_options_, rollback_batch.GetWriteBatch(),
-                          nullptr, nullptr, NO_REF_LOG, !DISABLE_MEMTABLE,
-                          &seq_used, rollback_batch_cnt,
+                          nullptr, nullptr, nullptr, NO_REF_LOG,
+                          !DISABLE_MEMTABLE, &seq_used, rollback_batch_cnt,
                           do_one_write ? &update_commit_map : nullptr);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   if (!s.ok()) {
@@ -806,8 +814,8 @@ Status WriteUnpreparedTxn::RollbackInternal() {
   s = WriteBatchInternal::InsertNoop(&empty_batch);
   assert(s.ok());
   s = db_impl_->WriteImpl(write_options_, &empty_batch, nullptr, nullptr,
-                          NO_REF_LOG, DISABLE_MEMTABLE, &seq_used, ONE_BATCH,
-                          &update_commit_map_with_rollback_batch);
+                          nullptr, NO_REF_LOG, DISABLE_MEMTABLE, &seq_used,
+                          ONE_BATCH, &update_commit_map_with_rollback_batch);
   assert(!s.ok() || seq_used != kMaxSequenceNumber);
   // Mark the txn as rolled back
   if (s.ok()) {
@@ -882,6 +890,7 @@ Status WriteUnpreparedTxn::RollbackToSavePointInternal() {
   assert(save_points_ != nullptr && save_points_->size() > 0);
   const LockTracker& tracked_keys = *save_points_->top().new_locks_;
 
+  // TODO: plumb Env::IOActivity, Env::IOPriority
   ReadOptions roptions;
   roptions.snapshot = top.snapshot_->snapshot();
   SequenceNumber min_uncommitted =
@@ -943,19 +952,37 @@ Status WriteUnpreparedTxn::PopSavePoint() {
   return Status::NotFound();
 }
 
-void WriteUnpreparedTxn::MultiGet(const ReadOptions& options,
+void WriteUnpreparedTxn::MultiGet(const ReadOptions& _read_options,
                                   ColumnFamilyHandle* column_family,
                                   const size_t num_keys, const Slice* keys,
                                   PinnableSlice* values, Status* statuses,
                                   const bool sorted_input) {
-  SequenceNumber min_uncommitted, snap_seq;
-  const SnapshotBackup backed_by_snapshot =
-      wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+      _read_options.io_activity != Env::IOActivity::kMultiGet) {
+    Status s = Status::InvalidArgument(
+        "Can only call MultiGet with `ReadOptions::io_activity` is "
+        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kMultiGet`");
+
+    for (size_t i = 0; i < num_keys; ++i) {
+      if (statuses[i].ok()) {
+        statuses[i] = s;
+      }
+    }
+    return;
+  }
+  ReadOptions read_options(_read_options);
+  if (read_options.io_activity == Env::IOActivity::kUnknown) {
+    read_options.io_activity = Env::IOActivity::kMultiGet;
+  }
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot = wupt_db_->AssignMinMaxSeqs(
+      read_options.snapshot, &min_uncommitted, &snap_seq);
   WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
                                           unprep_seqs_, backed_by_snapshot);
-  write_batch_.MultiGetFromBatchAndDB(db_, options, column_family, num_keys,
-                                      keys, values, statuses, sorted_input,
-                                      &callback);
+  write_batch_.MultiGetFromBatchAndDB(db_, read_options, column_family,
+                                      num_keys, keys, values, statuses,
+                                      sorted_input, &callback);
   if (UNLIKELY(!callback.valid() ||
                !wupt_db_->ValidateSnapshot(snap_seq, backed_by_snapshot))) {
     wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
@@ -965,10 +992,28 @@ void WriteUnpreparedTxn::MultiGet(const ReadOptions& options,
   }
 }
 
-Status WriteUnpreparedTxn::Get(const ReadOptions& options,
+Status WriteUnpreparedTxn::Get(const ReadOptions& _read_options,
                                ColumnFamilyHandle* column_family,
                                const Slice& key, PinnableSlice* value) {
-  SequenceNumber min_uncommitted, snap_seq;
+  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
+      _read_options.io_activity != Env::IOActivity::kGet) {
+    return Status::InvalidArgument(
+        "Can only call Get with `ReadOptions::io_activity` is "
+        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kGet`");
+  }
+  ReadOptions read_options(_read_options);
+  if (read_options.io_activity == Env::IOActivity::kUnknown) {
+    read_options.io_activity = Env::IOActivity::kGet;
+  }
+
+  return GetImpl(read_options, column_family, key, value);
+}
+
+Status WriteUnpreparedTxn::GetImpl(const ReadOptions& options,
+                                   ColumnFamilyHandle* column_family,
+                                   const Slice& key, PinnableSlice* value) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
   const SnapshotBackup backed_by_snapshot =
       wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
   WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
@@ -985,10 +1030,56 @@ Status WriteUnpreparedTxn::Get(const ReadOptions& options,
   }
 }
 
+Status WriteUnpreparedTxn::GetEntityImpl(const ReadOptions& options,
+                                         ColumnFamilyHandle* column_family,
+                                         const Slice& key,
+                                         PinnableWideColumns* columns) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
+                                          unprep_seqs_, backed_by_snapshot);
+  Status res = write_batch_.GetEntityFromBatchAndDB(db_, options, column_family,
+                                                    key, columns, &callback);
+  if (LIKELY(callback.valid() &&
+             wupt_db_->ValidateSnapshot(snap_seq, backed_by_snapshot))) {
+    return res;
+  } else {
+    res.PermitUncheckedError();
+    wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+    return Status::TryAgain();
+  }
+}
+
+void WriteUnpreparedTxn::MultiGetEntityImpl(const ReadOptions& options,
+                                            ColumnFamilyHandle* column_family,
+                                            size_t num_keys, const Slice* keys,
+                                            PinnableWideColumns* results,
+                                            Status* statuses,
+                                            bool sorted_input) {
+  SequenceNumber min_uncommitted;
+  SequenceNumber snap_seq;
+  const SnapshotBackup backed_by_snapshot =
+      wupt_db_->AssignMinMaxSeqs(options.snapshot, &min_uncommitted, &snap_seq);
+  WriteUnpreparedTxnReadCallback callback(wupt_db_, snap_seq, min_uncommitted,
+                                          unprep_seqs_, backed_by_snapshot);
+  write_batch_.MultiGetEntityFromBatchAndDB(db_, options, column_family,
+                                            num_keys, keys, results, statuses,
+                                            sorted_input, &callback);
+  if (UNLIKELY(!callback.valid() ||
+               !wupt_db_->ValidateSnapshot(snap_seq, backed_by_snapshot))) {
+    wupt_db_->WPRecordTick(TXN_GET_TRY_AGAIN);
+    for (size_t i = 0; i < num_keys; i++) {
+      statuses[i] = Status::TryAgain();
+    }
+  }
+}
+
 namespace {
 static void CleanupWriteUnpreparedWBWIIterator(void* arg1, void* arg2) {
-  auto txn = reinterpret_cast<WriteUnpreparedTxn*>(arg1);
-  auto iter = reinterpret_cast<Iterator*>(arg2);
+  auto txn = static_cast<WriteUnpreparedTxn*>(arg1);
+  auto iter = static_cast<Iterator*>(arg2);
   txn->RemoveActiveIterator(iter);
 }
 }  // anonymous namespace
@@ -1003,7 +1094,8 @@ Iterator* WriteUnpreparedTxn::GetIterator(const ReadOptions& options,
   Iterator* db_iter = wupt_db_->NewIterator(options, column_family, this);
   assert(db_iter);
 
-  auto iter = write_batch_.NewIteratorWithBase(column_family, db_iter);
+  auto iter =
+      write_batch_.NewIteratorWithBase(column_family, db_iter, &options);
   active_iterators_.push_back(iter);
   iter->RegisterCleanup(CleanupWriteUnpreparedWBWIIterator, this, iter);
   return iter;
@@ -1039,7 +1131,8 @@ Status WriteUnpreparedTxn::ValidateSnapshot(ColumnFamilyHandle* column_family,
   // TODO(yanqin): Support user-defined timestamp.
   return TransactionUtil::CheckKeyForConflicts(
       db_impl_, cfh, key.ToString(), snap_seq, /*ts=*/nullptr,
-      false /* cache_only */, &snap_checker, min_uncommitted);
+      false /* cache_only */, &snap_checker, min_uncommitted,
+      txn_db_impl_->GetTxnDBOptions().enable_udt_validation);
 }
 
 const std::map<SequenceNumber, size_t>&
@@ -1048,4 +1141,3 @@ WriteUnpreparedTxn::GetUnpreparedSequenceNumbers() {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

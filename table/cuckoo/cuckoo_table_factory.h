@@ -54,7 +54,6 @@ class CuckooTableFactory : public TableFactory {
  public:
   explicit CuckooTableFactory(
       const CuckooTableOptions& table_option = CuckooTableOptions());
-  ~CuckooTableFactory() {}
 
   // Method to allow CheckedCast to work for this class
   static const char* kClassName() { return kCuckooTableName(); }
@@ -72,6 +71,10 @@ class CuckooTableFactory : public TableFactory {
       WritableFileWriter* file) const override;
 
   std::string GetPrintableOptions() const override;
+
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<CuckooTableFactory>(*this);
+  }
 
  private:
   CuckooTableOptions table_options_;

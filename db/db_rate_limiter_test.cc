@@ -9,6 +9,7 @@
 #include <string>
 
 #include "db/db_test_util.h"
+#include "env/composite_env_wrapper.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -27,8 +28,11 @@ class DBRateLimiterOnReadTest
         use_block_cache_(std::get<1>(GetParam())),
         use_readahead_(std::get<2>(GetParam())) {}
 
-  void Init() {
+  void Init(Env* env = nullptr) {
     options_ = GetOptions();
+    if (env != nullptr) {
+      options_.env = env;
+    }
     Reopen(options_);
     for (int i = 0; i < kNumFiles; ++i) {
       for (int j = 0; j < kNumKeysPerFile; ++j) {
@@ -50,6 +54,23 @@ class DBRateLimiterOnReadTest
     read_options.rate_limiter_priority = Env::IO_USER;
     read_options.readahead_size = use_readahead_ ? kReadaheadBytes : 0;
     return read_options;
+  }
+
+  void MultiGetAllKeys(const ReadOptions& read_options) {
+    const int kNumKeys = kNumFiles * kNumKeysPerFile;
+    std::vector<std::string> key_bufs;
+    key_bufs.reserve(kNumKeys);
+    for (int i = 0; i < kNumKeys; ++i) {
+      key_bufs.emplace_back(Key(i));
+    }
+    std::vector<Slice> keys(key_bufs.begin(), key_bufs.end());
+    std::vector<Status> statuses(kNumKeys);
+    std::vector<PinnableSlice> values(kNumKeys);
+    db_->MultiGet(read_options, dbfull()->DefaultColumnFamily(), kNumKeys,
+                  keys.data(), values.data(), statuses.data());
+    for (const Status& s : statuses) {
+      ASSERT_OK(s);
+    }
   }
 
   Options GetOptions() {
@@ -165,6 +186,190 @@ TEST_P(DBRateLimiterOnReadTest, NewMultiGet) {
   ASSERT_EQ(expected, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 }
 
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGet) {
+  if (use_direct_io_ && !IsDirectIOSupported()) {
+    return;
+  }
+  Init();
+
+  ReadOptions read_options = GetReadOptions();
+  read_options.fill_cache = false;
+  MultiGetAllKeys(read_options);
+  const int64_t sync_requests =
+      options_.rate_limiter->GetTotalRequests(Env::IO_USER);
+  const int64_t sync_bytes =
+      options_.rate_limiter->GetTotalBytesThrough(Env::IO_USER);
+  ASSERT_EQ(kNumFiles * kNumKeysPerFile, sync_requests);
+
+  int read_async_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadAsync:InjectStatus",
+      [&](void* /*arg*/) { ++read_async_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  read_options.async_io = true;
+  MultiGetAllKeys(read_options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+#if USE_COROUTINES
+  ASSERT_GT(read_async_calls, 0);
+#endif  // USE_COROUTINES
+  ASSERT_EQ(2 * sync_requests,
+            options_.rate_limiter->GetTotalRequests(Env::IO_USER));
+  ASSERT_EQ(2 * sync_bytes,
+            options_.rate_limiter->GetTotalBytesThrough(Env::IO_USER));
+}
+
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGetAdjacentDirectIOBlocks) {
+  if (!use_direct_io_ || !IsDirectIOSupported()) {
+    return;
+  }
+  Options options = GetOptions();
+  BlockBasedTableOptions table_options = GetTableOptions();
+  table_options.block_size = 1000;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  Reopen(options);
+  constexpr int kFiles = 4;
+  constexpr int kKeysPerFile = 200;
+  Random rnd(301);
+  std::vector<std::string> values;
+  values.reserve(kFiles * kKeysPerFile);
+  for (int f = 0; f < kFiles; ++f) {
+    for (int k = 0; k < kKeysPerFile; ++k) {
+      values.push_back(rnd.RandomString(300 + (k % 7) * 37));
+      ASSERT_OK(Put(Key(f * kKeysPerFile + k), values.back()));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(1);
+
+  // One batch of consecutive keys from every file, so each file reads several
+  // adjacent blocks, most of them starting mid-page.
+  constexpr int kPickedPerFile = 8;
+  std::vector<int> picked;
+  std::vector<std::string> key_bufs;
+  picked.reserve(kFiles * kPickedPerFile);
+  key_bufs.reserve(kFiles * kPickedPerFile);
+  for (int f = 0; f < kFiles; ++f) {
+    for (int j = 0; j < kPickedPerFile; ++j) {
+      picked.push_back(f * kKeysPerFile + 3 + j);
+      key_bufs.push_back(Key(picked.back()));
+    }
+  }
+  std::vector<Slice> keys(key_bufs.begin(), key_bufs.end());
+  auto multi_get = [&](bool async_io) {
+    std::vector<PinnableSlice> results(keys.size());
+    std::vector<Status> statuses(keys.size());
+    ReadOptions read_options = GetReadOptions();
+    read_options.fill_cache = false;
+    read_options.async_io = async_io;
+    db_->MultiGet(read_options, dbfull()->DefaultColumnFamily(), keys.size(),
+                  keys.data(), results.data(), statuses.data());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      ASSERT_OK(statuses[i]);
+      ASSERT_EQ(values[picked[i]], results[i].ToString());
+    }
+  };
+
+  RateLimiter* const rate_limiter = options.rate_limiter.get();
+  const int64_t requests_before = rate_limiter->GetTotalRequests(Env::IO_USER);
+  const int64_t bytes_before = rate_limiter->GetTotalBytesThrough(Env::IO_USER);
+  ASSERT_NO_FATAL_FAILURE(multi_get(/*async_io=*/false));
+  const int64_t sync_requests =
+      rate_limiter->GetTotalRequests(Env::IO_USER) - requests_before;
+  const int64_t sync_bytes =
+      rate_limiter->GetTotalBytesThrough(Env::IO_USER) - bytes_before;
+
+  int read_async_calls = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadAsync:InjectStatus",
+      [&](void* /*arg*/) { ++read_async_calls; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NO_FATAL_FAILURE(multi_get(/*async_io=*/true));
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const int64_t async_requests = rate_limiter->GetTotalRequests(Env::IO_USER) -
+                                 requests_before - sync_requests;
+  const int64_t async_bytes = rate_limiter->GetTotalBytesThrough(Env::IO_USER) -
+                              bytes_before - sync_bytes;
+
+#if USE_COROUTINES
+  // MultiRead() merges the adjacent aligned requests of a file into one read.
+  // The async_io path reads and charges each block on its own, re-reading the
+  // aligned pages that adjacent blocks share.
+  ASSERT_GT(read_async_calls, 0);
+  ASSERT_GT(async_requests, sync_requests);
+  ASSERT_GT(async_bytes, sync_bytes);
+#else
+  ASSERT_EQ(async_requests, sync_requests);
+  ASSERT_EQ(async_bytes, sync_bytes);
+#endif  // USE_COROUTINES
+}
+
+// A file system can reject ReadAsync even though it advertises kAsyncIO, e.g.
+// when io_uring fails to initialize. MultiGet then reads synchronously, and
+// each read must still be charged exactly once.
+class ReadAsyncNotSupportedFS : public FileSystemWrapper {
+ public:
+  explicit ReadAsyncNotSupportedFS(const std::shared_ptr<FileSystem>& target)
+      : FileSystemWrapper(target) {}
+
+  static const char* kClassName() { return "ReadAsyncNotSupportedFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& opts,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    IOStatus s = target()->NewRandomAccessFile(fname, opts, result, dbg);
+    if (s.ok()) {
+      *result = std::make_unique<File>(std::move(*result));
+    }
+    return s;
+  }
+
+ private:
+  class File : public FSRandomAccessFileOwnerWrapper {
+   public:
+    using FSRandomAccessFileOwnerWrapper::FSRandomAccessFileOwnerWrapper;
+    IOStatus ReadAsync(FSReadRequest& /*req*/, const IOOptions& /*opts*/,
+                       std::function<void(FSReadRequest&, void*)> /*cb*/,
+                       void* /*cb_arg*/, void** /*io_handle*/,
+                       IOHandleDeleter* /*del_fn*/,
+                       IODebugContext* /*dbg*/) override {
+      return IOStatus::NotSupported("ReadAsync");
+    }
+  };
+};
+
+TEST_P(DBRateLimiterOnReadTest, AsyncIOMultiGetSyncFallback) {
+  if (use_direct_io_ && !IsDirectIOSupported()) {
+    return;
+  }
+  auto fs = std::make_shared<ReadAsyncNotSupportedFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  Init(env.get());
+
+  int fallbacks = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "AsyncFileReader::MultiReadAsyncImpl:SyncFallback",
+      [&](void* /*arg*/) { ++fallbacks; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  ReadOptions read_options = GetReadOptions();
+  read_options.async_io = true;
+  MultiGetAllKeys(read_options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  const int64_t requests =
+      options_.rate_limiter->GetTotalRequests(Env::IO_USER);
+  Close();
+
+#if USE_COROUTINES
+  ASSERT_GT(fallbacks, 0);
+#endif  // USE_COROUTINES
+  ASSERT_EQ(kNumFiles * kNumKeysPerFile, requests);
+}
+
 TEST_P(DBRateLimiterOnReadTest, OldMultiGet) {
   // The old `vector<Status>`-returning `MultiGet()` APIs use `Read()`, which
   // supports rate limiting.
@@ -220,11 +425,11 @@ TEST_P(DBRateLimiterOnReadTest, Iterator) {
       ++expected;
     }
   }
+  ASSERT_OK(iter->status());
   // Reverse scan does not read evenly (one block per iteration) due to
   // descending seqno ordering, so wait until after the loop to check total.
   ASSERT_EQ(expected, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 }
-
 
 TEST_P(DBRateLimiterOnReadTest, VerifyChecksum) {
   if (use_direct_io_ && !IsDirectIOSupported()) {
@@ -235,8 +440,24 @@ TEST_P(DBRateLimiterOnReadTest, VerifyChecksum) {
   ASSERT_EQ(0, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 
   ASSERT_OK(db_->VerifyChecksum(GetReadOptions()));
-  // The files are tiny so there should have just been one read per file.
-  int expected = kNumFiles;
+  // In BufferedIO,
+  // there are 7 reads per file, each of which will be rate-limited.
+  // During open:  read footer, meta index block, properties block, index block.
+  // During actual checksum verification: read meta index block, verify checksum
+  // in meta blocks and verify checksum in file blocks.
+  //
+  // In DirectIO, where we support tail prefetching, during table open, we only
+  // do 1 read instead of 4 as described above. Actual checksum verification
+  // reads stay the same.
+#ifdef OS_WIN
+  // No file system prefetch implemented for OS Win. During table open,
+  // we only do 1 read for BufferedIO.
+  int num_read_per_file = 4;
+#else
+  int num_read_per_file = (!use_direct_io_) ? 7 : 4;
+#endif
+  int expected = kNumFiles * num_read_per_file;
+
   ASSERT_EQ(expected, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 }
 
@@ -253,7 +474,6 @@ TEST_P(DBRateLimiterOnReadTest, VerifyFileChecksums) {
   int expected = kNumFiles;
   ASSERT_EQ(expected, options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 }
-
 
 class DBRateLimiterOnWriteTest : public DBTestBase {
  public:
@@ -427,6 +647,107 @@ TEST_P(DBRateLimiterOnWriteWALTest, AutoWalFlush) {
   EXPECT_EQ(actual_auto_wal_flush_request,
             options_.rate_limiter->GetTotalRequests(Env::IO_USER));
 }
+
+class DBRateLimiterOnManualWALFlushTest
+    : public DBRateLimiterOnWriteTest,
+      public ::testing::WithParamInterface<Env::IOPriority> {
+ public:
+  static std::string GetTestNameSuffix(
+      ::testing::TestParamInfo<Env::IOPriority> info) {
+    std::ostringstream oss;
+    if (info.param == Env::IO_USER) {
+      oss << "RateLimitManualWALFlush";
+    } else if (info.param == Env::IO_TOTAL) {
+      oss << "NoRateLimitManualWALFlush";
+    } else if (info.param == Env::IO_HIGH) {
+      oss << "RateLimitManualWALFlushWithHighPriority";
+    } else {
+      oss << "RateLimitManualWALFlushWithLowPriority";
+    }
+    return oss.str();
+  }
+
+  explicit DBRateLimiterOnManualWALFlushTest()
+      : rate_limiter_priority_(GetParam()) {}
+
+  void Init() {
+    options_ = GetOptions();
+    // Enable manual WAL flush mode
+    options_.manual_wal_flush = true;
+    Reopen(options_);
+  }
+
+  WriteOptions GetWriteOptions() {
+    WriteOptions write_options;
+    // WAL must be enabled for manual WAL flush to work
+    write_options.disableWAL = false;
+    // In manual WAL flush mode, WAL write rate limiting should be done through
+    // FlushWAL(), not WriteOptions::rate_limiter_priority
+    write_options.rate_limiter_priority = Env::IO_TOTAL;
+    return write_options;
+  }
+
+ protected:
+  Env::IOPriority rate_limiter_priority_;
+};
+
+INSTANTIATE_TEST_CASE_P(DBRateLimiterOnManualWALFlushTest,
+                        DBRateLimiterOnManualWALFlushTest,
+                        ::testing::Values(Env::IO_TOTAL, Env::IO_USER,
+                                          Env::IO_HIGH, Env::IO_LOW),
+                        DBRateLimiterOnManualWALFlushTest::GetTestNameSuffix);
+
+TEST_P(DBRateLimiterOnManualWALFlushTest, ManualWALFlush) {
+  Init();
+
+  const bool no_rate_limit = (rate_limiter_priority_ == Env::IO_TOTAL);
+
+  ASSERT_EQ(0, options_.rate_limiter->GetTotalRequests(Env::IO_TOTAL));
+
+  for (bool sync : {false, true}) {
+    std::int64_t prev_total_request =
+        options_.rate_limiter->GetTotalRequests(Env::IO_TOTAL);
+
+    Status put_status = Put("key_" + std::to_string(sync),
+                            "value_" + std::to_string(sync), GetWriteOptions());
+
+    EXPECT_TRUE(put_status.ok());
+
+    // Since manual_wal_flush is enabled and write_options.rate_limiter_priority
+    // is IO_TOTAL, no rate limiting should have occurred for this user write
+    EXPECT_EQ(0, options_.rate_limiter->GetTotalRequests(Env::IO_TOTAL) -
+                     prev_total_request);
+
+    // Now explicitly flush the WAL with the test's rate_limiter_priority
+    prev_total_request = options_.rate_limiter->GetTotalRequests(Env::IO_TOTAL);
+    std::int64_t prev_priority_request =
+        options_.rate_limiter->GetTotalRequests(rate_limiter_priority_);
+
+    FlushWALOptions flush_options;
+    flush_options.sync = sync;
+    flush_options.rate_limiter_priority = rate_limiter_priority_;
+    Status flush_status = db_->FlushWAL(flush_options);
+
+    EXPECT_TRUE(flush_status.ok());
+
+    std::int64_t manual_wal_flush_requests_total =
+        options_.rate_limiter->GetTotalRequests(Env::IO_TOTAL) -
+        prev_total_request;
+    std::int64_t manual_wal_flush_requests_for_priority =
+        options_.rate_limiter->GetTotalRequests(rate_limiter_priority_) -
+        prev_priority_request;
+
+    if (no_rate_limit) {
+      EXPECT_EQ(0, manual_wal_flush_requests_total);
+      EXPECT_EQ(0, manual_wal_flush_requests_for_priority);
+    } else {
+      EXPECT_EQ(manual_wal_flush_requests_total,
+                manual_wal_flush_requests_for_priority);
+      EXPECT_GT(manual_wal_flush_requests_for_priority, 0);
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

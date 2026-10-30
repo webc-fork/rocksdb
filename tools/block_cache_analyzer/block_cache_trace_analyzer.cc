@@ -577,7 +577,7 @@ void BlockCacheTraceAnalyzer::WriteSkewness(
   std::map<std::string, std::map<uint64_t, uint64_t>> label_bucket_naccesses;
   std::vector<std::pair<std::string, uint64_t>> pairs;
   for (auto const& itr : label_naccesses) {
-    pairs.push_back(itr);
+    pairs.emplace_back(itr);
   }
   // Sort in descending order.
   sort(pairs.begin(), pairs.end(),
@@ -628,7 +628,7 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeatures(
           for (auto const& caller_map : block.caller_access_timeline) {
             const std::string label =
                 BuildLabel(labels, cf_name, fd, level, block_type,
-                           caller_map.first, /*block_id=*/0, block);
+                           caller_map.first, /*block_key=*/0, block);
             auto it = block.caller_access_sequence__number_timeline.find(
                 caller_map.first);
             assert(it != block.caller_access_sequence__number_timeline.end());
@@ -640,7 +640,7 @@ void BlockCacheTraceAnalyzer::WriteCorrelationFeatures(
         const std::string label =
             BuildLabel(labels, cf_name, fd, level, block_type,
                        TableReaderCaller::kMaxBlockCacheLookupCaller,
-                       /*block_id=*/0, block);
+                       /*block_key=*/0, block);
         UpdateFeatureVectors(block.access_sequence_number_timeline,
                              block.access_timeline, label, &label_features,
                              &label_predictions);
@@ -814,7 +814,7 @@ void BlockCacheTraceAnalyzer::WriteGetSpatialLocality(
     }
     const std::string label =
         BuildLabel(labels, cf_name, fd, level, TraceType::kBlockTraceDataBlock,
-                   TableReaderCaller::kUserGet, /*block_id=*/0, block);
+                   TableReaderCaller::kUserGet, /*block_key=*/0, block);
 
     const uint64_t percent_referenced_for_existing_keys =
         static_cast<uint64_t>(std::max(
@@ -1571,6 +1571,10 @@ Status BlockCacheTraceAnalyzer::Analyze() {
     miss_ratio_stats_.UpdateMetrics(access.access_timestamp,
                                     is_user_access(access.caller),
                                     !access.is_cache_hit);
+    caller_miss_ratio_stats_map_[access.caller].UpdateMetrics(
+        access.access_timestamp, is_user_access(access.caller),
+        !access.is_cache_hit);
+
     if (cache_simulator_) {
       cache_simulator_->Access(access);
     }
@@ -1586,6 +1590,14 @@ Status BlockCacheTraceAnalyzer::Analyze() {
               " seconds. Observed miss ratio %.2f\n",
               duration, duration > 0 ? access_sequence_number_ / duration : 0,
               trace_duration, miss_ratio_stats_.miss_ratio());
+
+      for (const auto& caller : caller_miss_ratio_stats_map_) {
+        fprintf(stdout, "Caller %s: Observed miss ratio %.2f\n",
+                caller_to_string(caller.first).c_str(),
+                caller.second.miss_ratio());
+      }
+      print_break_lines(/*num_break_lines=*/1);
+
       time_interval++;
     }
   }
@@ -1599,6 +1611,11 @@ Status BlockCacheTraceAnalyzer::Analyze() {
           " seconds. Observed miss ratio %.2f\n",
           duration, duration > 0 ? access_sequence_number_ / duration : 0,
           trace_duration, miss_ratio_stats_.miss_ratio());
+  for (const auto& caller : caller_miss_ratio_stats_map_) {
+    fprintf(stdout, "Caller %s: Observed miss ratio %.2f\n",
+            caller_to_string(caller.first).c_str(), caller.second.miss_ratio());
+  }
+  print_break_lines(/*num_break_lines=*/1);
   return s;
 }
 

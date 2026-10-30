@@ -47,7 +47,7 @@ class Cleanable {
     cleanup_.next = nullptr;
   }
 
-  inline bool HasCleanups() { return cleanup_.function != nullptr; }
+  inline bool HasCleanups() const { return cleanup_.function != nullptr; }
 
  protected:
   struct Cleanup {
@@ -107,6 +107,7 @@ class SharedCleanablePtr {
   Cleanable* operator->();
   // Get as raw pointer to Cleanable
   Cleanable* get();
+  const Cleanable* get() const;
 
   // Creates a (virtual) copy of this SharedCleanablePtr and registers its
   // destruction with target, so that the cleanups registered with the

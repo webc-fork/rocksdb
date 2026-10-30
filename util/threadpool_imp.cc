@@ -18,11 +18,10 @@
 #include <sys/syscall.h>
 #endif
 
-#include <stdlib.h>
-
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <sstream>
@@ -45,6 +44,11 @@ void ThreadPoolImpl::PthreadCall(const char* label, int result) {
 
 struct ThreadPoolImpl::Impl {
   Impl();
+  // No copying allowed
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+  Impl(Impl&&) = delete;
+  Impl& operator=(Impl&&) = delete;
   ~Impl();
 
   void JoinThreads(bool wait_for_jobs_to_complete);
@@ -322,10 +326,10 @@ struct BGThreadMetadata {
 };
 
 void ThreadPoolImpl::Impl::BGThreadWrapper(void* arg) {
-  BGThreadMetadata* meta = reinterpret_cast<BGThreadMetadata*>(arg);
+  BGThreadMetadata* meta = static_cast<BGThreadMetadata*>(arg);
   size_t thread_id = meta->thread_id_;
   ThreadPoolImpl::Impl* tp = meta->thread_pool_;
-#ifdef ROCKSDB_USING_THREAD_STATUS
+#ifndef NROCKSDB_THREAD_STATUS
   // initialize it because compiler isn't good enough to see we don't use it
   // uninitialized
   ThreadStatus::ThreadType thread_type = ThreadStatus::NUM_THREAD_TYPES;
@@ -351,7 +355,7 @@ void ThreadPoolImpl::Impl::BGThreadWrapper(void* arg) {
 #endif
   delete meta;
   tp->BGThread(thread_id);
-#ifdef ROCKSDB_USING_THREAD_STATUS
+#ifndef NROCKSDB_THREAD_STATUS
   ThreadStatusUtil::UnregisterThread();
 #endif
   return;
@@ -465,7 +469,7 @@ int ThreadPoolImpl::Impl::UnSchedule(void* arg) {
 
 ThreadPoolImpl::ThreadPoolImpl() : impl_(new Impl()) {}
 
-ThreadPoolImpl::~ThreadPoolImpl() {}
+ThreadPoolImpl::~ThreadPoolImpl() = default;
 
 void ThreadPoolImpl::JoinAllThreads() { impl_->JoinThreads(false); }
 

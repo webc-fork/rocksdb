@@ -22,7 +22,12 @@ namespace ROCKSDB_NAMESPACE {
 // The unknown file checksum.
 constexpr char kUnknownFileChecksum[] = "";
 // The unknown sst file checksum function name.
+// Indicates that the file metadata says that no checksum factory was configured
+// when the file was written.
 constexpr char kUnknownFileChecksumFuncName[] = "Unknown";
+// Used when opening a file and there is no file checksum metadata to propagate
+// at all.
+constexpr char kNoFileChecksumFuncName[] = "Unavailable";
 // The standard DB file checksum function name.
 // This is the name of the checksum function returned by
 // GetFileChecksumGenCrc32cFactory();
@@ -49,7 +54,7 @@ struct FileChecksumGenContext {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumGenerator {
  public:
-  virtual ~FileChecksumGenerator() {}
+  virtual ~FileChecksumGenerator() = default;
 
   // Update the current result after process the data. For different checksum
   // functions, the temporal results may be stored and used in Update to
@@ -74,13 +79,14 @@ class FileChecksumGenerator {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumGenFactory : public Customizable {
  public:
-  ~FileChecksumGenFactory() override {}
+  ~FileChecksumGenFactory() override = default;
   static const char* Type() { return "FileChecksumGenFactory"; }
   static Status CreateFromString(
       const ConfigOptions& options, const std::string& value,
       std::shared_ptr<FileChecksumGenFactory>* result);
 
-  // Create a new FileChecksumGenerator.
+  // Create a new FileChecksumGenerator. Recommended to return nullptr if the
+  // requested function name is not recognized.
   virtual std::unique_ptr<FileChecksumGenerator> CreateFileChecksumGenerator(
       const FileChecksumGenContext& context) = 0;
 
@@ -100,7 +106,7 @@ class FileChecksumGenFactory : public Customizable {
 // including data loss, unreported corruption, deadlocks, and more.
 class FileChecksumList {
  public:
-  virtual ~FileChecksumList() {}
+  virtual ~FileChecksumList() = default;
 
   // Clean the previously stored file checksum information.
   virtual void reset() = 0;
@@ -131,7 +137,7 @@ class FileChecksumList {
 };
 
 // Create a new file checksum list.
-extern FileChecksumList* NewFileChecksumList();
+FileChecksumList* NewFileChecksumList();
 
 // Return a shared_ptr of the builtin Crc32c based file checksum generator
 // factory object, which can be shared to create the Crc32c based checksum

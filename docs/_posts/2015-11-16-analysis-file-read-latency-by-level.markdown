@@ -1,7 +1,7 @@
 ---
 title: Analysis File Read Latency by Level
 layout: post
-author: sdong
+author: siying
 category: blog
 redirect_from:
   - /blog/2537/analysis-file-read-latency-by-level/
@@ -13,7 +13,7 @@ As an example, a user can tune the DB as following: use level-based compaction, 
 
 <!--truncate-->
 
-In order to make tuning easier, we added new instrumentation to help users analysis latency distribution of file reads in different levels. If users turn DB statistics on, we always keep track of distribution of file read latency for each level. Users can retrieve the information by querying DB property “rocksdb.stats” ( [https://github.com/facebook/rocksdb/blob/v3.13.1/include/rocksdb/db.h#L315-L316](https://github.com/facebook/rocksdb/blob/v3.13.1/include/rocksdb/db.h#L315-L316) ). It will also printed out as a part of compaction summary in info logs periodically.
+In order to make tuning easier, we added new instrumentation to help users analysis latency distribution of file reads in different levels. If users turn DB statistics on, we always keep track of distribution of file read latency for each level. Users can retrieve the information by querying DB property “rocksdb.stats” ( [https://github.com/meta/rocksdb/blob/v3.13.1/include/rocksdb/db.h#L315-L316](https://github.com/meta/rocksdb/blob/v3.13.1/include/rocksdb/db.h#L315-L316) ). It will also printed out as a part of compaction summary in info logs periodically.
 
 The output looks like this:
 

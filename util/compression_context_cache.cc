@@ -35,8 +35,11 @@ struct ZSTDCachedData {
                    CACHE_LINE_SIZE)];  // unused padding field
 
   ZSTDCachedData() : zstd_uncomp_sentinel_(&uncomp_cached_data_) {}
+  ~ZSTDCachedData() = default;
   ZSTDCachedData(const ZSTDCachedData&) = delete;
   ZSTDCachedData& operator=(const ZSTDCachedData&) = delete;
+  ZSTDCachedData(ZSTDCachedData&&) = delete;
+  ZSTDCachedData& operator=(ZSTDCachedData&&) = delete;
 
   ZSTDUncompressCachedData GetUncompressData(int64_t idx) {
     ZSTDUncompressCachedData result;
@@ -67,7 +70,7 @@ static_assert(sizeof(ZSTDCachedData) % CACHE_LINE_SIZE == 0,
 
 class CompressionContextCache::Rep {
  public:
-  Rep() {}
+  Rep() = default;
   ZSTDUncompressCachedData GetZSTDUncompressData() {
     auto p = per_core_uncompr_.AccessElementAndIndex();
     int64_t idx = static_cast<int64_t>(p.second);

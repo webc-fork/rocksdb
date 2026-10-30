@@ -340,7 +340,7 @@ IOStatus FSRandomAccessFileTracingWrapper::InvalidateCache(size_t offset,
 
 IOStatus FSRandomAccessFileTracingWrapper::ReadAsync(
     FSReadRequest& req, const IOOptions& opts,
-    std::function<void(const FSReadRequest&, void*)> cb, void* cb_arg,
+    std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
     void** io_handle, IOHandleDeleter* del_fn, IODebugContext* dbg) {
   // Create a callback and populate info.
   auto read_async_callback =
@@ -355,14 +355,37 @@ IOStatus FSRandomAccessFileTracingWrapper::ReadAsync(
   IOStatus s = target()->ReadAsync(req, opts, read_async_callback,
                                    read_async_cb_info, io_handle, del_fn, dbg);
 
+#ifndef __clang_analyzer__
   if (!s.ok()) {
     delete read_async_cb_info;
   }
+#endif  // __clang_analyzer__
   return s;
 }
 
-void FSRandomAccessFileTracingWrapper::ReadAsyncCallback(
-    const FSReadRequest& req, void* cb_arg) {
+bool FSRandomAccessFileTracingWrapper::SubmitReadAsync(
+    FSReadRequest& req, const IOOptions& opts,
+    std::function<void(FSReadRequest&)> cb, IODebugContext* dbg) {
+  const uint64_t start_time = clock_->NowNanos();
+  return target()->SubmitReadAsync(
+      req, opts,
+      [this, start_time, cb = std::move(cb)](FSReadRequest& completed_req) {
+        const uint64_t elapsed = clock_->NowNanos() - start_time;
+        uint64_t io_op_data = 0;
+        io_op_data |= (1 << IOTraceOp::kIOLen);
+        io_op_data |= (1 << IOTraceOp::kIOOffset);
+        IOTraceRecord io_record(
+            clock_->NowNanos(), TraceType::kIOTracer, io_op_data,
+            "SubmitReadAsync", elapsed, completed_req.status.ToString(),
+            file_name_, completed_req.result.size(), completed_req.offset);
+        io_tracer_->WriteIOOp(io_record, nullptr /*dbg*/);
+        cb(completed_req);
+      },
+      dbg);
+}
+
+void FSRandomAccessFileTracingWrapper::ReadAsyncCallback(FSReadRequest& req,
+                                                         void* cb_arg) {
   ReadAsyncCallbackInfo* read_async_cb_info =
       static_cast<ReadAsyncCallbackInfo*>(cb_arg);
   assert(read_async_cb_info);

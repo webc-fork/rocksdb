@@ -12,7 +12,7 @@
 #include "db/db_test_util.h"
 #include "rocksdb/options.h"
 #include "test_util/testharness.h"
-#include "utilities/agg_merge/agg_merge.h"
+#include "utilities/agg_merge/agg_merge_impl.h"
 #include "utilities/agg_merge/test_agg_merge.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -117,7 +117,8 @@ TEST_F(AggMergeTest, TestUsingMergeOperator) {
   v1 = EncodeHelper::EncodeFuncAndInt("sum", 20);
   ASSERT_OK(Merge("bar4", v1));
   std::string aggregated_value = Get("bar4");
-  Slice func, payload;
+  Slice func;
+  Slice payload;
   ASSERT_TRUE(ExtractAggFuncAndValue(aggregated_value, func, payload));
   EXPECT_EQ(kErrorFuncName, func);
   std::vector<Slice> decoded_list;

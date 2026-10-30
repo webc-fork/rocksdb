@@ -43,7 +43,7 @@ using ROCKSDB_NAMESPACE::Random;
 using ROCKSDB_NAMESPACE::SequenceNumber;
 using ROCKSDB_NAMESPACE::Slice;
 using ROCKSDB_NAMESPACE::Status;
-using ROCKSDB_NAMESPACE::TransactionLogIterator;
+using ROCKSDB_NAMESPACE::WalIterator;
 using ROCKSDB_NAMESPACE::WriteOptions;
 
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
@@ -54,7 +54,7 @@ struct DataPumpThread {
 };
 
 static void DataPumpThreadBody(void* arg) {
-  DataPumpThread* t = reinterpret_cast<DataPumpThread*>(arg);
+  DataPumpThread* t = static_cast<DataPumpThread*>(arg);
   DB* db = t->db;
   Random rnd(301);
   uint64_t i = 0;
@@ -83,7 +83,7 @@ int main(int argc, const char** argv) {
   options.create_if_missing = true;
   options.WAL_ttl_seconds = FLAGS_wal_ttl_seconds;
   options.WAL_size_limit_MB = FLAGS_wal_size_limit_MB;
-  DB* db;
+  std::unique_ptr<DB> db;
   DestroyDB(default_db_path, options);
 
   Status s = DB::Open(options, default_db_path, &db);
@@ -94,10 +94,10 @@ int main(int argc, const char** argv) {
   }
 
   DataPumpThread dataPump;
-  dataPump.db = db;
+  dataPump.db = db.get();
   env->StartThread(DataPumpThreadBody, &dataPump);
 
-  std::unique_ptr<TransactionLogIterator> iter;
+  std::unique_ptr<WalIterator> iter;
   SequenceNumber currentSeqNum = 1;
   uint64_t num_read = 0;
   for (;;) {
@@ -129,4 +129,3 @@ int main(int argc, const char** argv) {
 }
 
 #endif  // GFLAGS
-

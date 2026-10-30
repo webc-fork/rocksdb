@@ -51,12 +51,11 @@ static TableProperties newTablePropertiesForTest() {
   table_properties.format_version = UINT64_MAX;
   table_properties.fixed_key_len = UINT64_MAX;
   table_properties.column_family_id = UINT64_MAX;
-  table_properties.creation_time = UINT64_MAX;
+  table_properties.oldest_ancestor_time = UINT64_MAX;
   table_properties.oldest_key_time = UINT64_MAX;
   table_properties.file_creation_time = UINT64_MAX;
   table_properties.slow_compression_estimated_data_size = UINT64_MAX;
   table_properties.fast_compression_estimated_data_size = UINT64_MAX;
-  table_properties.external_sst_file_global_seqno_offset = UINT64_MAX;
   table_properties.db_id = "dbId";
   table_properties.db_session_id = "sessionId";
   table_properties.column_family_name = "columnFamilyName";
@@ -78,9 +77,9 @@ static TableProperties newTablePropertiesForTest() {
  * Signature: (J)V
  */
 void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
-    JNIEnv *, jclass, jlong jhandle) {
-  const auto &el =
-      *reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::EventListener> *>(
+    JNIEnv*, jclass, jlong jhandle) {
+  const auto& el =
+      *reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::EventListener>*>(
           jhandle);
 
   TableProperties table_properties = newTablePropertiesForTest();
@@ -127,7 +126,7 @@ void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
   compaction_job_info.output_file_infos = {};
   compaction_job_info.table_properties = {
       {"tableProperties", std::shared_ptr<TableProperties>(
-                              &table_properties, [](TableProperties *) {})}};
+                              &table_properties, [](TableProperties*) {})}};
   compaction_job_info.compaction_reason = CompactionReason::kFlush;
   compaction_job_info.compression = CompressionType::kSnappyCompression;
 
@@ -201,7 +200,7 @@ void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
       FileOperationInfo(FileOperationType::kRead, file_path, start_timestamp,
                         finish_timestamp, status);
   op_info.offset = UINT64_MAX;
-  op_info.length = SIZE_MAX;
+  op_info.length = 4096;
 
   el->OnFileReadFinish(op_info);
   el->OnFileWriteFinish(op_info);

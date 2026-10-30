@@ -25,7 +25,7 @@ class FileSystemTracingWrapper : public FileSystemWrapper {
         io_tracer_(io_tracer),
         clock_(SystemClock::Default().get()) {}
 
-  ~FileSystemTracingWrapper() override {}
+  ~FileSystemTracingWrapper() override = default;
 
   static const char* kClassName() { return "FileSystemTracing"; }
   const char* Name() const override { return kClassName(); }
@@ -144,7 +144,7 @@ class FSSequentialFileTracingWrapper : public FSSequentialFileOwnerWrapper {
         clock_(SystemClock::Default().get()),
         file_name_(file_name) {}
 
-  ~FSSequentialFileTracingWrapper() override {}
+  ~FSSequentialFileTracingWrapper() override = default;
 
   IOStatus Read(size_t n, const IOOptions& options, Slice* result,
                 char* scratch, IODebugContext* dbg) override;
@@ -214,7 +214,7 @@ class FSRandomAccessFileTracingWrapper : public FSRandomAccessFileOwnerWrapper {
         clock_(SystemClock::Default().get()),
         file_name_(file_name) {}
 
-  ~FSRandomAccessFileTracingWrapper() override {}
+  ~FSRandomAccessFileTracingWrapper() override = default;
 
   IOStatus Read(uint64_t offset, size_t n, const IOOptions& options,
                 Slice* result, char* scratch,
@@ -229,11 +229,15 @@ class FSRandomAccessFileTracingWrapper : public FSRandomAccessFileOwnerWrapper {
   IOStatus InvalidateCache(size_t offset, size_t length) override;
 
   IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
-                     std::function<void(const FSReadRequest&, void*)> cb,
+                     std::function<void(FSReadRequest&, void*)> cb,
                      void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
                      IODebugContext* dbg) override;
 
-  void ReadAsyncCallback(const FSReadRequest& req, void* cb_arg);
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override;
+
+  void ReadAsyncCallback(FSReadRequest& req, void* cb_arg);
 
  private:
   std::shared_ptr<IOTracer> io_tracer_;
@@ -243,7 +247,7 @@ class FSRandomAccessFileTracingWrapper : public FSRandomAccessFileOwnerWrapper {
 
   struct ReadAsyncCallbackInfo {
     uint64_t start_time_;
-    std::function<void(const FSReadRequest&, void*)> cb_;
+    std::function<void(FSReadRequest&, void*)> cb_;
     void* cb_arg_;
     std::string file_op_;
   };
@@ -301,7 +305,7 @@ class FSWritableFileTracingWrapper : public FSWritableFileOwnerWrapper {
         clock_(SystemClock::Default().get()),
         file_name_(file_name) {}
 
-  ~FSWritableFileTracingWrapper() override {}
+  ~FSWritableFileTracingWrapper() override = default;
 
   IOStatus Append(const Slice& data, const IOOptions& options,
                   IODebugContext* dbg) override;
@@ -398,7 +402,7 @@ class FSRandomRWFileTracingWrapper : public FSRandomRWFileOwnerWrapper {
         clock_(SystemClock::Default().get()),
         file_name_(file_name) {}
 
-  ~FSRandomRWFileTracingWrapper() override {}
+  ~FSRandomRWFileTracingWrapper() override = default;
 
   IOStatus Write(uint64_t offset, const Slice& data, const IOOptions& options,
                  IODebugContext* dbg) override;

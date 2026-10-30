@@ -118,7 +118,7 @@ class BlockCacheTraceWriterImpl : public BlockCacheTraceWriter {
   BlockCacheTraceWriterImpl(SystemClock* clock,
                             const BlockCacheTraceWriterOptions& trace_options,
                             std::unique_ptr<TraceWriter>&& trace_writer);
-  ~BlockCacheTraceWriterImpl() = default;
+  ~BlockCacheTraceWriterImpl() override = default;
   // No copy and move.
   BlockCacheTraceWriterImpl(const BlockCacheTraceWriterImpl&) = delete;
   BlockCacheTraceWriterImpl& operator=(const BlockCacheTraceWriterImpl&) =
@@ -142,7 +142,7 @@ class BlockCacheTraceWriterImpl : public BlockCacheTraceWriter {
 };
 
 // Write a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for details.
 class BlockCacheHumanReadableTraceWriter {
  public:
@@ -181,13 +181,13 @@ class BlockCacheTraceReader {
 };
 
 // Read a trace record in human readable format, see
-// https://github.com/facebook/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
+// https://github.com/meta/rocksdb/wiki/Block-cache-analysis-and-simulation-tools#trace-format
 // for detailed.
 class BlockCacheHumanReadableTraceReader : public BlockCacheTraceReader {
  public:
   BlockCacheHumanReadableTraceReader(const std::string& trace_file_path);
 
-  ~BlockCacheHumanReadableTraceReader();
+  ~BlockCacheHumanReadableTraceReader() override;
 
   Status ReadHeader(BlockCacheTraceHeader* header);
 

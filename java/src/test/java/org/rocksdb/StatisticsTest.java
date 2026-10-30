@@ -5,23 +5,38 @@
 
 package org.rocksdb;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.nio.charset.StandardCharsets;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.Set;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import java.nio.charset.StandardCharsets;
-
-import static org.assertj.core.api.Assertions.assertThat;
-
 public class StatisticsTest {
-
-  @ClassRule
-  public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
-      new RocksNativeLibraryResource();
-
   @Rule
   public TemporaryFolder dbFolder = new TemporaryFolder();
+
+  @Test
+  public void tickerTypesHaveUniqueValuesAndRoundTrip() {
+    final Set<Byte> tickerValues = new HashSet<>();
+    for (final TickerType tickerType : TickerType.values()) {
+      assertThat(tickerValues.add(tickerType.getValue())).isTrue();
+      assertThat(TickerType.getTickerType(tickerType.getValue())).isEqualTo(tickerType);
+    }
+  }
+
+  @Test
+  public void createStatistics() throws RocksDBException {
+    final Statistics statistics = new Statistics();
+    statistics.setStatsLevel(StatsLevel.EXCEPT_DETAILED_TIMERS);
+    final Statistics statisticsWithHistogramOptions =
+        new Statistics(EnumSet.of(HistogramType.DB_WRITE, HistogramType.COMPACTION_TIME));
+    statisticsWithHistogramOptions.reset();
+  }
 
   @Test
   public void statsLevel() throws RocksDBException {

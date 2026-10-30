@@ -5,7 +5,6 @@
 
 #pragma once
 
-
 #include <atomic>
 
 #include "rocksdb/listener.h"
@@ -22,7 +21,8 @@ class BlobDBListener : public EventListener {
 
   void OnFlushBegin(DB* /*db*/, const FlushJobInfo& /*info*/) override {
     assert(blob_db_impl_ != nullptr);
-    blob_db_impl_->SyncBlobFiles();
+    blob_db_impl_->SyncBlobFiles(WriteOptions(Env::IOActivity::kFlush))
+        .PermitUncheckedError();
   }
 
   void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& /*info*/) override {

@@ -26,6 +26,7 @@ int main() {
 #include "test_util/testutil.h"
 #include "tools/block_cache_analyzer/block_cache_trace_analyzer.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -88,7 +89,7 @@ class BlockCacheTracerTest : public testing::Test {
       case 4:
         return TableReaderCaller::kUserIterator;
     }
-    // This cannot happend.
+    // This cannot happen.
     assert(false);
     return TableReaderCaller::kMaxBlockCacheLookupCaller;
   }
@@ -492,7 +493,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       ASSERT_EQ(20, ParseDouble(percent));
     }
     ASSERT_EQ(expected_callers.size(), callers.size());
-    for (auto caller : callers) {
+    for (const auto& caller : callers) {
       ASSERT_TRUE(expected_callers.find(caller) != expected_callers.end());
     }
     ASSERT_OK(env_->DeleteFile(percent_access_summary_file));
@@ -504,7 +505,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       std::string caller;
       ASSERT_TRUE(getline(analyzing_callers, caller, ','));
       std::vector<std::string> breakdowns{"level", "bt"};
-      for (auto breakdown : breakdowns) {
+      for (const auto& breakdown : breakdowns) {
         const std::string file_name = test_path_ + "/" + caller + "_" +
                                       breakdown +
                                       "_percentage_of_accesses_summary";
@@ -554,7 +555,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
   }
   for (auto const& access_type : access_types) {
     std::vector<std::string> block_types{"Index", "Data", "Filter"};
-    for (auto block_type : block_types) {
+    for (const auto& block_type : block_types) {
       // Validate reuse block timeline.
       const std::string reuse_blocks_timeline = test_path_ + "/" + block_type +
                                                 "_" + access_type +
